@@ -189,7 +189,7 @@ def main_pod(repo, check, root):
     leaf(work, down / "downlink-cert.pem", "octo-downlink-bridge", now - 86400, now + 800 * 86400)
     shutil.copy(work / "ca.pem", down / "ca-root.pem")
     (down / "downlink-key.pem").write_text("not-read\n")
-    slot = root / "octo-uplink"   # the anchor is aabbcc, from test_top's 10-pod.yml
+    slot = root / "fabric-uplink"   # the anchor is aabbcc, from test_top's 10-pod.yml
     slot.mkdir()
     leaf(work, slot / "aabbcc-cert.pem", "octo-slot-aabbcc", now - 86400, now + 20 * 86400)
     shutil.copy(work / "old.pem", slot / "fabric-ca-root.pem")

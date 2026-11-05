@@ -397,10 +397,10 @@ Both gates are open for {args.id}. Nothing has been applied.{warn}
     -e fabric_ca_root_src={cas[0]}
 
 The slot anchor is now written into 10-pod.yml, so it needs no -e. The three cert/key
-srcs stay: they copy the operator's bundle into /etc/octo-uplink on this run, and the
+srcs stay: they copy the operator's bundle into /etc/fabric-uplink on this run, and the
 tasks that place them skip on later applies once the files are there.
 
-apply installs the key at 0640 root-owned under /etc/octo-uplink. The copies in
+apply installs the key at 0640 root-owned under /etc/fabric-uplink. The copies in
 {slot} are staging only: delete them afterwards, they are a private key.
 
 The operator must also have granted this anchor write access upstream. Without that the

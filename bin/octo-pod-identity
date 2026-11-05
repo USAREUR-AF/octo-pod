@@ -13,7 +13,7 @@ set -uo pipefail
 # at another — and the tool could only ever be exercised as root against the real
 # identity, which is why its behaviour went untested.
 ETC="${OCTO_POD_ETC:-/etc/octo-pod}"
-FABRIC_DIR="${OCTO_FABRIC_DIR:-/etc/octo-uplink}"
+FABRIC_DIR="${OCTO_FABRIC_DIR:-/etc/fabric-uplink}"
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 [ "${1:-}" = write ] || { sed -n '2,8p' "$0" >&2; exit 1; }

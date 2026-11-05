@@ -19,7 +19,7 @@ name: images
 on:
   push:
     branches: [main]
-    paths: ['arms/**', '.github/workflows/images.yml']
+    paths: ['arms/**', 'tools/check-image-sboms.py', '.github/workflows/images.yml']
   workflow_dispatch:
 
 # Supersede an in-flight run for the same ref, but never on main.
@@ -66,6 +66,8 @@ jobs:
           context: arms
           file: arms/${{ matrix.arm }}/Dockerfile
           platforms: ${{ matrix.platform }}
+          sbom: true
+          provenance: mode=max
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arm }}-${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arm }}-${{ matrix.platform }}
@@ -99,6 +101,10 @@ jobs:
         # The coverage job below now fails when the two drift.
         arm: [udp-ingest, tcp-ingest, tcp-connect, health-pub, egress, sapient, uplink-bridge]
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -163,6 +169,19 @@ jobs:
             [.manifests[]? | .platform | select(.os == "linux") | .architecture]
             | unique | contains(["amd64", "arm64"])
           ' || { echo "::error::manifest must carry both linux/amd64 and linux/arm64"; exit 1; }
+
+      - name: verify and export both platform SBOMs
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/octo-${{ matrix.arm }}"
+          SHA="sha-${GITHUB_SHA::7}"
+          python3 tools/check-image-sboms.py "${IMAGE}:${SHA}" --output-dir /tmp/sboms
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sbom-${{ matrix.arm }}-${{ github.sha }}
+          path: /tmp/sboms/*
+          if-no-files-found: error
+          retention-days: 90
 
       - name: promote a verified main build
         if: github.ref == 'refs/heads/main'

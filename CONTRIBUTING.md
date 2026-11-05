@@ -166,6 +166,28 @@ images on native amd64 and arm64 runners. Each image gets a `sha-<short-commit>`
 and a verified multi-architecture manifest. Main builds also promote `latest`;
 feature-branch builds do not. Deployments use digest pins, not `latest`.
 
+New image builds attach an SPDX SBOM and build provenance to each architecture's
+manifest in GHCR. Before promoting `latest`, the workflow downloads both platform
+SBOMs and requires OS package and Rust crate entries. The Rust crate inventory relies
+on the dependency metadata embedded by the Chainguard Rust builder's `cargo-auditable`
+wrapper; an OS-only scan fails this check. BuildKit attestations are metadata attached
+to an image, not independent cryptographic signatures.
+
+Each image also has a 90-day workflow artifact named `sbom-<arm>-<commit>` containing
+`linux-amd64.spdx.json`, `linux-arm64.spdx.json`, and `image.json` with the immutable
+image reference. With Docker Buildx and registry read access, download and check the
+registry copies after the workflow artifact expires:
+
+```zsh
+image_ref='ghcr.io/usareur-af/octo-udp-ingest:sha-<short-commit>'
+python3 tools/check-image-sboms.py "$image_ref" --output-dir sboms
+```
+
+Use a real commit tag or the reviewed image digest in that command. Older images are
+not updated by this workflow change. Third-party images and air-gap bundle metadata
+are outside this image-build check. SBOMs support vulnerability and licence review;
+they do not establish redistribution permission or complete licence compliance.
+
 Review all six `PIN-THIS` values and commit the matching `*_image_upstream` values in
 `platform/group_vars/all/10-infrastructure.yml`. Build and verify the package and
 container bundle from that pinned checkout. Publishing a new image does not change

@@ -2,6 +2,8 @@
 
 Run these commands on the pod unless a section says otherwise. `otp` is an alias
 for `octo-pod`. [Release status](release-status.md) lists what each release includes.
+For one bullet per ingress, egress, and local service, start with the
+[function overview](../README.md#functions).
 
 ## Everyday commands
 

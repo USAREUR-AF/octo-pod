@@ -79,7 +79,7 @@ SECRET_PARTS = ("secret", "token", "passw", "passphrase", "private", "credential
 # bridge's copy, and the slot certificate with the fabric's root, which nothing on the
 # pod renews. A test reads the playbook and fails if it writes certificates elsewhere.
 DEFAULT_COPIES = ("/etc/octo-arm/tls:/etc/octo-arm-*/tls:/etc/octo-egress-*/tls:"
-                  "/etc/octo-pen-uplink:/etc/octo-downlink/tls:/etc/octo-uplink")
+                  "/etc/octo-pen-uplink:/etc/octo-downlink/tls:/etc/fabric-uplink")
 COPIES = os.environ.get("OCTO_POD_CERT_COPIES", DEFAULT_COPIES)
 TIMERS = ("pen-cert-renew.timer", "pen-cert-expiry.timer")
 CA_FILES = ("ca-roots.pem", "ca-root.pem", "root-cert.pem")
@@ -274,7 +274,7 @@ def short(path):
     for pre in ("egress-", "arm-"):
         if base.startswith(pre):
             base = f"{pre[:-1]}/{base[len(pre):]}"
-    return f"{'slot' if base == 'octo-uplink' else base}/{f}"
+    return f"{'slot' if base == 'fabric-uplink' else base}/{f}"
 
 
 def certificates(days, now=None):

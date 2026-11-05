@@ -110,7 +110,7 @@ sapient_image: "ghcr.io/example/octo-sapient@sha256:5555555555555555555555555555
 egress_session_schemes: [sapient]
 egress_audit_dir: /var/lib/octo-egress
 downlink_tls_dir: /etc/octo-downlink/tls
-fabric_uplink_dir: /etc/octo-uplink
+fabric_uplink_dir: /etc/fabric-uplink
 sub_leaf_dir: /etc/octo-pen-uplink
 fabric_endpoint: "tls/fabric.example.invalid:7447"
 fabric_slot_anchor: "0123456789abcdef0123456789abcdef"

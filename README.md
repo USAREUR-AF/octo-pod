@@ -4,6 +4,51 @@ An edge gateway for UDP/TCP sensor feeds and Zenoh peers. Capture and audit loca
 then release selected feeds to a fabric or deliver fabric data to receivers.
 `otp` is a short alias for `octo-pod`.
 
+## Functions
+
+An **arm** connects one external feed or destination to the pod. **Ingress** brings
+data into the pod; **egress** sends released fabric data to a receiver. The **fabric**
+is the shared Zenoh network the pod joins. These are the functions exposed by the
+pod's configuration and CLI:
+
+### Ingress: bring data into the pod
+
+- **UDP ingress arm (`--udp`):** receives datagrams sent by a sensor to a UDP port on the pod.
+- **TCP listener ingress arm (`--tcp`):** accepts a sensor's TCP connection and receives its feed.
+- **TCP client ingress arm (`--dial`):** connects to a sensor's TCP server and receives its feed.
+- **Zenoh peer ingress (`add-peer`):** lets a system that already uses Zenoh connect directly and publish into its own permitted namespace.
+
+See [Adding a publisher](docs/operations.md#adding-a-publisher) for setup and TCP framing.
+
+### Egress: deliver released data to a receiver
+
+- **UDP egress arm (`udp://`):** sends each released message as a UDP datagram to the receiver.
+- **TCP client egress arm (`tcp://`):** connects to the receiver's TCP server and sends the released feed.
+- **TCP server egress arm (`tcp-server://`):** listens on the pod so an allowed receiver can connect and receive the released feed.
+- **SAPIENT egress arm (`sapient://`):** connects to a SAPIENT controller, registers as a sensor, maintains heartbeats, and relays released SAPIENT detections and alerts.
+- **Zenoh egress arm (`zenoh://`):** connects to a partner's own Zenoh router using credentials the partner issued, then publishes released data under the prefix they allowed.
+- **Zenoh peer reads (`peer allow-read`):** lets a partner connected to the pod's router subscribe to the fabric keys explicitly released to that partner.
+
+See [Egress setup](docs/operations.md#sending-fabric-data-to-a-system-that-cannot-join)
+and the [Zenoh partner guide](docs/guide-zenoh-partners.md). Zenoh partner egress and
+released peer reads require 0.5.0 or later; see [Release status](docs/release-status.md).
+
+### Local services and controls
+
+- **Local capture and audit:** records received feeds locally for inspection, subject to configured storage limits.
+- **Uplink bridge:** publishes only the local feeds explicitly released for the shared fabric.
+- **Downlink bridge:** brings only approved fabric keys into the pod for released egress destinations and peer reads.
+- **Identity and access:** gives each arm or peer its own certificate and restricts which Zenoh keys it may publish or read.
+- **Pod firewall:** when enabled, limits network traffic to the declared management, sensor, peer, and destination connections.
+- **Health reporting:** publishes the pod's own health to the fabric for monitoring.
+- **Operator inspection:** shows flow counters, service status, logs, and certificate checks through the CLI.
+- **Automatic maintenance:** renews certificates and repairs supported service faults without applying configuration changes automatically.
+- **Installation and upgrades:** installs verified software and carried container images, including at disconnected sites, while preserving the pod's identity and declarations.
+
+Byte ingress and byte egress preserve the payload format. SAPIENT egress manages the
+session and protocol envelope; its input must already contain SAPIENT messages.
+Local capture does not provide durable store-and-forward delivery.
+
 ## Requirements
 
 - **Pod:** Ubuntu 24.04, amd64 or arm64, with SSH and sudo access.
