@@ -1,0 +1,40 @@
+# SITE FACTS — interfaces and addressing for this one box.
+#
+# Every file in this directory is merged into one namespace, loaded alphabetically;
+# the numeric prefixes make that order explicit. No secrets here — pass those at
+# runtime with --extra-vars or a vault.
+#
+# Values below are a worked example. Replace them; do not assume any of them apply.
+
+# ---- interfaces (confirm with `ip -br addr`) --------------------------------
+# Names are NOT eth0/eth1 on most pod hardware. A Jetson presents enP2p1s0/wlP1p1s0;
+# guessing here costs you an apply that binds an arm to nothing.
+uplink_iface: wlP1p1s0          # the box's default route (WiFi, LTE, Satlink)
+lan_iface: enP2p1s0             # the wired leg publishers reach us on — arms bind here
+mesh_iface: wt0                 # NetBird
+
+# ---- addressing -------------------------------------------------------------
+# mesh_ip is NOT set here. It is derived from {{ mesh_iface }} at apply time, because
+# NetBird assigns it at enrolment and it changes if the peer re-enrols. Set it only to
+# override a working derivation.
+lan_ip: "10.20.30.10"          # our address on {{ lan_iface }}
+lan_prefix: 16                  # see the note below before narrowing this
+lan_conn_name: "Wired connection 1"   # the NetworkManager profile owning {{ lan_iface }}
+
+# WHY /16 AND NOT /24: with a /16, a publisher anywhere in 10.20.0.0/16 is ON-LINK —
+# ARP reaches it directly, no route and no firewall permit in the path. Narrow this to
+# /24 and a publisher at 10.20.30.50 suddenly needs a route you have not written and a
+# permit on a firewall you may not own. Size the prefix to cover every publisher you
+# expect, or accept that each one outside it is a separate networking conversation.
+
+# true  — netplan owns this NIC and the playbook persists the address itself.
+#         Correct for stock Ubuntu Server, which is what a new pod usually is.
+# false — NetworkManager already owns it and wrote its own netplan file. Leave it false,
+#         or the interface gets two owners and the address flaps between them.
+network_managed: true
+
+# ---- reachable partner subnets ---------------------------------------------
+# Only set this when a publisher lands OUTSIDE {{ lan_ip }}/{{ lan_prefix }}. On-link
+# publishers need no entry. A wrong value here sends you hunting a firewall rule that
+# does not exist.
+partner_subnet: ""              # e.g. "10.20.8.0/22"

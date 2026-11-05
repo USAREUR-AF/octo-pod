@@ -1,0 +1,54 @@
+# sapient — octo-pod session arm: BSI Flex 335 v2.0 over TCP.
+#
+# The second arm that holds a session and writes to its peer. A SAPIENT node cannot be
+# tapped: an ASM registers with its DMM and then heartbeats to stay registered, so an arm
+# that only read would be dropped by the peer within three intervals. See
+# ../../docs/engineering-principles.md, "Session arms: arms that write".
+#
+# The definitions are vendored and compiled in ../sapient-proto, which a translator can
+# share, so the two cannot disagree about the wire format.
+
+[package]
+name = "sapient"
+version = "0.1.0"
+# Never goes to crates.io: these are binaries baked into container images. Saying so is
+# also what lets cargo-deny accept the workspace path dependency — crates.io forbids
+# path deps, so a crate that CLAIMS to be publishable while using one is a real defect.
+publish = false
+description = "octo-pod SAPIENT session arm: BSI Flex 335 v2.0 over TCP, ASM or DMM, to native mTLS Zenoh publish"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sapient"
+path = "src/main.rs"
+
+[dependencies]
+octo-arm-common = { workspace = true }
+# Egress mode: the downlink gate, the destination allow list and the audit record,
+# shared with egress-arm so a sapient:// destination is held to the same rules.
+octo-egress = { workspace = true }
+serde_json = "1"
+zenoh = { workspace = true }
+# io-util: AsyncRead/WriteExt + io::split. sync: the bounded mpsc queues that keep socket
+# writes and zenoh puts off the driver loop.
+tokio = { workspace = true, features = ["io-util", "sync"] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+# The wire format. prost-types carries google.protobuf.Timestamp, which every
+# SapientMessage header sets.
+sapient-proto = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+# The node identity this arm registers under, minted once and persisted.
+uuid = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+sapient-receiver = { path = "../sapient-receiver" }

@@ -1,0 +1,45 @@
+# THIS POD's identity and its release gate. Everything here differs per pod;
+# shared policy lives in platform/group_vars/all/.
+
+# The local pen's name. Stage 2 — local plane only, so it need not match anything
+# upstream. Kept identical to the handle here because there is no reason to differ,
+# and two names for one box is how confusion starts.
+#
+# The FLEET handle is the inventory hostname: `pod-example-01`, which is also this
+# directory's name, the NetBird peer name and the slot alias. Those four are one
+# string by contract: the fleet joins registry to mesh on it, and a mismatch makes
+# the pod unrevokable. See docs/deployment.md, "Join a mesh".
+pen_id: "pod-example-01"
+
+# ---- arms bound directly by the pen (the built-in listeners) ---------------
+# Most publishers should be declared in 30-arms.yml instead, which generates the
+# cert and the ACL together. These are the pen's own listeners, for feeds that
+# predate that or need no separate identity.
+arm_bind_host: "127.0.0.1"
+arm_enabled: false                     # true = bring the TCP arm up on apply
+arm_feeds: "cot=8087:newline"          # TCP:  label=port[:framing]
+arm_udp_feeds: "telemetry=5001"        # UDP:  label=port
+arm_allow_sources: ""                  # "" = any source. Tighten once you know the IP.
+
+# ---- the sync leg (bridge → the remote goatnet) ---------------------------
+# THE RELEASE GATE. A namespace leaves this pod only if it is listed here AND that
+# publisher's own release.to_fabric is true. Two files, two deliberate edits — so no
+# single change can start exporting someone's data.
+bridge_allow: "raw/octo/**,raw/radar1/**"
+
+# The slot anchor is a PUBLIC identifier: it is stamped on every key this pod
+# publishes upstream and is visible in the portal. It comes from the join token —
+# `goat machine enroll` allocates it. Kept here so the bridge config can be
+# regenerated without runtime extra-vars.
+#
+# The matching CERT and KEY are secrets and are NEVER committed. Supply them at
+# runtime as fabric_slot_cert_src / fabric_slot_key_src / fabric_ca_root_src.
+fabric_slot_anchor: "0123456789abcdef0123456789abcdef"
+
+# ---- interfaces deliberately kept off the mesh ----------------------------
+isolated_ifaces: []
+
+# ---- mesh-only egress lockdown (DANGEROUS) --------------------------------
+# OFF by default. It can sever the mesh, which on a remote pod is its only path
+# back to you. Enable only with console access; the role applies a dead-man's-switch
+# auto-revert, but do not rely on it as your recovery plan.

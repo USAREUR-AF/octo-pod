@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# MANAGED BY ANSIBLE — edit platform/templates/pen/cert-expiry-check.sh.j2
+# pen-cert-expiry-check — fail loudly before the pen router's leaf expires.
+#
+# The pod's local Zenoh router presents a leaf issued by the pen's own CA, which
+# lives on THIS BOX at {{ pen_state_dir }}/ca/ca-key.pem. pen-cert-renew.timer
+# renews it from there, unattended, inside its renewal window — a pod at a border
+# site has nobody who could do it by hand.
+#
+# This check is therefore the ALARM, not the repair: it fires only if renewal has
+# not happened when it should have, which means something is wrong with renewal
+# itself. The two are separate units on purpose — one reports, one repairs.
+#
+# It still matters, because an unnoticed expiry stops the pen accepting arms and
+# presents as a broken router rather than an expired certificate.
+#
+# So: check daily, and exit NON-ZERO inside the warning window. A failed unit
+# shows up in `systemctl --failed`, which is the only always-present signal on
+# this host — it runs no node_exporter, so Prometheus cannot see it. When the
+# pod is brought into the scrape set, move this to a textfile-collector metric
+# and alert on it there instead.
+#
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+CERT="${CERT:-{{ pen_state_dir }}/zenoh/tls/pod-cert.pem}"
+WARN_DAYS="${WARN_DAYS:-{{ cert_expiry_warn_days | default(90) }}}"
+
+if [[ ! -r "$CERT" ]]; then
+    echo "CRITICAL: pen router certificate not readable at $CERT" >&2
+    exit 2
+fi
+
+end_date="$(openssl x509 -in "$CERT" -noout -enddate | cut -d= -f2)"
+end_epoch="$(date -u -d "$end_date" +%s)"
+now_epoch="$(date -u +%s)"
+days_left=$(( (end_epoch - now_epoch) / 86400 ))
+subject="$(openssl x509 -in "$CERT" -noout -subject | sed 's/^subject=//')"
+
+if (( days_left < 0 )); then
+    echo "CRITICAL: pen router certificate EXPIRED ${days_left#-} days ago (${end_date})." >&2
+    echo "  subject: $subject" >&2
+    echo '  The router is refusing arms, and automatic renewal did not run or failed.' >&2
+    echo '  Renew by hand:  sudo /usr/local/sbin/pen-cert-renew' >&2
+    echo '  Then check:     systemctl status pen-cert-renew.service' >&2
+    exit 2
+fi
+
+if (( days_left <= WARN_DAYS )); then
+    echo "WARNING: pen router certificate expires in ${days_left} day(s) (${end_date})." >&2
+    echo "  subject: $subject" >&2
+    echo '  pen-cert-renew.timer should have renewed this already — that it has not' >&2
+    echo '  means renewal is failing. Check: systemctl status pen-cert-renew.service' >&2
+    echo '  Force it now:   sudo /usr/local/sbin/pen-cert-renew' >&2
+    exit 1
+fi
+
+echo "OK: pen router certificate valid for ${days_left} more day(s) (${end_date})."
+echo "  subject: $subject"

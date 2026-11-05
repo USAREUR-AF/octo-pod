@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""
+octo-pod egress: declare, release, revoke, check and remove egress destinations.
+
+    octo-pod egress add     c2-radar1 --dest udp://10.1.2.20:8600 \\
+                            --key <anchor>/sensors/radar1/asterix/data
+    octo-pod egress add     c2-radar1 --dest tcp-server://10.1.2.10:9000 --from 10.1.2.20 \\
+                            --key <anchor>/sensors/radar1/radar-one/** --replay 2
+    octo-pod egress add     c2-sapient1 --dest sapient://10.1.2.30:48000 \\
+                            --key <anchor>/sapient/** --node-type RADAR
+    octo-pod egress release c2-radar1 --slot ~/slot --ca-fingerprint SHA256:<hex> --router-ip 100.127.0.10
+    octo-pod egress revoke  c2-radar1
+    octo-pod egress check
+    octo-pod egress remove  c2-radar1
+
+An egress destination is the mirror of an arm. An arm gives a certless SOURCE an identity,
+a namespace and an audit trail on the way in; a destination gives a certless RECEIVER the
+same on the way out: its own pen certificate, one literal address, and an audit record of
+every send. It is reached the way the receiver expects to reach the sensor:
+
+    udp://IP:PORT         the pod sends datagrams; the receiver listens
+    tcp://IP:PORT         the pod dials the receiver and streams
+    tcp-server://IP:PORT  the receiver dials the pod, as it would dial the radar; IP is the
+                          pod's own LAN address, and only --from addresses are served
+    sapient://IP:PORT     a SAPIENT session (BSI Flex 335 v2.0): the pod dials the
+                          controller, registers as a sensor node and sends it what was
+                          released. Each sample must already be one SapientMessage carrying
+                          a DetectionReport or Alert; the pod converts nothing
+    zenoh://IP:PORT       the receiver already runs Zenoh: the pod dials ITS router in
+                          client mode, with the certificate the receiver issued us
+                          (--partner-bundle), and publishes under the prefix it granted
+                          (--prefix). Nothing is translated.
+
+PEERS READ THROUGH THE SAME GATE. A peer with read_keys (`octo-pod peer allow-read`) uses
+downlink_allow exactly as a destination does, so `check` lists both, and `revoke` and
+`remove` never drop a key a released peer still reads.
+
+KEYS are any fabric keys the pod's slot can read, held to one scope rule: the first chunk
+names a publisher (or release/<lane>/), never a wildcard, and never ops, attest, system,
+downlink or @. The egress arm's gate and the playbook enforce the same rule.
+
+TWO GATES, AS ON THE WAY UP. Data reaches a destination only when its own
+release.from_fabric is true in 40-egress.yml AND its keys are listed in downlink_allow in
+10-pod.yml. `release` opens both for one destination and `revoke` closes both, so no
+single edit can start an export and naming one destination keeps it that way.
+
+THE SLOT. The downlink bridge reads the fabric as this pod's slot identity, which `join`
+does not supply. `release --slot <dir>` takes the bundle GOAT's portal issued for this
+pod (its <anchor>-cert.pem, <anchor>-key.pem, CA roots, signed profile and NOTES.md),
+persists the anchor, fills fabric_endpoint from the signed profile when it is empty, and,
+given --router-ip, pins the router's name, as `octo-pod release --slot` does for an arm.
+Nothing in the bundle is used until it is authenticated: --ca-fingerprint is the
+fingerprint of the key that signs the bundle, as the goatnet's operators gave it to you
+out of band and as `goat ca add` prints it. The signature must hold and the files must
+be the ones it covers; then the fingerprint and the CA roots' digest are pinned in
+10-pod.yml, and apply refuses any other roots (bin/octo_pod_slot.py has the detail).
+
+DESIGN, as for add-arm: this edits the DECLARATION and nothing else, except `remove`,
+which must stop the running arm before it forgets it (the reason is in octo-pod's
+remove-arm). `octo-pod check` then `apply` render the certificate, the pen grant and the
+unit. Validation is here AND in the playbook AND in the binaries: here it is a fast,
+friendly refusal before anything is written; there it is the gate that cannot be bypassed.
+"""
+import argparse
+import datetime
+import ipaddress
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import octo_pod_slot as slotlib  # noqa: E402  (the slot bundle, authenticated)
+
+ETC = pathlib.Path(os.environ.get("OCTO_POD_ETC", "/etc/octo-pod"))
+PEN_STATE = pathlib.Path(os.environ.get("OCTO_PEN_STATE", "/var/lib/octo-pen"))
+QUADLET_DIR = pathlib.Path(os.environ.get("OCTO_QUADLET_DIR", "/etc/containers/systemd"))
+# Each destination's TLS lives in <EGRESS_ETC>/octo-egress-<id>; /etc on a pod.
+EGRESS_ETC = pathlib.Path(os.environ.get("OCTO_EGRESS_ETC", "/etc"))
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+SCHEMES = ("udp", "tcp", "tcp-server", "sapient", "zenoh")
+# Schemes whose arm holds a session with the destination, and so runs only once released.
+# Must match egress_session_schemes in the platform's group_vars.
+SESSION_SCHEMES = ("sapient",)
+# The SAPIENT standard's NodeType values, without the NODE_TYPE_ prefix. The sapient arm
+# refuses anything else when it registers.
+SAPIENT_NODE_TYPES = ("OTHER", "RADAR", "LIDAR", "CAMERA", "SEISMIC", "ACOUSTIC",
+                      "PROXIMITY_SENSOR", "PASSIVE_RF", "HUMAN", "CHEMICAL", "BIOLOGICAL",
+                      "RADIATION", "KINETIC", "JAMMER", "CYBER", "LDEW", "RFDEW", "MOBILE_NODE",
+                      "POINTABLE_NODE", "FUSION_NODE")
+MAX_STATUS_INTERVAL = 300
+PARTNER_BUNDLES = pathlib.Path(os.environ.get("OCTO_PARTNER_BUNDLES", str(ETC / "partner-bundles")))
+RESERVED_ROOTS = ("ops", "attest", "system", "downlink")
+MAX_CLIENTS, MAX_REPLAY = 64, 1024
+
+
+def die(msg):
+    sys.exit(f"error: {msg}")
+
+
+def pod_dir():
+    hv = ETC / "host_vars"
+    pods = [p for p in hv.iterdir() if p.is_dir()] if hv.is_dir() else []
+    if not pods:
+        die(f"no pod identity under {hv}; run 'octo-pod join' first")
+    if len(pods) > 1:
+        die(f"more than one pod under {hv}: {[p.name for p in pods]}")
+    return pods[0]
+
+
+def load(path):
+    try:
+        import yaml
+    except ImportError:
+        die("pyyaml missing; install python3-yaml")
+    return (yaml.safe_load(path.read_text()) or {}) if path.exists() else {}
+
+
+def key_problem(key):
+    """Why a fabric key may not come down, or None. gate.rs in the egress crate and the
+    playbook's validation hold the same rule."""
+    chunks = key.split("/")
+    if not key or key != key.strip() or "" in chunks:
+        return f"key {key!r} is not a well-formed key expression"
+    first = chunks[0]
+    if first.startswith("@") or first in RESERVED_ROOTS:
+        return f"key {key!r} starts in a reserved namespace (ops, attest, system, downlink or @)"
+    if "*" in first or "$" in first:
+        return f"key {key!r} must start with a literal publisher or release lane, not a wildcard"
+    if first == "release" and (len(chunks) < 2 or "*" in chunks[1] or "$" in chunks[1]):
+        return f"key {key!r} must name its release lane"
+    return None
+
+
+def literal(addr):
+    """True for a literal, specific IP:port. A name could resolve somewhere else
+    tomorrow, and 0.0.0.0 would answer on every leg of the pod, the mesh included."""
+    if not isinstance(addr, str):
+        return False
+    host, _, port = addr.rpartition(":")
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    # isascii too: str.isdigit() is true for "²", which int() then refuses with a traceback.
+    return (not ip.is_unspecified and port.isascii() and port.isdigit()
+            and len(port) <= 5 and 0 < int(port) < 65536)
+
+
+def ipv4_list(text):
+    """The literal IPv4 addresses in a comma list, or None if any entry is not one."""
+    out = []
+    for item in (x.strip() for x in str(text or "").split(",")):
+        if not item:
+            continue
+        try:
+            ip = ipaddress.IPv4Address(item)
+        except ValueError:
+            return None
+        if ip.is_unspecified:
+            return None
+        out.append(str(ip))
+    return out
+
+
+def whole(value):
+    """True for a YAML integer. bool is an int subclass, so `true` would pass as 1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def problems_with(dest):
+    """Everything that would make a destination unsafe to release.
+
+    40-egress.yml can be hand-edited, so a field can hold any YAML type. Each check
+    refuses a wrong type with the field's name rather than raising on it: a traceback
+    here buries the one line that says what to fix."""
+    if not isinstance(dest, dict):
+        return ["destination must be a map"]
+    out = []
+    if not isinstance(dest.get("release", {}), dict):
+        out.append("release must be a map holding from_fabric: true or false")
+    keys = dest.get("keys") or []
+    if not isinstance(keys, list):
+        out.append("keys must be a list")
+        keys = []
+    if not keys:
+        out.append("it declares no keys")
+    out += [p for p in (key_problem(str(k)) for k in keys) if p]
+    target = str(dest.get("dest", ""))
+    scheme, _, addr = target.partition("://")
+    if scheme not in SCHEMES or not literal(addr):
+        out.append(f"dest {target!r} must be udp://, tcp://, tcp-server://, sapient:// or zenoh:// with "
+                   "a literal, specific IP:port")
+    allowed = [a.strip() for a in str(dest.get("allow_dest", "")).split(",") if a.strip()]
+    if addr not in allowed:
+        out.append(f"dest {addr!r} is not in its own allow_dest {allowed}")
+    if scheme == "tcp-server":
+        if not ipv4_list(dest.get("allow_sources")):
+            out.append("a tcp-server:// destination needs allow_sources: the literal IPv4 "
+                       "addresses of the consumers that may dial it")
+        clients, replay = dest.get("max_clients", 1), dest.get("replay", 0)
+        if not whole(clients) or not 1 <= clients <= MAX_CLIENTS:
+            out.append(f"max_clients must be a whole number, 1-{MAX_CLIENTS}")
+        if not whole(replay) or not 0 <= replay <= MAX_REPLAY:
+            out.append(f"replay must be a whole number, 0-{MAX_REPLAY}")
+    if scheme == "sapient":
+        out += sapient_problems(dest.get("sapient") or {})
+    if scheme == "zenoh":
+        prefix = str(dest.get("prefix", ""))
+        if not prefix or "*" in prefix or "$" in prefix or prefix.startswith("/"):
+            out.append("a zenoh:// destination needs a literal prefix: the namespace the "
+                       "receiver granted us on its router, never a wildcard")
+        if dest.get("allow_prefix") != prefix:
+            out.append("allow_prefix must equal prefix")
+        bundle = pathlib.Path(str(dest.get("partner_bundle_dir", "")))
+        missing = [f for f in ("cert.pem", "key.pem", "ca.pem") if not (bundle / f).is_file()]
+        if missing:
+            out.append(f"partner_bundle_dir {bundle} lacks {', '.join(missing)}")
+    return out
+
+
+def sapient_problems(sap):
+    """What would make a sapient:// destination's registration fail at the controller."""
+    if not isinstance(sap, dict):
+        return ["sapient must be a map"]
+    out = []
+    node_type = str(sap.get("node_type", "OTHER")).upper().removeprefix("NODE_TYPE_")
+    if node_type not in SAPIENT_NODE_TYPES:
+        out.append(f"sapient node_type {node_type!r} is not one of the standard's NodeType "
+                   f"values ({', '.join(SAPIENT_NODE_TYPES)})")
+    interval = sap.get("status_interval_s", 5)
+    if (isinstance(interval, bool) or not isinstance(interval, int)
+            or not 1 <= interval <= MAX_STATUS_INTERVAL):
+        out.append(f"sapient status_interval_s must be a whole number, 1-{MAX_STATUS_INTERVAL}")
+    for cap in [c.strip() for c in str(sap.get("capabilities", "") or "").split(",") if c.strip()]:
+        fields = [f.strip() for f in cap.split(":")]
+        if len(fields) < 2 or not fields[0] or not fields[1] or len(fields) > 4:
+            out.append(f"sapient capability {cap!r} is not category:type[:value[:units]]")
+    return out
+
+
+def downlink_readers(d):
+    """Everything that reads through downlink_allow: egress destinations, and peers with
+    read_keys. One list, so no gate decision counts one kind and forgets the other."""
+    out = []
+    for e in load(d / "40-egress.yml").get("egress") or []:
+        out.append({"kind": "egress", "id": e.get("id"), "keys": list(e.get("keys") or []),
+                    "released": released(e), "where": e.get("dest")})
+    for p in load(d / "20-peers.yml").get("peers") or []:
+        if p.get("read_keys"):
+            out.append({"kind": "peer", "id": p.get("id"), "keys": list(p.get("read_keys") or []),
+                        "released": released(p), "where": "peer, reads downlink/<key>"})
+    return out
+
+
+def still_needed(d, except_kind, except_id):
+    """Keys some OTHER released reader still needs, so closing one never cuts off another."""
+    return {k for r in downlink_readers(d)
+            if r["released"] and not (r["kind"] == except_kind and r["id"] == except_id)
+            for k in r["keys"]}
+
+
+def find_block(text, ident):
+    """(start, end) of one destination's entry, from its '- id:' line to the next."""
+    m = re.search(rf"^(\s*)- id: {re.escape(ident)}\s*$", text, re.M)
+    if not m:
+        return None
+    nxt = re.search(r"^\s*- id: ", text[m.end():], re.M)
+    end = m.end() + (nxt.start() if nxt else len(text) - m.end())
+    return m.start(), end
+
+
+def set_flag(path, ident, value):
+    """Set release.from_fabric in one entry, replacing the line and its stale comment."""
+    text = path.read_text()
+    span = find_block(text, ident)
+    if span is None:
+        die(f"{ident} has no entry in {path.name}")
+    start, end = span
+    block = text[start:end]
+    new, n = re.subn(r"from_fabric:\s*(true|false)[^\n]*(?:\n[ \t]+#[^\n]*)*",
+                     f"from_fabric: {'true' if value else 'false'}", block, count=1)
+    if not n:
+        die(f"{ident} in {path.name} has no 'release: from_fabric:' line")
+    path.write_text(text[:start] + new + text[end:])
+    return new != block
+
+
+def edit_pod(pod_file, key, value):
+    """Rewrite one `key: "value"` line in 10-pod.yml, adding it when a pre-egress pod
+    lacks it. A pod made before egress existed has no downlink lines at all."""
+    text = pod_file.read_text()
+    line = f'{key}: "{value}"'
+    m = re.search(rf'^{key}:\s*"[^"]*"', text, re.M)
+    if m:
+        text = text[: m.start()] + line + text[m.end():]
+    else:
+        text = text.rstrip("\n") + "\n" + line + "\n"
+    pod_file.write_text(text)
+
+
+def allow_list(pod):
+    return [x for x in str(pod.get("downlink_allow", "") or "").split(",") if x]
+
+
+def released(dest):
+    # A hand-edited `release: open` is not a map. The playbook reads release.from_fabric
+    # on it as undefined, so shut; read it the same way here instead of raising.
+    release = dest.get("release")
+    return isinstance(release, dict) and bool(release.get("from_fabric", False))
+
+
+def holds_session(dest):
+    """Whether the destination's arm registers with the far side, released or not."""
+    return str(dest.get("dest", "")).partition("://")[0] in SESSION_SCHEMES
+
+
+def slot_material(slot):
+    """The files of a GOAT bundle directory, or die naming why."""
+    try:
+        return slotlib.slot_material(slot)
+    except slotlib.SlotError as exc:
+        die(str(exc))
+
+
+def set_fabric(d, endpoint, router_ip):
+    """Fill fabric_endpoint and the router's pin in 05-fabric.yml, only where empty. A value
+    an operator already set is theirs and is left alone."""
+    f = d / "05-fabric.yml"
+    if not f.exists():
+        die(f"no {f}; run 'octo-pod join' first")
+    fabric = load(f)
+    text = f.read_text()
+    current = str(fabric.get("fabric_endpoint", "") or "")
+    if not current and endpoint:
+        text, n = re.subn(r"^fabric_endpoint:.*$", f"fabric_endpoint: {endpoint}", text, count=1, flags=re.M)
+        if not n:
+            text = text.rstrip("\n") + f"\nfabric_endpoint: {endpoint}\n"
+        print(f"set fabric_endpoint: {endpoint} in 05-fabric.yml")
+        current = endpoint
+    elif current:
+        print(f"kept fabric_endpoint: {current}")
+    if not (fabric.get("fabric_host_pins") or []):
+        host = current.removeprefix("tls/").rsplit(":", 1)[0]
+        if router_ip and host:
+            try:
+                ipaddress.ip_address(router_ip)
+            except ValueError:
+                die(f"--router-ip {router_ip!r} is not an IP address")
+            block = f'fabric_host_pins:\n  - {{ ip: "{router_ip}", names: "{host}" }}'
+            text, n = re.subn(r"^fabric_host_pins:.*$", block, text, count=1, flags=re.M)
+            if not n:
+                text = text.rstrip("\n") + "\n" + block + "\n"
+            print(f"pinned {host} to {router_ip} in 05-fabric.yml")
+        else:
+            print("note: fabric_host_pins is empty. The downlink bridge needs the router's name to "
+                  f"resolve; give --router-ip <its mesh address> to pin {host or 'it'}.")
+    f.write_text(text)
+
+
+def existing_ids(d):
+    out = []
+    for f, k in (("20-peers.yml", "peers"), ("30-arms.yml", "arms"), ("40-egress.yml", "egress")):
+        out += [x.get("id") for x in (load(d / f).get(k) or [])]
+    return [x for x in out if x]
+
+
+def verify_yaml(path, key, ident, present):
+    """Re-read a file just written: an unparseable declaration fails at 3am otherwise."""
+    try:
+        back = load(path)
+    except Exception as e:  # noqa: BLE001 - any parse failure is the finding
+        die(f"wrote invalid YAML to {path}: {e}")
+    ids = [x.get("id") for x in (back.get(key) or [])]
+    if (ident in ids) != present:
+        die(f"{path} {'lacks' if present else 'still holds'} {ident} after the write; inspect it")
+
+
+def cmd_add(args, d):
+    if not ID_RE.match(args.id or ""):
+        die(f"id {args.id!r} must be lowercase alphanumeric/dashes: it becomes a CN and a unit name")
+    if args.id in existing_ids(d):
+        die(f"{args.id} is already declared on this pod")
+    if not args.key:
+        die("give at least one --key: the fabric keys this destination receives, e.g. "
+            "<anchor>/sensors/radar1/asterix/data")
+    bad = [p for p in (key_problem(k) for k in args.key) if p]
+    if bad:
+        die("refusing these keys:\n  - " + "\n  - ".join(bad))
+
+    scheme, _, addr = args.dest.partition("://")
+    if scheme not in SCHEMES or not literal(addr):
+        die(f"--dest {args.dest!r} must be udp://, tcp://, tcp-server:// sapient:// or zenoh:// with a "
+            "literal, specific IP:port: a name could resolve somewhere else tomorrow")
+    sapient_given = (args.node_type, args.status_interval, args.capabilities) != (None, None, None)
+    if sapient_given and scheme != "sapient":
+        die("--node-type, --status-interval and --capabilities apply to sapient:// only")
+    if scheme != "zenoh" and (args.prefix or args.partner_bundle):
+        die("--prefix and --partner-bundle apply to zenoh:// only")
+    serve = ""
+    if scheme == "tcp-server":
+        peers = ipv4_list(args.src)
+        if not peers:
+            die("a tcp-server:// destination needs --from: the IPv4 addresses of the consumers "
+                "that may dial it (a listener with no allowed consumer answers no one)")
+        if not 1 <= args.max_clients <= MAX_CLIENTS:
+            die(f"--max-clients must be 1-{MAX_CLIENTS}")
+        if not 0 <= args.replay <= MAX_REPLAY:
+            die(f"--replay must be 0-{MAX_REPLAY}")
+        serve = (f'\n    allow_sources: "{", ".join(peers)}"'
+                 f"\n    max_clients: {args.max_clients}\n    replay: {args.replay}")
+        lan_ip = str(load(d / "00-site.yml").get("lan_ip", "") or "")
+        if lan_ip and addr.rpartition(":")[0] != lan_ip:
+            print(f"note: {addr} is not this pod's lan_ip ({lan_ip}); consumers must reach it there")
+    elif scheme == "zenoh":
+        if args.src:
+            die("--from applies to tcp-server:// only: for zenoh:// the pod dials the receiver")
+        prefix = (args.prefix or "").strip().strip("/")
+        if not prefix or "*" in prefix or "$" in prefix:
+            die("a zenoh:// destination needs --prefix: the literal namespace the receiver "
+                "granted us on its router (e.g. raw/goat), never a wildcard")
+        src = pathlib.Path(args.partner_bundle or "")
+        missing = [f for f in ("cert.pem", "key.pem", "ca.pem") if not (src / f).is_file()]
+        if not args.partner_bundle or missing:
+            die("a zenoh:// destination needs --partner-bundle <dir> holding cert.pem, key.pem "
+                "and ca.pem: the certificate the receiver issued us, its key, and the "
+                "receiver's CA" + (f" (missing: {', '.join(missing)})" if missing and args.partner_bundle else ""))
+        # Kept under /etc/octo-pod, not wherever the operator unpacked it: the declaration
+        # must not depend on a download directory that gets cleaned up.
+        keep = PARTNER_BUNDLES / args.id
+        keep.mkdir(parents=True, exist_ok=True)
+        os.chmod(keep, 0o700)
+        for f in ("cert.pem", "key.pem", "ca.pem"):
+            (keep / f).write_bytes((src / f).read_bytes())
+            os.chmod(keep / f, 0o600 if f == "key.pem" else 0o644)
+        serve = (f'\n    kind: zenoh-egress\n    prefix: "{prefix}"\n    allow_prefix: "{prefix}"'
+                 f'\n    partner_bundle_dir: "{keep}"'
+                 + ("\n    verify_name_partner: false" if args.no_verify_name else ""))
+        print(f"kept the receiver's bundle in {keep}")
+    elif args.src:
+        die("--from applies to tcp-server:// only: for udp://, tcp:// and sapient:// the pod "
+            "connects out")
+    if scheme == "sapient":
+        sap = {"node_type": (args.node_type or "OTHER").upper().removeprefix("NODE_TYPE_"),
+               "status_interval_s": 5 if args.status_interval is None else args.status_interval,
+               "capabilities": args.capabilities or ""}
+        bad = sapient_problems(sap)
+        if bad:
+            die("refusing this SAPIENT declaration:\n  - " + "\n  - ".join(bad))
+        serve = (f"\n    sapient:\n      node_type: {sap['node_type']}"
+                 f"\n      status_interval_s: {sap['status_interval_s']}"
+                 f"\n      capabilities: \"{sap['capabilities']}\"")
+
+    how = {"udp": f"udp to {addr}", "tcp": f"tcp to {addr}",
+           "tcp-server": f"consumers dial {addr}",
+           "sapient": f"SAPIENT session to {addr}",
+           "zenoh": f"publishes into the receiver's Zenoh router at {addr}"}[scheme]
+    today = datetime.date.today().isoformat()
+    keys = "".join(f'\n      - "{k}"' for k in args.key)
+    entry = f"""
+  - id: {args.id}
+    description: "{args.description or f'{args.id}, {how}'}"
+    cert_cn: octo-egress-{args.id}
+    enabled: true
+    dest: "{args.dest}"
+    allow_dest: "{addr}"{serve}
+    keys:{keys}
+    onboarded: "{today}"
+    release:
+      from_fabric: false   # shut until you have checked what it would receive. Opening
+                           # it also adds its keys to downlink_allow in 10-pod.yml.
+"""
+    target = d / "40-egress.yml"
+    text = target.read_text() if target.exists() else "egress: []\n"
+    text = re.sub(r"^egress:\s*\[\]\s*$", "egress:", text, count=1, flags=re.M)
+    if not re.search(r"^egress:", text, re.M):
+        text = f"egress:\n{text}"
+    target.write_text(text.rstrip("\n") + "\n" + entry.lstrip("\n"))
+    verify_yaml(target, "egress", args.id, True)
+    pod_file = d / "10-pod.yml"
+    if "downlink_allow" not in load(pod_file):
+        edit_pod(pod_file, "downlink_allow", "")
+    print(f"declared {args.id} in {target} (shut: nothing reaches it until released)")
+    if scheme in SESSION_SCHEMES:
+        print("its arm does not run, and so opens no session with the destination, until it "
+              "is released")
+    print("\nNothing on the pod has changed yet. Next:\n  octo-pod check\n  sudo octo-pod apply")
+    return 0
+
+
+def cmd_check(d):
+    allow = allow_list(load(d / "10-pod.yml"))
+    readers = downlink_readers(d)
+    bad = 0
+    for r in readers:
+        listed = all(k in allow for k in r["keys"])
+        state = "RELEASED" if r["released"] and listed else ("shut" if not r["released"] else "DISAGREE")
+        bad += state == "DISAGREE"
+        print(f"  {r['kind']:6} {r['id'] or '?':16} {state:9} {r['where']}")
+    orphans = [k for k in allow if not any(k in r["keys"] and r["released"] for r in readers)]
+    if orphans:
+        print(f"  downlink_allow names keys no released destination or peer declares: {orphans}")
+    if bad:
+        print("  DISAGREE: release.from_fabric is open but its keys are missing from "
+              "downlink_allow. Run 'octo-pod egress release <id>' or "
+              "'octo-pod peer allow-read <id> --key <k>' to repair both gates.")
+    return 1 if bad or orphans else 0
+
+
+def cmd_release(args, d):
+    pod_file = d / "10-pod.yml"
+    pod = load(pod_file)
+    target = d / "40-egress.yml"
+    dests = {e.get("id"): e for e in (load(target).get("egress") or [])}
+    dest = dests.get(args.id)
+    if dest is None:
+        die(f"{args.id} is not declared in {target.name}. Known: {', '.join(sorted(dests)) or 'none'}")
+    problems = problems_with(dest)
+    if problems:
+        die(f"refusing to release {args.id}:\n  - " + "\n  - ".join(problems))
+    slot = None
+    trusted = None
+    if args.slot:
+        slot = slot_material(args.slot)
+        # The bundle is authenticated before anything is edited, so a bad one changes nothing.
+        try:
+            trusted = slotlib.trust(slot, expected=args.ca_fingerprint,
+                                    pinned_ca=str(pod.get(slotlib.PIN_CA, "") or ""),
+                                    pinned_roots=str(pod.get(slotlib.PIN_ROOTS, "") or ""),
+                                    ask=slotlib.terminal_ask())
+        except slotlib.SlotError as exc:
+            die(str(exc))
+    elif args.ca_fingerprint:
+        die("--ca-fingerprint checks the key that signs a bundle: pass it with --slot")
+    changed = set_flag(target, args.id, True)
+    print(("opened" if changed else "already open:") + f" release.from_fabric for {args.id}")
+    allow = allow_list(pod)
+    allow += [k for k in dest["keys"] if k not in allow]
+    edit_pod(pod_file, "downlink_allow", ",".join(allow))
+    print(f"downlink_allow now holds {len(allow)} key(s)")
+    apply = "  sudo octo-pod apply"
+    if slot:
+        edit_pod(pod_file, "fabric_slot_anchor", slot.anchor)
+        print(f"set fabric_slot_anchor to {slot.anchor} in 10-pod.yml")
+        for line in slotlib.record(pod_file, trusted):
+            print(line)
+        for warning in trusted.warnings:
+            print(f"WARNING: {warning}")
+        set_fabric(d, trusted.endpoint, args.router_ip)
+        apply = (f"  sudo octo-pod apply \\\n    -e fabric_slot_cert_src={slot.cert} \\\n"
+                 f"    -e fabric_slot_key_src={slot.key} \\\n    -e fabric_ca_root_src={slot.ca}")
+    elif not str(pod.get("fabric_slot_anchor", "") or ""):
+        print("note: this pod holds no slot, so the downlink bridge cannot read the fabric. "
+              "Re-run with --slot <the bundle GOAT issued for this pod>.")
+    session = (" It also starts the arm, which\nopens its session with the destination only now."
+               if holds_session(dest) else "")
+    print(f"""
+Both downward gates are open for {args.id}. Nothing has been applied.
+
+  octo-pod check
+{apply}
+
+apply renders the pen grant for {dest['cert_cn']} (read only, its {len(dest['keys'])} key(s)) and
+restarts the downlink bridge with the new downlink_allow.{session} Confirm delivery at the
+destination and in its audit record under /var/lib/octo-egress/{args.id}/.""")
+    return 0
+
+
+def close_gates(d, ident, dests):
+    """Close one destination's flag, and drop keys no other released destination needs."""
+    pod_file = d / "10-pod.yml"
+    set_flag(d / "40-egress.yml", ident, False)
+    # Peers read through the same gate: a key a released peer still reads stays open.
+    still = still_needed(d, "egress", ident)
+    allow = [k for k in allow_list(load(pod_file)) if k in still or k not in dests[ident].get("keys", [])]
+    edit_pod(pod_file, "downlink_allow", ",".join(allow))
+    return allow
+
+
+def cmd_revoke(args, d):
+    target = d / "40-egress.yml"
+    dests = {e.get("id"): e for e in (load(target).get("egress") or [])}
+    if args.id not in dests:
+        die(f"{args.id} is not declared in {target.name}. Known: {', '.join(sorted(dests)) or 'none'}")
+    allow = close_gates(d, args.id, dests)
+    print(f"closed release.from_fabric for {args.id}; downlink_allow now holds {len(allow)} key(s)")
+    if holds_session(dests[args.id]):
+        print("\nNext: sudo octo-pod apply. It withdraws the pen grant and stops the arm, "
+              "which ends its session with the destination.")
+    else:
+        print("\nNext: sudo octo-pod apply. It withdraws the pen grant; the egress arm keeps "
+              "running and receives nothing.")
+    return 0
+
+
+def systemctl(*argv):
+    """Run systemctl; on a box without it, say so instead of a traceback."""
+    try:
+        return subprocess.run(["systemctl", *argv], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        print(f"note: no systemctl here; skipped 'systemctl {' '.join(argv)}'")
+        return None
+
+
+def cmd_remove(args, d):
+    target = d / "40-egress.yml"
+    dests = {e.get("id"): e for e in (load(target).get("egress") or [])}
+    if args.id not in dests:
+        die(f"{args.id} is not declared in {target.name}. Known: {', '.join(sorted(dests)) or 'none'}")
+
+    # What this destination owns on disk. The certificate stays, as remove-arm keeps it:
+    # an audit record naming the CN must still resolve to who it was.
+    key = PEN_STATE / "zenoh" / "tls" / f"{args.id}-egress-key.pem"
+    csr = PEN_STATE / "ca" / f"{args.id}-egress.csr"
+    egressdir = EGRESS_ETC / f"octo-egress-{args.id}"
+    unit = QUADLET_DIR / f"octo-egress-{args.id}.container"
+    partner = PARTNER_BUNDLES / args.id   # zenoh:// only: the receiver's key for us
+
+    print(f"This removes egress destination {args.id} ({dests[args.id].get('dest')}):")
+    print(f"  stop and delete  octo-egress-{args.id}.service ({unit})")
+    print(f"  delete           {key}, {csr}, {egressdir}/"
+          + (f", {partner}/" if partner.exists() else ""))
+    print("  close            both downward gates, then drop its declaration")
+    print("  keep             its certificate and its audit records under /var/lib/octo-egress/")
+    if not args.yes:
+        typed = input(f"\nType the id to confirm ({args.id}): ").strip()
+        if typed != args.id:
+            die("not confirmed; nothing changed")
+
+    # Stop BEFORE forgetting: a unit left on disk resurrects its arm at the next boot.
+    systemctl("stop", f"octo-egress-{args.id}.service")
+    unit.unlink(missing_ok=True)
+    systemctl("daemon-reload")
+    for p in (key, csr):
+        p.unlink(missing_ok=True)
+    for tree in (egressdir, partner):
+        if tree.exists():
+            for f in sorted(tree.rglob("*"), reverse=True):
+                f.unlink() if f.is_file() or f.is_symlink() else f.rmdir()
+            tree.rmdir()
+
+    close_gates(d, args.id, dests)
+    text = target.read_text()
+    span = find_block(text, args.id)
+    if span is not None:
+        start, end = span
+        text = text[:start] + text[end:]
+        if not re.search(r"^\s*- id: ", text, re.M):
+            text = re.sub(r"^egress:[ \t]*$", "egress: []", text, count=1, flags=re.M)
+        target.write_text(text.rstrip("\n") + "\n")
+    verify_yaml(target, "egress", args.id, False)
+    print(f"\nremoved {args.id}. Next: sudo octo-pod apply, which withdraws its pen grant.")
+    return 0
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.stderr.write(
+            "\nERROR: run with sudo. Declarations live in /etc/octo-pod, which is root-owned.\n"
+            f"  sudo octo-pod egress {' '.join(sys.argv[1:]) or '<verb> ...'}\n\n")
+        return 2
+    ap = argparse.ArgumentParser(prog="octo-pod egress")
+    ap.add_argument("verb", choices=["add", "release", "revoke", "check", "remove"])
+    ap.add_argument("id", nargs="?")
+    ap.add_argument("--dest", help="add: udp://IP:PORT, tcp://IP:PORT, tcp-server://IP:PORT "
+                                   "(the pod listens on its own IP and the consumer dials it), or "
+                                   "sapient://IP:PORT (a SAPIENT session to a controller), or "
+                                   "zenoh://IP:PORT (the receiver's own Zenoh router)")
+    ap.add_argument("--prefix", help="add, zenoh:// only: the namespace the receiver granted us")
+    ap.add_argument("--partner-bundle",
+                    help="add, zenoh:// only: a directory with cert.pem, key.pem and ca.pem, "
+                         "as the receiver issued them to us")
+    ap.add_argument("--no-verify-name", action="store_true",
+                    help="add, zenoh:// only: do not check the receiver router's certificate "
+                         "name (when it is issued for an identity, not the address we dial)")
+    ap.add_argument("--key", action="append",
+                    help="add: a fabric key this destination receives, starting with its "
+                         "publisher's anchor (or release/<lane>/); repeat for more")
+    ap.add_argument("--from", dest="src",
+                    help="add, tcp-server:// only: the consumers' IPv4 addresses, comma-separated")
+    ap.add_argument("--max-clients", type=int, default=1,
+                    help="add, tcp-server:// only: most consumers at once (default 1)")
+    ap.add_argument("--replay", type=int, default=0,
+                    help="add, tcp-server:// only: newest status messages replayed on connect")
+    ap.add_argument("--node-type",
+                    help="add, sapient:// only: the SAPIENT NodeType this pod registers as "
+                         "(default OTHER), for example RADAR")
+    ap.add_argument("--status-interval", type=int,
+                    help=f"add, sapient:// only: heartbeat seconds, 1-{MAX_STATUS_INTERVAL} (default 5)")
+    ap.add_argument("--capabilities",
+                    help="add, sapient:// only: capabilities to declare, "
+                         "category:type[:value[:units]], comma-separated")
+    ap.add_argument("--description", default="")
+    ap.add_argument("--yes", action="store_true", help="remove: skip the typed confirmation")
+    ap.add_argument("--slot", help="release: the bundle GOAT issued for this pod (cert, key, CA roots, signed profile, NOTES.md)")
+    ap.add_argument("--router-ip", help="release: the router's mesh address, pinned when no pin exists")
+    ap.add_argument("--ca-fingerprint",
+                    help="release --slot: the fingerprint of the key that signs the bundle, as the "
+                         "goatnet's operators gave it to you and `goat ca add` prints it (SHA256:<hex>)")
+    args = ap.parse_args()
+    d = pod_dir()
+    if args.verb == "check":
+        return cmd_check(d)
+    if not args.id:
+        die(f"usage: octo-pod egress {args.verb} <destination-id>")
+    if args.verb == "add":
+        if not args.dest:
+            die("usage: octo-pod egress add <id> --dest udp://IP:PORT|tcp://IP:PORT|"
+                "tcp-server://IP:PORT|sapient://IP:PORT|zenoh://IP:PORT [--from IP,...] "
+                "[--prefix P --partner-bundle DIR] --key <anchor>/<key>")
+        return cmd_add(args, d)
+    return {"release": cmd_release, "revoke": cmd_revoke, "remove": cmd_remove}[args.verb](args, d)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

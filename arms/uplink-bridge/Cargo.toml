@@ -1,0 +1,35 @@
+# uplink-bridge — the pod's sync leg. One small process holding TWO zenoh client
+# sessions:
+#   - subscriber on the pen router (pen-CA client cert, local LAN)
+#   - publisher on the fabric router (portal-minted slot cert, over the mesh)
+# Every sample matching the key allowlist on the pen is republished into the fabric
+# under `<slot_prefix>/<original_key>` — provenance in the key path. OUTBOUND ONLY:
+# the fabric session never declares a subscriber.
+#
+# Deliberately NOT cross-CA router federation: the bridge is a normal, scoped fabric
+# publisher whose write authority is exactly the minted slot anchor.
+
+[package]
+name = "uplink-bridge"
+version = "0.1.0"
+publish = false
+description = "octo-pod uplink bridge: pen to fabric scoped zenoh republish, outbound only"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "uplink-bridge"
+path = "src/main.rs"
+
+[dependencies]
+zenoh = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

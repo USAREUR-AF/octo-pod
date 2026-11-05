@@ -1,0 +1,42 @@
+# /etc/containers/systemd/octo-pen-audit-sink{{ sink_suffix }}.container — MANAGED BY ANSIBLE
+#
+# One audit sink per declared publisher, from the same declaration as the ACL —
+# a namespace that can be written is a namespace that is watched. Zenoh is
+# brokerless: an unobserved put is gone, not queued.
+#
+# Rendered once per declaration by the playbook ({{ 'the catch-all pen sink' if sink_suffix == '' else 'publisher ' + (sink_suffix | replace('-', '', 1)) }});
+# a reap task removes any sink unit no declaration names, so removal converges
+# too — the unit file set IS the declared set.
+
+[Unit]
+Description=octo-pod pen — audit sink{{ sink_suffix }}
+# After/Wants order startup after the router health notification. Podman 4.7+ uses
+# the router's explicit --sdnotify=healthy; Podman 5+ also supports Notify=healthy.
+# PartOf propagates router restarts. The watchdog detects and repairs failed sessions.
+After=octo-pen-zenoh-router.service
+Wants=octo-pen-zenoh-router.service
+PartOf=octo-pen-zenoh-router.service
+
+[Container]
+Image={{ audit_image }}
+ContainerName=octo-pen-audit-sink{{ sink_suffix }}
+# Own netns (NOT host) so this sink's peer listener cannot collide with the
+# router on :{{ pen_listen_port }}; it dials the router via the host
+# gateway alias instead.
+PodmanArgs=--add-host penhost:host-gateway
+Environment=AUDIT_SUBSCRIBER_ENDPOINT=tls/penhost:{{ pen_listen_port }}
+Environment=AUDIT_SUBSCRIBER_KEY={{ sink_key }}
+Environment=AUDIT_SUBSCRIBER_ID={{ sink_sub_id }}
+Environment=AUDIT_SUBSCRIBER_CERT=/etc/zenoh/tls/pod-cert.pem
+Environment=AUDIT_SUBSCRIBER_KEY_FILE=/etc/zenoh/tls/pod-key.pem
+Environment=AUDIT_SUBSCRIBER_ROOT_CA=/etc/zenoh/tls/ca-roots.pem
+Environment=AUDIT_SUBSCRIBER_METRICS_BIND=0.0.0.0:{{ audit_metrics_port }}
+Volume={{ pen_state_dir }}/zenoh/tls:/etc/zenoh/tls:ro
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

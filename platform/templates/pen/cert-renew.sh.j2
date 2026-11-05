@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# MANAGED BY ANSIBLE — renew the pen's own certificates, on the pod, with no operator.
+#
+# WHY THIS EXISTS
+#   Every leaf the pen mints is valid for 825 days and was written once, guarded by
+#   `creates:`, so nothing ever re-minted it. On a known date, roughly two years after
+#   provisioning, the router stops accepting arms — presenting as a broken router
+#   rather than an expired certificate — and the documented fix was "re-issue from the
+#   CA on the mgmt host".
+#
+#   That fix was never necessary. THE CA IS ON THIS BOX: {{ pen_state_dir }}/ca/ca-key.pem
+#   is generated here at provisioning time and signs every leaf. A pod has everything it
+#   needs to renew itself, and a pod at a border site has nobody to do it for them.
+#
+# HOW IT DECIDES WHAT TO RENEW
+#   It does not read the declaration, and it holds no list of certificates. It walks the
+#   places certs live, and renews anything that (a) our CA signed and (b) is inside the
+#   renewal window. The existing certificate is the specification for its replacement —
+#   same CN, same SAN, same EKU, same key — so this cannot drift from what `apply`
+#   would have minted, and it picks up arms added long after this script was written.
+#
+#   A certificate our CA did NOT sign is skipped. That is deliberate: the fabric slot cert
+#   is minted off-box on the portal, cannot be renewed here, and is the one thing that
+#   genuinely does need an operator.
+set -uo pipefail
+
+CA_KEY="{{ pen_state_dir }}/ca/ca-key.pem"
+CA_CERT="{{ pen_state_dir }}/zenoh/tls/ca-roots.pem"
+STATUS="{{ pen_state_dir }}/cert-renew.status"
+RENEW_DAYS="${RENEW_DAYS:-{{ cert_renew_days | default(60) }}}"
+LEAF_DAYS="{{ cert_leaf_days | default(825) }}"
+
+# Where certificates live. The pen mints them here, and `apply` copies each arm's pair
+# into its own directory so one arm cannot read another's key. Renewing IN PLACE at
+# every location means this script never needs to know which copy came from which
+# original — each is independent, and each is fixed where it is found.
+SEARCH_DIRS=(
+  "{{ pen_state_dir }}/zenoh/tls"
+  "{{ sub_leaf_dir }}"
+  /etc/octo-egress-*/tls
+  "{{ downlink_tls_dir | default('/etc/octo-downlink/tls') }}"
+  /etc/octo-arm-*/tls
+  {{ arm_tls_dir }}
+)
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { printf '%s %s\n' "$(ts)" "$*"; }
+err() { printf '%s %s\n' "$(ts)" "$*" >&2; }
+
+[ -r "$CA_KEY" ] || { log "no CA key at $CA_KEY — nothing this box can renew"; exit 0; }
+
+# THE CLOCK GATE. Renewal signs validity windows from the system clock, so on a box that
+# believes it is 1970 this would replace working certificates with ones dated to the
+# epoch — turning a wrong clock into permanently broken trust, and doing it to every
+# leaf at once. An RTC-less Orin/Thor cold-boots exactly that way;
+# fake-hwclock and chrony fix it, but this runs on a timer and cannot assume they won.
+#
+# Refusing is always safe: the certificates already on disk keep working, and the next
+# run renews them once the clock is sane.
+year="$(date -u +%Y)"
+if [ "${year:-0}" -lt "${MIN_YEAR:-2025}" ]; then
+  err "REFUSING to renew: this box thinks it is ${year}. Signing now would date every"
+  log "  replacement to then. Fix the clock (chronyc makestep / fake-hwclock) first."
+  printf '%s renewed=0 failures=1 reason=implausible-clock year=%s\n' "$(ts)" "$year" > "$STATUS"
+  exit 1
+fi
+
+renewed=0
+failures=0
+touched_router=0
+touched_arms=()
+touched_egress=()
+touched_downlink=0
+
+# `openssl -checkend` rather than parsing dates: it answers exactly the question being
+# asked ("will this expire within N seconds?"), needs no date arithmetic, and does not
+# depend on GNU date's -d, which is not portable and was the only thing in this script
+# that could not be exercised outside a Linux pod.
+expiring_within() {  # expiring_within <cert> <days> — true when renewal is due
+  ! openssl x509 -in "$1" -noout -checkend $(( $2 * 86400 )) >/dev/null 2>&1
+}
+end_date_of() { openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2; }
+
+# openssl PRINTS extensions in human form but the extfile wants wire form back, and the
+# two differ in ways that only bite some certificates. `IP Address:127.0.0.1` must go
+# back as `IP:127.0.0.1` — miss it and every leaf renews except the router's, which is
+# the only one with an IP SAN, and the pen stops accepting arms two years later for a
+# reason no log explains. Found by testing the renewal, not by reading it.
+san_wire() {
+  sed -e 's/IP Address:/IP:/g' -e 's/Registered ID:/RID:/g' | tr -d ' \n'
+}
+
+# openssl prints EKU in long form; the extfile wants the short names back.
+eku_short() {
+  sed -e 's/TLS Web Server Authentication/serverAuth/g' \
+      -e 's/TLS Web Client Authentication/clientAuth/g' \
+      -e 's/ *, */,/g' -e 's/^ *//' -e 's/ *$//'
+}
+
+renew_one() {  # renew_one <cert> <key>
+  local cert="$1" key="$2" cn san eku tmp
+  cn="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p')"
+  [ -n "$cn" ] || { err "SKIP $cert — no CN"; return 1; }
+  san="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | san_wire)"
+  eku="$(openssl x509 -in "$cert" -noout -ext extendedKeyUsage 2>/dev/null | tail -n +2 | eku_short)"
+  [ -n "$san" ] || san="DNS:${cn}"
+  [ -n "$eku" ] || eku="clientAuth,serverAuth"
+
+  tmp="$(mktemp -d)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  openssl req -new -key "$key" -subj "/CN=${cn}" -out "$tmp/req.csr" 2>/dev/null || {
+    err "FAIL $cert — could not build a CSR from its key"; return 1; }
+  openssl x509 -req -in "$tmp/req.csr" -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
+    -days "$LEAF_DAYS" -sha256 \
+    -extfile <(printf 'subjectAltName=%s\nextendedKeyUsage=%s\nbasicConstraints=CA:FALSE' "$san" "$eku") \
+    -out "$tmp/new.pem" 2>/dev/null || { err "FAIL $cert — signing failed"; return 1; }
+
+  # Prove the replacement before installing it. A pod that overwrites a working
+  # certificate with a broken one has turned a scheduled outage into an immediate one.
+  openssl verify -CAfile "$CA_CERT" "$tmp/new.pem" >/dev/null 2>&1 || {
+    err "FAIL $cert — replacement does not verify against our CA; keeping the old one"; return 1; }
+
+  # Written THROUGH the existing file, so owner and mode survive untouched. Several of
+  # these are 0640 root:65532 so a nonroot container can read them; a fresh file with
+  # default ownership would be a silent permission failure at the next restart.
+  cat "$tmp/new.pem" > "$cert" || { err "FAIL $cert — could not write"; return 1; }
+  log "RENEWED $cert (CN=$cn, SAN=$san, EKU=$eku, +${LEAF_DAYS}d)"
+  return 0
+}
+
+for dir in "${SEARCH_DIRS[@]}"; do
+  [ -d "$dir" ] || continue
+  for cert in "$dir"/*cert*.pem; do
+    [ -e "$cert" ] || continue
+    case "$cert" in *ca-root*) continue ;; esac   # matches ca-root.pem and ca-roots.pem
+
+    # Ours to renew? Anything signed elsewhere (the fabric slot) is left alone.
+    # -no_check_time: this asks who signed it, not whether it is still valid. Without it
+    # an EXPIRED leaf fails verify and is skipped as "not ours", so a pod switched on
+    # after its leaves ran out could never renew them. The clock gate above already
+    # guards the one case where ignoring time would be wrong.
+    openssl verify -no_check_time -CAfile "$CA_CERT" "$cert" >/dev/null 2>&1 || continue
+
+    key="${cert%-cert.pem}-key.pem"
+    [ -f "$key" ] || key="$dir/$(basename "${cert%cert.pem}")key.pem"
+    [ -f "$key" ] || { err "SKIP $cert — no private key beside it"; continue; }
+
+    expiring_within "$cert" "$RENEW_DAYS" || continue
+
+    log "due: $cert expires $(end_date_of "$cert") (within ${RENEW_DAYS}d)"
+    if ! renew_one "$cert" "$key"; then
+      failures=$((failures + 1))
+    else
+      renewed=$((renewed + 1))
+      case "$dir" in
+        "{{ pen_state_dir }}/zenoh/tls") touched_router=1 ;;
+        /etc/octo-egress-*/tls) touched_egress+=("$(basename "$(dirname "$dir")")") ;;
+        "{{ downlink_tls_dir | default('/etc/octo-downlink/tls') }}") touched_downlink=1 ;;
+        /etc/octo-arm-*/tls) touched_arms+=("$(basename "$(dirname "$dir")")") ;;
+      esac
+    fi
+  done
+done
+
+# The CA itself. Renewing it is a different and much larger operation — every leaf must
+# be re-signed and every arm's copy of the root replaced — so this only warns, loudly
+# and early. Ten years of notice is enough to plan a rebuild.
+if expiring_within "$CA_CERT" 365; then
+  err "WARNING: the pen CA itself expires $(end_date_of "$CA_CERT"). Renewing it re-signs every leaf and replaces every arm's ca-root.pem — plan a rebuild, this script will not do it."
+fi
+
+if [ "$renewed" -gt 0 ]; then
+  # A renewed certificate on disk changes nothing until the process presenting it
+  # re-reads the file, which happens when it restarts. Arms survive a restart without
+  # losing anything but freshness, so this is now a safe thing to do unattended.
+  if [ "$touched_router" = 1 ]; then
+    log "restarting the pen router to present its new certificate"
+    systemctl restart octo-pen-zenoh-router.service >/dev/null 2>&1 \
+      || err "WARNING: could not restart octo-pen-zenoh-router"
+  fi
+  for egress in "${touched_egress[@]:-}"; do
+    [ -n "$egress" ] || continue
+    systemctl restart "$egress.service" || failures=$((failures + 1))
+  done
+  if [ "$touched_downlink" = 1 ]; then
+    systemctl restart octo-downlink-bridge.service || failures=$((failures + 1))
+  fi
+  for arm in "${touched_arms[@]:-}"; do
+    [ -n "$arm" ] || continue
+    for c in $(podman ps --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | grep -- "-${arm#octo-arm-}\$" || true); do
+      log "restarting $c to present its new certificate"
+      systemctl restart "$c.service" >/dev/null 2>&1 || err "WARNING: could not restart $c"
+    done
+  done
+fi
+
+printf '%s renewed=%s failures=%s router_restarted=%s\n' \
+  "$(ts)" "$renewed" "$failures" "$touched_router" > "$STATUS"
+log "done: renewed=$renewed failures=$failures"
+
+# Exit non-zero if anything failed to renew. A failed systemd unit is the only
+# always-present signal on this box — no node_exporter, nothing scraping it — so a
+# renewal that cannot sign has to surface in `systemctl --failed` rather than in a log
+# nobody reads. Silence here is how the original two-year time bomb stayed invisible.
+[ "$failures" -eq 0 ] || exit 1
+exit 0

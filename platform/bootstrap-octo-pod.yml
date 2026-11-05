@@ -1,0 +1,1283 @@
+---
+# octo-pod · day 0 — turn a bare box into one configure-octo-pod.yml can work on.
+#
+#   ansible-playbook -i inventory.ini bootstrap-octo-pod.yml --check --diff
+#   ansible-playbook -i inventory.ini bootstrap-octo-pod.yml -e netbird_setup_key=<KEY>
+#
+# WHAT THIS IS FOR
+#   configure-octo-pod.yml assumes three things already exist: podman (from the base image), an ENROLLED netbird
+#   and /opt/octo-pod. Nothing created them — a wiped box was not
+#   rebuildable from this repo. This closes that.
+#
+# BOUNDARY — what is still human, and why
+#   · OS install, a sudo user, reachable SSH .... ansible needs a host to connect to
+#   · the netbird SETUP KEY ...................... a secret; pass at runtime, never commit
+#   · the netbird group + access policy .......... console-side; the pod's group is
+#     restricted, so a peer with no policy cannot reach it however correct this play is
+#   · the fabric org slot .......................... minted on the portal while connected
+#
+# AIRGAP
+#   On site there is no internet (docs/deployment.md, air-gapped installation). Set bootstrap_mode=airgap and stage the
+#   artifacts under {{ stage_dir }} on the box first: the .deb files and the image bundle. Connected mode uses apt repos and image pulls instead.
+#
+# SAFE ON A BUILT POD: every task is guarded, so running this against a converged pod is
+# a no-op. That is also how it is tested — see the assert at the end.
+- name: bootstrap octo-pod host
+  hosts: octopod
+  become: true
+  gather_facts: true
+
+  vars:
+    bootstrap_mode: connected            # connected | airgap
+    # stage_dir is defined in group_vars/all/10-infrastructure.yml so configure-octo-pod.yml
+    # can name it too (it points a missing-bridge-source error at it).
+    # The on-pod registry that serves the carried images at their published digests.
+    # Bound to loopback: it exists so THIS box can resolve its own pins, and a registry
+    # reachable from the mesh is a different decision made somewhere it can be secured.
+    local_registry_name: octo-registry
+    local_registry_port: 5000
+    local_registry_data: /var/lib/octo-registry
+    # AIRGAP CARRIES IMAGES, NOT SOURCE. A pod cut off from ghcr is equally cut off from
+    # crates.io, so shipping the arm workspace and building on the box would trade one
+    # network dependency for a worse one — and would make each pod's binaries a function
+    # of the day it was provisioned. A loaded tar keeps the digest CI published, so an
+    # airgapped pod verifies exactly like a connected one.
+    #
+    # THESE PLAIN TARS ARE THE LEGACY PATH and cannot satisfy a digest-pinned reference:
+    # `docker load` restores the image but not the RepoDigest that names it (measured —
+    # index digest and platform digest both fail). They still serve tag-referenced
+    # images, the bridge among them. For the pinned ones the bundle carries a registry
+    # instead, seeded from an OCI layout: tools/build-airgap-bundle.sh builds it, and
+    # the tasks below start and seed it.
+    #
+    # This listed ONE of the three arms, so an airgapped pod with a UDP sensor — the
+    # common case — could not bring its arm up at all: `docker load` had nothing to load
+    # and the pull it fell back to is the thing that does not work on an airgapped box.
+    staged_images:
+      - zenoh.tar
+      - audit-sink.tar
+      - udp-ingest.tar
+      - tcp-ingest.tar
+      - tcp-connect.tar
+
+  tasks:
+    # =============================================================== preflight
+    - name: preflight — supported platform
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'Debian'
+          - bootstrap_mode in ['connected', 'airgap']
+        fail_msg: >-
+          This bootstrap targets Debian/Ubuntu. Got
+          {{ ansible_facts['os_family'] }} / {{ ansible_facts['distribution_version'] | default('?') }},
+          bootstrap_mode={{ bootstrap_mode }}.
+        quiet: true
+      tags: [always]
+
+    # This pod's inventory hostname IS its registry handle: the name given to
+    # `goat machine enroll`, the peer's name on the mesh, and the slot alias. One name,
+    # because the fleet joins registry to mesh on it. The grammar is goat's slot-alias
+    # grammar — the mint refuses anything else, so refuse it here rather than at issuance.
+    - name: preflight — handle is a valid slot alias
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname is match('^[a-z0-9][a-z0-9-]*$')
+        fail_msg: >-
+          '{{ inventory_hostname }}' is not a valid machine handle. It must be lowercase
+          [a-z0-9-] — it becomes this pod's slot alias, its NetBird peer name and its
+          registry handle, and those three must be the same string.
+        quiet: true
+      tags: [always]
+
+    # Pod hosts are not all the same architecture: aarch64 Jetsons are common. Images must
+    # match, which is why they are published multi-arch rather than built here.
+    - name: preflight — report what we are building on
+      ansible.builtin.debug:
+        msg: >-
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+          {{ ansible_facts['architecture'] }} — mode={{ bootstrap_mode }}
+      tags: [always]
+
+    - name: preflight — airgap staging present
+      ansible.builtin.stat: { path: "{{ stage_dir }}" }
+      register: _stage
+      when: bootstrap_mode == 'airgap'
+      tags: [always]
+
+    - name: preflight — airgap needs its artifacts carried in first
+      ansible.builtin.assert:
+        that: _stage.stat.isdir | default(false)
+        fail_msg: "bootstrap_mode=airgap but {{ stage_dir }} is missing. Stage per docs/deployment.md, air-gapped installation."
+        quiet: true
+      when: bootstrap_mode == 'airgap'
+      tags: [always]
+
+    # ============================================ dpkg lock (background updater)
+    # A box NOT built from our base image runs unattended-upgrades on first boot, and it
+    # grabs /var/lib/dpkg/lock-frontend the moment the box has a network — exactly when the
+    # apt steps below want it. Measured 2026-09-10 on a fresh Ubuntu 24.04 Pi: the docker-ce
+    # install died with "Could not get lock ... held by unattended-upgr". Mask the updater
+    # and its timers (an appliance takes package currency as a deliberate act — a new base
+    # image — not a background run that upgrades openssh/u-boot mid-session), then wait out
+    # any run already in flight before touching apt. The base image prebakes this away; a
+    # box built any other way needs it done here.
+    - name: base — mask the background updater so it cannot hold the dpkg lock
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop:
+        - unattended-upgrades.service
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+        - apt-daily.service
+        - apt-daily-upgrade.service
+      failed_when: false      # a minimal image may ship none of these; nothing to stop is fine
+      tags: [base]
+
+    - name: base — wait for a dpkg run already in flight to release the lock
+      # `stop` above ends future runs; one that was already downloading at boot still holds
+      # the lock until it finishes. Wait for it rather than racing apt into a hard failure.
+      # Skips cleanly where `fuser` is absent — the mask above is the load-bearing half.
+      ansible.builtin.shell: |
+        command -v fuser >/dev/null 2>&1 || exit 0
+        for _ in $(seq 1 60); do
+          fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || exit 0
+          sleep 3
+        done
+        echo "dpkg lock still held after 180s — is something else installing?" >&2
+        exit 1
+      changed_when: false
+      tags: [base]
+
+    # ================================================================ packages
+    - name: base — tools the rest of this play needs
+      ansible.builtin.package:
+        name: [ca-certificates, curl, gnupg, git, rsync]
+        state: present
+      retries: 20
+      delay: 15
+      register: _base
+      until: _base is succeeded
+      when: bootstrap_mode == 'connected'
+      tags: [base]
+
+    # ================================================================== docker
+    # SHARED BY DOCKER AND NETBIRD, so it cannot live inside either one's install block.
+    # It used to be docker's first step, which meant a box that already had docker skipped
+    # it — and then netbird's get_url wrote a keyring into a directory that did not exist.
+    # `get_url` creates the file, never the directory above it. Not every distro ships
+    # /etc/apt/keyrings, so "it worked on my Jetson" proves nothing about a fresh Pi.
+    - name: base — apt keyring dir (docker and netbird both put a key here)
+      ansible.builtin.file: { path: /etc/apt/keyrings, state: directory, mode: "0755" }
+      tags: [docker, netbird, base]
+
+    - name: runtime — the base contract is present (podman + skopeo)
+      # The container runtime is the base image's to provide, not this play's
+      # to install: an appliance's packages arrive when its image is built,
+      # never over a network at provision time. Refusing here beats failing
+      # later in a way that names none of this. bootstrap installs nothing
+      # container-runtime-shaped.
+      ansible.builtin.shell: command -v podman && command -v skopeo && podman version --format '{{ "{{" }}.Client.Version{{ "}}" }}'
+      register: _runtime_v
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      tags: [docker]
+
+    - name: runtime — refuse a box without podman 4.7 or later and skopeo
+      # Quadlet, which runs every container here as a systemd unit, arrived in
+      # Podman 4.7 adds --sdnotify=healthy. Ubuntu 22.04 ships 3.4 and Debian 12 ships 4.3.
+      ansible.builtin.assert:
+        that:
+          - _runtime_v.rc == 0
+          - (_runtime_v.stdout_lines | last | default('0')) is version('4.7', '>=')
+        fail_msg: >-
+          This box needs podman 4.7 or later and skopeo
+          (found: {{ (_runtime_v.stdout_lines | last) if _runtime_v.rc == 0 else 'podman or skopeo missing' }}).
+          On a supported OS, run 'sudo apt-get install podman skopeo', or install
+          all dependencies declared by the octo-pod package with apt. Stage those
+          packages before disconnected installation. Bootstrap checks the runtime;
+          it does not install it. A device whose repositories
+          cannot provide the required runtime needs a supported device OS from its
+          device/base-image pipeline. LXD image tooling is for lab tests only.
+          Then run bootstrap again.
+        quiet: true
+      tags: [docker]
+
+    # ================================================================== the clock
+    # TLS VALIDITY IS WALL-CLOCK, so a wrong clock is not a degraded pod, it is a dead
+    # one: every mTLS handshake fails "certificate is not yet valid" and the pen refuses
+    # every arm. Worse for us, pen-cert-renew would mint replacements dated to whatever
+    # the box believes.
+    #
+    # The Tegra Orin/Thor has NO battery-backed RTC and cold-boots at 1970. The fleet's answer is two layers that
+    # compose, and this is the same pattern reduced to what a pod needs:
+    #
+    #   fake-hwclock — persists the wall clock to disk and restores it at boot BEFORE
+    #                  the network, so an offline cold boot starts at last-known-good
+    #                  instead of 1970. It only ever ADVANCES the clock, so it is a
+    #                  no-op on an RTC-equipped box and safe everywhere.
+    #   chrony       — refines it once any time source is reachable.
+    #
+    # The mgmt-host role also ships chrony-presync (a script + retry timer that steps the
+    # clock before NTS-secured chrony can start). A pod gets the same outcome from
+    # config alone: `makestep` unrestricted plus a plain-NTP pool alongside the NTS
+    # sources, so chrony can bootstrap itself from a 1970 clock without a helper that
+    # would be one more thing to fail unattended.
+    # `octo-pod upgrade` REFUSES to install a release it cannot verify, and cosign is
+    # what verifies it. Without this the first upgrade on every pod hits that refusal,
+    # and the documented way out becomes the thing an operator reaches for — which is
+    # how a verification control turns into a formality. Installed here so the safe path
+    # is also the default one.
+    - name: verification — cosign (release signatures are checked on this box)
+      ansible.builtin.get_url:
+        url: "https://github.com/sigstore/cosign/releases/download/v{{ cosign_version | default('2.4.1') }}/cosign-linux-{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
+        dest: /usr/local/bin/cosign
+        mode: "0755"
+        checksum: "{{ cosign_checksum | default(omit) }}"
+      when: bootstrap_mode == 'connected'
+      failed_when: false          # airgap or no route: upgrade will say what is missing
+      tags: [verification]
+
+    - name: clock — packages (RTC-less boxes cold-boot at 1970)
+      ansible.builtin.package:
+        name: [chrony, fake-hwclock]
+        state: present
+      when: bootstrap_mode == 'connected'
+      failed_when: false          # an airgapped provision has no apt; chrony can wait
+      tags: [clock]
+
+    - name: clock — restore the saved wall clock before anything TLS starts
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/fake-hwclock-load.service
+        mode: "0644"
+        content: |
+          [Unit]
+          # No RTC: restore last-known-good BEFORE sysinit, chrony or docker, so an
+          # offline cold boot on a box with no RTC does not sit at 1970 and fail every
+          # certificate check. `fake-hwclock load` only advances, never regresses.
+          Description=Restore saved wall clock before network/TLS services
+          DefaultDependencies=no
+          After=local-fs.target
+          Before=sysinit.target chrony.service chronyd.service docker.service
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/fake-hwclock load
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=sysinit.target
+      tags: [clock]
+
+    - name: clock — enable the restore unit
+      ansible.builtin.systemd:
+        name: fake-hwclock-load.service
+        enabled: true
+        daemon_reload: true
+      failed_when: false
+      tags: [clock]
+
+    - name: clock — chrony sources (NTS where reachable, plain pool to bootstrap from 1970)
+      ansible.builtin.copy:
+        dest: /etc/chrony/conf.d/10-octo-pod.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible — octo-pod clock hygiene.
+          # NTS first: authenticated time, so a spoofed source cannot walk our clock.
+          {% for s in chrony_nts_sources | default(['time.cloudflare.com', 'nts.ntp.rnl.se', 'ptbtime1.ptb.de']) %}
+          server {{ s }} iburst nts
+          {% endfor %}
+          # Plain NTP as the BOOTSTRAP path. NTS validates certificates, which a box at
+          # 1970 cannot do — so without an unauthenticated source to step from, a
+          # cold-booted pod can never reach the sources it would prefer.
+          pool {{ chrony_bootstrap_pool | default('pool.ntp.org') }} iburst maxsources 3
+          # Step for the FIRST FEW updates only, then slew. Unlimited stepping (-1) lets
+          # any selected source move the clock arbitrarily for the life of the process —
+          # and an unauthenticated pool is in that set. Wall-clock governs certificate
+          # validity here, so a spoofed source could expire every leaf on the pod, or
+          # wind the clock back far enough that pen-cert-renew mints 825-day certs dated
+          # from a time of the attacker's choosing. Three steps is enough to recover from
+          # 1970; after that a running pod is only slewed, and NTS sources dominate.
+          makestep 1.0 3
+          driftfile /var/lib/chrony/chrony.drift
+          rtcsync
+      when: bootstrap_mode == 'connected'
+      failed_when: false
+      notify: restart chrony
+      tags: [clock]
+
+    - name: clock — is this box's idea of the date plausible?
+      ansible.builtin.assert:
+        that: (ansible_facts['date_time']['year'] | int) >= 2020
+        fail_msg: >-
+          This box thinks it is {{ ansible_facts['date_time']['year'] }}. Every
+          certificate on it will be read as not-yet-valid, and renewing them would mint
+          replacements dated the same. Fix the clock before converging:
+          `sudo chronyc makestep`, or set it by hand if there is no time source.
+        quiet: true
+      tags: [clock, always]
+
+    - name: clock — persist the current time for the next cold boot
+      ansible.builtin.command: fake-hwclock save
+      changed_when: false
+      failed_when: false
+      when: (ansible_facts['date_time']['year'] | int) >= 2020
+      tags: [clock]
+
+    # ================================================================== docker
+    # Container logs are unbounded by default. Quadlet containers log to journald through
+    # conmon, so ONE cap in journald covers every container and every unit on the box,
+    # including any started outside our units. It goes in before anything can write an
+    # unbounded log (this pod once lost a disk to a 2.2 GB log).
+    #
+    # THE DIRECTORY FIRST. `copy:` creates the file, not the directory above it, and stock
+    # Ubuntu 24.04 ships no /etc/systemd/journald.conf.d. Written first, this died on the
+    # first box to run the play after the Podman migration (an amd64 VM). The docker-era
+    # version of this task died the same way on /etc/docker.
+    - name: runtime — the journald drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: "0755"
+      tags: [docker]
+
+    - name: runtime — bound container logs at the journal they all write into
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/10-octo-pod.conf
+        mode: "0644"
+        content: |
+          # Managed by octo-pod bootstrap. A full disk takes the pod down;
+          # these caps make journal retention bounded and predictable.
+          [Journal]
+          SystemMaxUse={{ journal_max_use | default('500M') }}
+          SystemKeepFree={{ journal_keep_free | default('200M') }}
+          RuntimeMaxUse={{ journal_runtime_max | default('100M') }}
+          MaxFileSec=1week
+      notify: restart journald
+      tags: [docker]
+
+    # WHICH SOURCE, DECIDED BY WHAT IS ACTUALLY THERE — not by bootstrap_mode.
+    #
+    # bootstrap_mode was doing two unrelated jobs: where the container IMAGES come from, and
+    # where the docker and netbird PACKAGES come from. Those are independent, and the common
+    # case proves it — a pod with ordinary internet whose images must come from a bundle
+    # because the registry is private. Under the old gating that combination was impossible:
+    # -e bootstrap_mode=airgap made image seeding work and then refused to install docker,
+    # because no .debs were staged.
+    #
+    # It refused correctly. tools/build-airgap-bundle.sh has never fetched those .debs — it
+    # prints "STILL TO STAGE BY HAND", because they are apt's artifacts and have to be
+    # downloaded on a box of the pod's architecture. So the honest rule is: use carried
+    # packages when they are present, and apt when they are not.
+    # Existence checked before the search, so an absent directory is a fact rather than a
+    # WARNING. `find` on a missing path prints "Skipped … is not a directory" on every run
+    # of a pod that carries no .debs — the normal case, on a run that succeeds. A warning
+    # nobody should ever act on is how people learn to skim past warnings.
+    - name: packages — is there a staged package directory at all?
+      ansible.builtin.stat:
+        path: "{{ stage_dir }}/deb"
+      register: _deb_dir
+      changed_when: false
+      tags: [docker, netbird]
+
+    - name: packages — are netbird .debs staged on this box?
+      ansible.builtin.find:
+        paths: "{{ stage_dir }}/deb"
+        patterns: "*.deb"
+      register: _staged_debs
+      failed_when: false
+      changed_when: false
+      when: _deb_dir.stat.isdir | default(false)
+      tags: [docker, netbird]
+
+    - name: packages — carried, or from apt
+      ansible.builtin.set_fact:
+        _debs_carried: "{{ (_staged_debs.files | default([]) | length) > 0 }}"
+      tags: [docker, netbird]
+
+    - name: packages — which source this run uses
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'carried .debs at ' ~ stage_dir ~ '/deb ('
+               ~ (_staged_debs.files | default([]) | length) ~ ' files)'
+             if _debs_carried
+             else 'apt: nothing is staged, so netbird comes from its own repository. A pod with no route to it needs the .deb staged first; tools/build-airgap-bundle.sh says how. (The base image provides the container runtime; this play never installs it.)' }}
+      tags: [docker, netbird]
+
+    # DID THE RUNTIME ACTUALLY WORK — not merely exist on PATH. podman has no
+    # daemon to enable; `podman info` exercises storage and configuration, which
+    # is the claim everything below depends on.
+    - name: runtime — podman actually works on this box
+      ansible.builtin.command: podman info --format '{{ "{{" }}.Store.GraphDriverName{{ "}}" }}'
+      register: _podman_info
+      changed_when: false
+      check_mode: false
+      tags: [docker]
+
+    # ================================================================= netbird
+    # The mesh is this box's only remote path once it leaves the bench. If enrolment
+    # fails you lose the box, so this is deliberately loud rather than skipped.
+    - name: netbird — already installed?
+      ansible.builtin.command: netbird version
+      register: _nb_v
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      tags: [netbird]
+
+    - name: netbird — apt repo + agent
+      when:
+        - _nb_v.rc != 0
+        - not _debs_carried
+      tags: [netbird]
+      block:
+        - name: netbird — signing key
+          ansible.builtin.get_url:
+            url: https://pkgs.netbird.io/debian/public.key
+            dest: /etc/apt/keyrings/netbird.asc
+            mode: "0644"
+
+        - name: netbird — apt source
+          ansible.builtin.apt_repository:
+            repo: "deb [signed-by=/etc/apt/keyrings/netbird.asc] https://pkgs.netbird.io/debian stable main"
+            filename: netbird
+            state: present
+
+        - name: netbird — agent
+          ansible.builtin.apt: { name: netbird, state: present, update_cache: true }
+
+    # nullglob for the same reason as docker's: no carried .deb is a staging mistake with
+    # a name, not a dpkg usage error.
+    - name: netbird — install from carried .deb
+      ansible.builtin.shell: |
+        shopt -s nullglob
+        debs=({{ stage_dir }}/deb/netbird*.deb)
+        # Element zero rather than the array-length form — see the docker task above.
+        if [ -z "${debs[0]:-}" ]; then
+          echo "no netbird*.deb in {{ stage_dir }}/deb" >&2
+          exit 2
+        fi
+        dpkg -i "${debs[@]}" || apt-get -y -f install
+      args: { executable: /bin/bash }
+      register: _nbdeb
+      changed_when: "'Setting up' in _nbdeb.stdout"
+      failed_when: false
+      when:
+        - _nb_v.rc != 0
+        - _debs_carried
+      tags: [netbird]
+
+    # Same reasoning as docker's post-install check: the mesh is this box's only remote
+    # path once it leaves the bench, and "the agent is missing" must not first surface as
+    # `netbird up` not being a command.
+    - name: netbird — is the agent there now?
+      ansible.builtin.command: netbird version
+      register: _nb_after
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      tags: [netbird]
+
+    - name: netbird — the agent is required to reach this box again
+      ansible.builtin.assert:
+        that: _nb_after.rc == 0
+        fail_msg: >-
+          The netbird agent is still not installed.
+          {{ 'No netbird .deb was carried to ' ~ stage_dir ~ '/deb.'
+             if bootstrap_mode == 'airgap'
+             else 'The apt install from pkgs.netbird.io did not complete.' }}
+          A pod with no agent can still capture locally, but you will not reach it
+          remotely — so this stops here rather than leaving you to find out from the
+          field.
+        quiet: true
+      tags: [netbird]
+
+    # -d, because plain `netbird status` says "Management: Connected" and never says
+    # connected TO WHAT. Enrolment is skipped on that string alone, so a box already on
+    # one mesh, handed a token for another, was reported as done while sitting on the
+    # wrong fabric — the failure being invisible is the whole problem, since every later
+    # step succeeds and the pod simply never appears where anyone is looking for it.
+    # The detailed form prints "Management: Connected to https://<host>:443".
+    - name: netbird — enrolled already, and to which mesh?
+      ansible.builtin.command: netbird status -d
+      register: _nb_status
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      tags: [netbird]
+
+    - name: netbird — the mesh it is on, and the mesh it was told to join
+      ansible.builtin.set_fact:
+        _nb_on: >-
+          {{ (_nb_status.stdout | regex_search('Management: Connected to (\S+)', '\1')
+              | default([], true) | join(''))
+             | regex_replace('^https?://', '') | regex_replace('[:/].*$', '') }}
+        _nb_want: >-
+          {{ (netbird_mgmt_url | default('https://' ~ (netbird_mgmt_host | default(''))))
+             | regex_replace('^https?://', '') | regex_replace('[:/].*$', '') }}
+      tags: [netbird]
+
+    # Refuse rather than re-enrol. `netbird up` against a different management server
+    # takes a NEW mesh address, and the address is how an operator is reaching this box
+    # — silently moving it is how a remote pod is lost. Whether to move a box between
+    # fabrics is an operator's decision, so name both meshes and stop.
+    - name: netbird — not already on a DIFFERENT mesh
+      ansible.builtin.assert:
+        that: _nb_on == _nb_want
+        fail_msg: >-
+          This box is already enrolled on {{ _nb_on }}, but was told to join
+          {{ _nb_want }}. Bootstrap will not move a peer between meshes on its own:
+          re-enrolling takes a new mesh address, which is usually the address you are
+          reaching it on. If the move is intended, run
+          `netbird down && netbird up --management-url https://{{ _nb_want }} …` by
+          hand, on the console. If it is not, fix netbird_mgmt_host in
+          host_vars/{{ inventory_hostname }}/05-fabric.yml.
+        quiet: true
+      when:
+        - _nb_on | length > 0
+        - _nb_want | length > 0
+      tags: [netbird]
+
+    # Which mesh this pod joins is a property of the deployment, not of the software, so
+    # it arrives with the token (identity layer) or on the join command line. Neither
+    # present renders `https://` as the management URL, and `netbird up` then fails with
+    # a URL error that says nothing about the actual mistake.
+    # Only a precondition of ENROLLING, so it is gated exactly like the enrol task below.
+    # Ungated it made step 1 impossible to complete on a new box: `octo-pod bootstrap` is
+    # documented as runnable before the pod has any identity — that is the whole reason
+    # it is a separate step — and it installs the agent without joining anything. A pod
+    # therefore reaches this assert with no management URL by design, on the one run
+    # where the operator has nothing to fix and no token yet.
+    - name: netbird — the mesh this pod joins is known
+      ansible.builtin.assert:
+        that: (netbird_mgmt_url | default('') | length > 0)
+              or (netbird_mgmt_host | default('') | length > 0)
+        fail_msg: >-
+          No management server. Pass it on the command line —
+          'octo-pod join --mgmt https://<netbird-host> …' — or set netbird_mgmt_host in
+          host_vars/{{ inventory_hostname }}/05-fabric.yml, which is where the pod's
+          token puts it.
+        quiet: true
+      when:
+        - "'Management: Connected' not in (_nb_status.stdout | default(''))"
+        - netbird_setup_key | default('') | length > 0
+      tags: [netbird]
+
+    # A pod is provisioned airgapped, so the management server is usually unreachable at
+    # this point. Probe before attempting: `netbird up` blocks and retries, which would
+    # stall provisioning on a box that has no network by design.
+    - name: netbird — is the management server reachable yet?
+      ansible.builtin.wait_for:
+        host: "{{ (netbird_mgmt_url | default('https://' ~ (netbird_mgmt_host | default('')))) | urlsplit('hostname') }}"
+        port: >-
+          {{ ((netbird_mgmt_url | default('https://' ~ (netbird_mgmt_host | default('')))) | urlsplit('port'))
+             or (80 if ((netbird_mgmt_url | default('https://' ~ (netbird_mgmt_host | default('')))) | urlsplit('scheme')) == 'http' else 443) }}
+        timeout: 5
+      register: _nb_reach
+      # Keep a timeout marked failed so the immediate and deferred paths below
+      # can distinguish an unreachable management server.
+      ignore_errors: true
+      changed_when: false
+      check_mode: false
+      # Same gate as the assert above: with no management URL this probes the empty
+      # string and spends the timeout proving nothing.
+      when:
+        - "'Management: Connected' not in (_nb_status.stdout | default(''))"
+        - netbird_setup_key | default('') | length > 0
+      tags: [netbird]
+
+    # no_log: the setup key is a credential. Enrolling when already connected is a no-op.
+    #
+    # --hostname is NOT cosmetic. The fleet's provenance audit and `goat machine revoke`
+    # both join the registry to the mesh on (machine handle == peer name). A peer left on
+    # its appliance hostname grades `violation` in check-node-class-membership.sh and
+    # CANNOT BE CUT by the revoke path — the pod becomes unrevokable.
+    # See goat docs/operations/gear-enrollment-sop.md §1, "Two invariants".
+    # NETBIRD 0.77 INTRODUCED PROFILES, and `netbird up` defaults to "the last used" one.
+    # On a box where root has never enrolled there is no last-used profile, and the client
+    # fails with
+    #
+    #   rpc error: code = NotFound desc = profile "bdb65d99…" not found
+    #
+    # which names neither netbird nor a profile anyone chose, and looks like a server
+    # problem. It is client state. Naming the profile explicitly removes the dependency on
+    # whatever happened last.
+    #
+    # PROBED, NOT ASSUMED: --profile does not exist on older clients, and passing it there
+    # would break enrolment on every pod that has not been updated. Same reasoning as the
+    # rsync flags in install-to-pod.sh.
+    - name: netbird — does this client have profiles?
+      ansible.builtin.shell: netbird up --help 2>&1 | grep -q -- '--profile'
+      register: _nb_profiles
+      changed_when: false
+      failed_when: false
+      tags: [netbird]
+
+    - name: netbird — make sure the profile exists before enrolling with it
+      ansible.builtin.command: netbird profile select default
+      register: _nb_profile_sel
+      changed_when: "'switched' in (_nb_profile_sel.stdout | lower)"
+      failed_when: false
+      when:
+        - _nb_profiles.rc == 0
+        - "'Management: Connected' not in (_nb_status.stdout | default(''))"
+        - netbird_setup_key | default('') | length > 0
+      tags: [netbird]
+
+    # BOUNDED, because the unbounded version hangs forever on a spent key. A NetBird
+    # setup key is one-off: the second `octo-pod join` with the same key gets no error
+    # and no refusal, just silence, and the play sits on this task until someone kills
+    # it. Measured during a recorded install, which is the worst place to learn it.
+    #
+    # timeout(1) rather than the task-level `timeout:` keyword: this task carries
+    # failed_when: false so the redacted report below can print the reason, and a task
+    # timeout bypasses that and dies with a message that names neither the key nor the
+    # remedy. rc 124 flows through the existing path like any other failure.
+    - name: netbird — enrol now (mesh reachable)
+      ansible.builtin.command: >-
+        timeout 120
+        netbird up --management-url {{ netbird_mgmt_url | default('https://' ~ netbird_mgmt_host) }}
+        --hostname {{ inventory_hostname }}
+        --setup-key {{ netbird_setup_key }}
+        {{ '--profile default' if _nb_profiles.rc == 0 else '' }}
+      register: _nb_up
+      changed_when: _nb_up.rc == 0
+      # no_log hides the SETUP KEY, which is on the command line — and hid every reason
+      # enrolment ever failed with it. `failed_when: false` plus the redacted report
+      # below keeps the credential out of the log and puts the error back in: a task
+      # that can only ever say "it failed" is one nobody can act on, and this is the
+      # step most likely to fail on a box that has never joined anything.
+      no_log: true
+      failed_when: false
+      when:
+        - "'Management: Connected' not in (_nb_status.stdout | default(''))"
+        - netbird_setup_key | default('') | length > 0
+        - not (_nb_reach is failed)
+      # WITHOUT THIS TAG THIS TASK NEVER RUNS. `octo-pod join` invokes the play with
+      # --tags netbird, and an untagged task is filtered out before execution — silently,
+      # because Ansible does not print "skipping" for a tag miss the way it does for a
+      # `when`. Every neighbouring task carried the tag and this one did not, so join
+      # probed the management server, found it reachable, enrolled nothing, and reported
+      # success. The direct enrolment path had never once run.
+      tags: [netbird]
+
+    - name: netbird — what enrolment said (key redacted)
+      ansible.builtin.debug:
+        msg: "{{ ((_nb_up.stderr | default('')) ~ ' ' ~ (_nb_up.stdout | default('')))
+                 | replace(netbird_setup_key | default('x-none-x'), '<setup-key>')
+                 | trim }}"
+      when:
+        - _nb_up.rc is defined
+        - _nb_up.rc != 0
+      tags: [netbird]
+
+    - name: netbird — enrolment did not succeed
+      ansible.builtin.fail:
+        msg: >-
+          netbird could not enrol on {{ netbird_mgmt_url | default('https://' ~ netbird_mgmt_host) }}.
+          The reason is in the line above, with the setup key redacted.
+
+          {{ 'IT TIMED OUT RATHER THAN FAILING, which is what a SPENT SETUP KEY looks like. A key is one-off. netbird neither refuses nor reports a used one, it simply never completes, so this waited 120 seconds and gave up. If this pod has been built before with this key, that is the cause: mint a fresh one and stage it again with `goat machine mesh-key <pod-name>`, or from the NetBird console.' if (_nb_up.rc | default(0)) == 124 else 'If it mentions a PROFILE that was not found, that is client state rather than the key. Run `sudo netbird profile select default` and try again.' }}
+
+          Otherwise, most often: the key is used up or expired, it belongs to a different
+          management server, or that server is reachable but is not the one this key was
+          issued by.
+      when:
+        - _nb_up.rc is defined
+        - _nb_up.rc != 0
+      tags: [netbird]
+
+    # PROVE IT, rather than trust rc 0. `netbird up` can exit zero having done nothing
+    # useful — most often when the daemon holds a stale profile pointing at a different
+    # management server — and the caller then reports a pod "on the mesh" that is not.
+    # This is the check that would have caught the missing tag above on its first run:
+    # enrolment claiming success while `netbird status` still says otherwise is the exact
+    # signature of that bug, and of several others that are not worth enumerating.
+    - name: netbird — did it actually join?
+      ansible.builtin.command: netbird status
+      register: _nb_after
+      changed_when: false
+      failed_when: false
+      when:
+        - _nb_up.rc is defined
+        - _nb_up.rc == 0
+      tags: [netbird]
+
+    - name: netbird — enrolled, but not connected
+      ansible.builtin.assert:
+        that: "'Management: Connected' in (_nb_after.stdout | default(''))"
+        fail_msg: >-
+          netbird up exited 0 but this box is still not connected to
+          {{ netbird_mgmt_url | default('https://' ~ netbird_mgmt_host) }}.
+          `netbird status` says:
+          {{ (_nb_after.stdout | default('')) | regex_search('Management:.*') | default('nothing about Management', true) }}.
+          Most often the daemon is holding a profile for a different management server
+          from an earlier `netbird up` — re-running with --management-url overwrites it.
+        quiet: true
+      when: _nb_after is not skipped
+      tags: [netbird]
+
+    # AIRGAPPED PATH: no route to the mesh. Store the key and enrol from a timer once a
+    # network path appears. Provisioning completes; joining happens later, unattended.
+    - name: netbird — defer enrolment (no route to the mesh yet)
+      when:
+        - "'Management: Connected' not in (_nb_status.stdout | default(''))"
+        - netbird_setup_key | default('') | length > 0
+        - _nb_reach is failed
+      tags: [netbird]
+      block:
+        - name: netbird — stash the setup key for deferred enrolment
+          ansible.builtin.copy:
+            content: "{{ netbird_setup_key }}"
+            dest: "{{ netbird_pending_key_file }}"
+            mode: "0600"
+          no_log: true
+
+        - name: netbird — deferred enrolment script
+          ansible.builtin.template:
+            src: host/netbird-enrol-pending.sh.j2
+            dest: /usr/local/sbin/netbird-enrol-pending.sh
+            mode: "0755"
+
+        - name: netbird — retry unit
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/netbird-enrol-pending.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=Complete NetBird enrolment once a network path exists
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/sbin/netbird-enrol-pending.sh
+
+        - name: netbird — retry timer
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/netbird-enrol-pending.timer
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=Retry NetBird enrolment every minute until it succeeds
+              [Timer]
+              OnBootSec=30s
+              OnUnitActiveSec=60s
+              [Install]
+              WantedBy=timers.target
+
+        - name: netbird — start the retry timer
+          ansible.builtin.systemd:
+            name: netbird-enrol-pending.timer
+            enabled: true
+            state: started
+            daemon_reload: true
+
+        - name: netbird — provisioning continues without the mesh
+          ansible.builtin.debug:
+            msg: >-
+              No route to the mesh. The setup key is stored and enrolment will complete
+              automatically when a network path appears. Watch /var/log/netbird-enrol.log.
+
+    # REPORTED, NOT FAILED. "No key yet" is the normal state at step 1 — it is the state
+    # every new box is in before anyone has issued it a token, and this play is
+    # documented as runnable before the box has any identity at all. Failing here made
+    # the documented sequence impossible to complete: a first-time operator runs
+    # `octo-pod bootstrap`, is told to supply a credential they have not been given yet,
+    # and cannot proceed.
+    #
+    # Enrolment is join's job. It passes the key, so on that path this never fires.
+    - name: netbird — this box is not on a mesh yet
+      ansible.builtin.debug:
+        msg: >-
+          The agent is installed but this box has not joined a mesh. That is expected at
+          this stage. Enrolment happens in step 2, which is where the key arrives:
+          `octo-pod join --setup-key <KEY> --mgmt <url> --pod <name>`. A pod that only
+          captures locally never needs one — its publishers reach it over the LAN.
+      when:
+        - "'Management: Connected' not in (_nb_status.stdout | default(''))"
+        - netbird_setup_key | default('') | length == 0
+      tags: [netbird]
+
+    # ============================================================ package source
+    # Written ONLY once enrolled. apt fails every operation when a configured source is
+    # unreachable, so adding this on an airgapped box would break the local installs that
+    # provisioning itself depends on. The deferred-enrolment script writes it too, so a
+    # pod that joins later still gets its update path.
+    # octo_repo_url comes from the identity layer (05-fabric.yml). With no value there is
+    # no update path to write, and writing one anyway is worse than skipping: an apt
+    # source with an empty URL makes EVERY apt operation on the box fail, which is the
+    # same trap the airgap comment above describes.
+    - name: packages — mesh-only apt source (requires enrolment)
+      when:
+        - "'Management: Connected' in (_nb_status.stdout | default('')) or (_nb_up is defined and _nb_up is changed)"
+        # NOT octo_repo_url — that is the release file surface, and an apt source
+        # pointed at it 404s and takes all of apt down with it.
+        - octo_apt_repo_url | default('') | length > 0
+      tags: [packages]
+      block:
+        - name: packages — keyring dir
+          ansible.builtin.file: { path: /etc/apt/keyrings, state: directory, mode: "0755" }
+
+        - name: packages — repository signing key
+          ansible.builtin.copy:
+            src: "{{ octo_repo_key_src }}"
+            dest: "{{ octo_repo_keyring }}"
+            mode: "0644"
+          when:
+            - octo_repo_key_src | default('') | length > 0
+            - octo_repo_key_src is exists
+
+        - name: packages — is the signing key actually in place?
+          ansible.builtin.stat: { path: "{{ octo_repo_keyring }}" }
+          register: _repo_keyring
+
+        # signed-by NAMES A KEYRING, and apt fails every operation when that file is
+        # absent — including the installs provisioning itself depends on. Writing the
+        # source without the key is therefore the same trap as writing an unreachable
+        # one. Dropping signed-by is not the way out: an unsigned mesh source would let
+        # anything that can answer on that address install as root on every pod.
+        #
+        # So: no key, no source. The box keeps working and simply has no update path,
+        # which is a state a pod can sit in indefinitely.
+        - name: packages — apt source, reachable only on the mesh
+          ansible.builtin.copy:
+            dest: /etc/apt/sources.list.d/octo-pod.list
+            mode: "0644"
+            content: |
+              # octo-pod updates. Resolvable and routable only over NetBird — revoking the
+              # peer revokes the update path.
+              deb [signed-by={{ octo_repo_keyring }}] {{ octo_apt_repo_url }} {{ octo_repo_suite }} {{ octo_repo_component }}
+          when: _repo_keyring.stat.exists
+
+        - name: packages — an update path was configured but has no signing key
+          ansible.builtin.debug:
+            msg: >-
+              octo_apt_repo_url is set to {{ octo_apt_repo_url }} but no signing key is installed
+              at {{ octo_repo_keyring }}, so no apt source was written and this pod cannot
+              take package updates. Supply the repository's PUBLIC key via
+              octo_repo_key_src (it is public material and may travel with the release).
+          when: not _repo_keyring.stat.exists
+
+    # ================================================================== images
+    # A LOCAL REGISTRY, SEEDED FROM THE CARRIED BUNDLE. This is the only way an
+    # airgapped pod can satisfy a digest-pinned reference: `docker load` restores the
+    # image but not the digest that names it, so the bytes must be served by something
+    # that speaks the registry API. The registry image itself is carried BY TAG, which
+    # is the one thing load does restore.
+    #
+    # Runs only when the bundle actually carries a registry, so a site that stages plain
+    # image tars is unaffected and a connected pod never sees any of it.
+    - name: images — did the bundle carry a registry?
+      ansible.builtin.stat: { path: "{{ stage_dir }}/images/oci" }
+      register: _reg_tar
+      when: bootstrap_mode == 'airgap'
+      tags: [images]
+
+    # THE TOOLS ARE ARCHITECTURE-SPECIFIC, unlike the payload. The images this pod runs
+    # are carried as a multi-arch OCI layout, but `docker save` stores only one platform
+    # — so the registry and skopeo are carried once per architecture and this loads the
+    # pair matching THIS box. Getting it wrong is not a clean failure: the tar loads
+    # without complaint and dies later with "exec format error", which is what a bundle
+    # built on an amd64 runner did on an arm64 Jetson.
+    - name: images — the tools built for this architecture
+      ansible.builtin.set_fact:
+        _tool_arch: "{{ 'arm64' if ansible_facts['architecture'] in ['aarch64', 'arm64']
+                        else 'amd64' }}"
+      when: bootstrap_mode == 'airgap'
+      tags: [images]
+
+    - name: images — are the tools for this architecture present?
+      ansible.builtin.stat:
+        path: "{{ stage_dir }}/images/{{ item }}-{{ _tool_arch }}.tar"
+      register: _tool_tars
+      loop: [registry, skopeo]
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    - name: images — does the bundle carry tools this box can run?
+      ansible.builtin.set_fact:
+        _tools_carried: "{{ (_tool_tars.results | default([]) | selectattr('stat.exists')
+                            | list | length) == 2 }}"
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    # READ ONCE, HERE, AND UNCONDITIONALLY. These used to be lookup('file', …) written
+    # inline in a `loop:`, and a loop is expanded BEFORE the task's `when:` is applied —
+    # so a connected-mode run, which has no stage directory at all, died on "could not
+    # locate file" inside a task gated to airgap and therefore never meant to run.
+    # errors='ignore' makes the absent case empty rather than fatal, which is what lets
+    # this run before anything knows whether a bundle is present.
+    - name: images — the tool references the bundle carries, if it carries any
+      ansible.builtin.set_fact:
+        _registry_ref: "{{ lookup('file', stage_dir ~ '/images/REGISTRY_IMAGE', errors='ignore') | default('', true) | trim }}"
+        _skopeo_ref: "{{ lookup('file', stage_dir ~ '/images/SKOPEO_IMAGE', errors='ignore') | default('', true) | trim }}"
+      tags: [images]
+
+    - name: images — load the registry and skopeo for this architecture
+      ansible.builtin.command: "podman load -i {{ stage_dir }}/images/{{ item }}-{{ _tool_arch }}.tar"
+      register: _reg_load
+      changed_when: "'Loaded image' in _reg_load.stdout"
+      loop: [registry, skopeo]
+      when:
+        - bootstrap_mode == 'airgap'
+        - _reg_tar.stat.exists | default(false)
+        - _tools_carried | default(false)
+      tags: [images]
+
+    # A BUNDLE WITHOUT TOOLS FOR THIS BOX IS RECOVERABLE, so recover rather than hand the
+    # operator four commands to run by hand. The registry and the copier are public
+    # images, unlike the payload — so a box with any route to a registry can fetch its
+    # own, and only a box with neither is actually stuck.
+    #
+    # This exists because bundles built before the per-architecture fix carry the
+    # BUILDER's platform only: CI is amd64, pods are Jetsons, and the tar loads cleanly
+    # and then dies with "exec format error".
+    - name: images — fetch tools for this architecture (the bundle carried none)
+      ansible.builtin.command: "podman pull --platform linux/{{ _tool_arch }} {{ item }}"
+      register: _tool_pull
+      changed_when: "'Downloaded newer image' in _tool_pull.stdout"
+      failed_when: false
+      loop:
+        - "{{ _registry_ref }}"
+        - "{{ _skopeo_ref }}"
+      when:
+        - bootstrap_mode == 'airgap'
+        - _reg_tar.stat.exists | default(false)
+        - not (_tools_carried | default(false))
+        - (_registry_ref | length > 0) and (_skopeo_ref | length > 0)
+      tags: [images]
+
+    - name: images — tools for this box, one way or the other
+      ansible.builtin.assert:
+        that: (_tools_carried | default(false))
+              or (_tool_pull.results | default([]) | selectattr('rc', 'equalto', 0)
+                  | list | length == 2)
+        fail_msg: >-
+          This bundle has no registry/skopeo for {{ _tool_arch | default('this architecture') }}
+          ({{ ansible_facts['architecture'] }}) and they could not be fetched either, so
+          the carried images cannot be served to this pod. A bundle built before the
+          per-architecture fix carries the builder's platform only — CI is amd64 and this
+          box is not. Rebuild it with tools/build-airgap-bundle.sh, which now carries
+          both, or give this box a route to a registry long enough to fetch two public
+          images.
+        quiet: true
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    # podman, unlike docker, does not create a missing bind-mount source: `-v` naming an
+    # absent directory fails with "statfs ... no such file or directory". The docker-era
+    # run never needed this task, so the migration to podman lost nothing it could see.
+    - name: images — the registry's data directory exists
+      ansible.builtin.file:
+        path: "{{ local_registry_data }}"
+        state: directory
+        mode: "0755"
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    # A QUADLET UNIT, LIKE EVERY OTHER SERVICE ON THE POD. It was `podman run --restart
+    # unless-stopped`, left to podman-restart.service to bring back at boot, but podman
+    # 4.9's podman-restart starts only restart-policy=always containers: after the first
+    # reboot the mirror stayed down and the next apply could not pull. systemd starts this.
+    - name: images — the directory systemd reads container units from
+      ansible.builtin.file:
+        path: /etc/containers/systemd
+        state: directory
+        mode: "0755"
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    - name: images — the registry, as a systemd unit on this box only
+      ansible.builtin.copy:
+        dest: "/etc/containers/systemd/{{ local_registry_name }}.container"
+        mode: "0644"
+        content: |
+          # MANAGED BY ANSIBLE (bootstrap-octo-pod.yml): the on-pod image mirror, loopback only.
+          [Unit]
+          Description=octo-pod image mirror (registry on loopback)
+
+          [Container]
+          ContainerName={{ local_registry_name }}
+          Image={{ _registry_ref }}
+          PublishPort=127.0.0.1:{{ local_registry_port }}:5000
+          Volume={{ local_registry_data }}:/var/lib/registry
+
+          [Service]
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+      register: _reg_unit
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    # A box bootstrapped before the registry was a unit holds a plain container of the same
+    # name, which would block the unit's. Its images live in the volume and survive.
+    - name: images — retire a registry container started outside systemd
+      ansible.builtin.shell: |
+        if podman container exists {{ local_registry_name }} && [ "$(podman inspect {{ local_registry_name }} \
+             --format '{% raw %}{{ index .Config.Labels "PODMAN_SYSTEMD_UNIT" }}{% endraw %}')" != "{{ local_registry_name }}.service" ]; then
+          podman rm -f {{ local_registry_name }} >/dev/null && echo RETIRED
+        fi
+      register: _reg_retire
+      changed_when: "'RETIRED' in _reg_retire.stdout"
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    - name: images — the registry is running
+      ansible.builtin.systemd:
+        name: "{{ local_registry_name }}.service"
+        state: "{{ 'restarted' if (_reg_unit is changed or _reg_retire is changed) else 'started' }}"
+        daemon_reload: true
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    - name: images — the registry answers
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ local_registry_port }}/v2/"
+        status_code: 200
+      register: _reg_up
+      retries: 30
+      delay: 2
+      until: _reg_up is succeeded
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    # --preserve-digests, so skopeo refuses to re-encode a manifest rather than quietly
+    # producing different bytes under the same name. If this ever alters a manifest, the
+    # digest changes and every reference in group_vars stops resolving — which is the
+    # failure this whole path exists to avoid, arriving by a different door.
+    # PODMAN HAS NO LOOPBACK EXCEPTION. dockerd treated every loopback address as an insecure
+    # registry by default, so the on-pod mirror (plain HTTP, loopback only) just worked;
+    # podman requires HTTPS unless containers-registries.conf(5) says otherwise, so every
+    # `podman pull` from the mirror would fail "server gave HTTP response to HTTPS client".
+    # Scoped to the mirror's own loopback addresses and nothing else.
+    - name: images — the drop-in directory for podman's registry settings
+      ansible.builtin.file:
+        path: /etc/containers/registries.conf.d
+        state: directory
+        mode: "0755"
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    - name: images — podman may use the on-pod mirror over loopback HTTP
+      ansible.builtin.copy:
+        dest: /etc/containers/registries.conf.d/50-octo-mirror.conf
+        mode: "0644"
+        content: |
+          # MANAGED BY ANSIBLE (bootstrap-octo-pod.yml): the on-pod image mirror, plain
+          # HTTP on loopback only.
+          [[registry]]
+          location = "localhost:{{ local_registry_port }}"
+          insecure = true
+
+          [[registry]]
+          location = "127.0.0.1:{{ local_registry_port }}"
+          insecure = true
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    - name: images — seed the registry from the OCI layout
+      ansible.builtin.shell: |
+        set -euo pipefail
+        while read -r tag path digest; do
+          [ -n "$tag" ] || continue
+          skopeo copy --all --preserve-digests --dest-tls-verify=false \
+            "oci:{{ stage_dir }}/images/oci:${tag}" "docker://127.0.0.1:{{ local_registry_port }}/${path}"
+        done < "{{ stage_dir }}/images/MAP"
+      args: { executable: /bin/bash }
+      register: _seed
+      changed_when: _seed.rc == 0
+      when: bootstrap_mode == 'airgap' and _reg_tar.stat.exists | default(false)
+      tags: [images]
+
+    - name: images — load carried tars
+      ansible.builtin.shell: "podman load -i {{ stage_dir }}/{{ item }}"
+      args: { executable: /bin/bash }
+      register: _load
+      changed_when: "'Loaded image' in _load.stdout"
+      failed_when: _load.rc != 0 and 'no such file' not in (_load.stderr | lower)
+      loop: "{{ staged_images }}"
+      when: bootstrap_mode == 'airgap'
+      tags: [images]
+
+    # A missing tar is TOLERATED, because not every pod needs every image — a site with
+    # only UDP sensors has no use for tcp-connect. It must not be SILENT: airgap means
+    # the pull fallback cannot work, so an image absent here is an arm that fails to
+    # start at the next `apply`, reported far from its cause and long after the USB
+    # stick has gone home. Say it while the person who staged it is still standing there.
+    - name: images — which carried tars were missing
+      ansible.builtin.debug:
+        msg: >-
+          NOT STAGED: {{ _missing | join(', ') }} — an image absent on an airgapped box
+          cannot be pulled later. If a publisher needs one of these, `apply` will fail
+          to start it. Produce them with `podman save <pinned ref> -o <name>.tar`.
+      vars:
+        _missing: >-
+          {{ _load.results | default([])
+             | selectattr('stderr', 'defined')
+             | selectattr('stderr', 'search', '(?i)no such file')
+             | map(attribute='item') | list }}
+      when:
+        - bootstrap_mode == 'airgap'
+        - _missing | length > 0
+        # SILENT WHEN THE REGISTRY COVERS IT. These tars are the LEGACY path; a bundle
+        # built by tools/build-airgap-bundle.sh carries an OCI layout instead. On a
+        # perfectly healthy airgapped pod this listed all six as missing and warned that
+        # `apply` would fail — immediately before the next task proved every pinned
+        # digest resolves from the on-pod registry. An alarm that fires on the good path
+        # is worse than no alarm: it is the one people learn to scroll past.
+        - not (_reg_tar.stat.exists | default(false))
+      tags: [images]
+
+    # A LOADED TAR DOES NOT SATISFY A DIGEST-PINNED REFERENCE. Measured on Docker 29.6.2
+    # with the containerd snapshotter active: pull alpine by its manifest-LIST digest,
+    # save, remove, load — and the digest reference no longer resolves. `docker save`
+    # writes one platform and cannot carry the index digest that named it.
+    #
+    # So on an airgapped box, compose meets `image: ...@sha256:...`, finds nothing local
+    # and tries to PULL, which is the one thing that cannot work there. Loading reports
+    # success either way, so without this the failure lands at `apply` — after the person
+    # who staged the bundle has gone.
+    #
+    # The fix is a registry, not a tar: a digest is content-addressed, so the SAME digest
+    # is valid in any registry holding the content. Point the image references at a
+    # mesh-local or on-pod registry seeded from the bundle and pinning is preserved
+    # end to end. Until that exists, say plainly that this pod cannot start its arms.
+    # CAN THE POD RESOLVE WHAT IT IS PINNED TO — asked of the place that will actually
+    # serve it. This checked `docker image inspect` instead, which is the local image
+    # store, and predates the registry: images seeded into a registry are NOT in the
+    # local store and are not supposed to be. They are pulled on demand, which is the
+    # entire point. So a correct, fully-seeded pod failed a check written for the older
+    # design.
+    #
+    # Asked over the registry API, by DIGEST, which is exactly the request compose will
+    # make. A 200 means these bytes are here under this name; anything else means the
+    # pod would try the internet at converge time.
+    - name: images — can the mirror serve every pinned digest?
+      ansible.builtin.uri:
+        url: "http://{{ image_mirror }}/v2/{{ (item | regex_replace('^[^/]+/', '')) | regex_replace('@.*$', '') }}/manifests/{{ item | regex_replace('^.*@', '') }}"
+        method: GET
+        headers:
+          Accept: "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json"
+        status_code: [200, 404, 401, 403]
+      register: _mirror_has
+      loop: "{{ [zenoh_image, audit_image, udp_ingest_image, tcp_ingest_image, tcp_connect_image]
+                | select('search', '@sha256:') | list }}"
+      when:
+        - bootstrap_mode == 'airgap'
+        - (image_mirror | default('')) | length > 0
+      tags: [images]
+
+    - name: images — a pinned digest the mirror cannot serve
+      ansible.builtin.assert:
+        that: _absent_from_mirror | length == 0
+        fail_msg: >-
+          The registry at {{ image_mirror }} does not hold: {{ _absent_from_mirror | join(', ') }}.
+          The pod is pinned to those digests, so compose would go to the internet for
+          them — which is the one thing an airgapped box cannot do. Either the bundle
+          did not carry them, or seeding did not complete. `docker save`/`load` cannot
+          carry a manifest-list digest, which is why the bundle ships an OCI layout and
+          a registry rather than plain tars.
+        quiet: true
+      vars:
+        _absent_from_mirror: >-
+          {{ _mirror_has.results | default([]) | selectattr('status', 'defined')
+             | rejectattr('status', 'equalto', 200) | map(attribute='item') | list }}
+      when:
+        - bootstrap_mode == 'airgap'
+        - (image_mirror | default('')) | length > 0
+      tags: [images]
+
+    - name: images — pull the pinned ones
+      ansible.builtin.command: "podman pull {{ item }}"
+      register: _pull
+      changed_when: "'Storing signatures' in _pull.stdout or 'Writing manifest' in _pull.stdout"
+      failed_when: false
+      loop: "{{ [zenoh_image, audit_image, udp_ingest_image, tcp_ingest_image, tcp_connect_image]
+                | reject('equalto', '') | list }}"
+      when: bootstrap_mode == 'connected'
+      tags: [images]
+
+    # Not a failure: a pod that is not on the mesh yet cannot reach a mesh registry, and
+    # that is the normal state during step 1. Say which images are still missing and
+    # when they will be fetched, so "images not here yet" never has to be inferred from
+    # a converge that fails later.
+    - name: images — what is still missing, and when it will be fetched
+      ansible.builtin.debug:
+        msg: >-
+          NOT FETCHED YET: {{ _unpulled | join(', ') }}.
+          {{ 'The registry REFUSED these as unauthorized. That is not a connectivity problem and joining the mesh will not fix it: the mesh carries no registry credential, and a pod holds none by design. Carry the images instead — install-to-pod.sh --with-images, then bootstrap with -e bootstrap_mode=airgap -e image_mirror=localhost:5000 — or point image_mirror at a registry this pod may read.'
+             if _unauthorized else
+             'The registry could not be reached. If this pod reaches its registry only over the mesh, join enrols it and fetches them right after.' }}
+      vars:
+        _unpulled: >-
+          {{ _pull.results | default([]) | selectattr('rc', 'defined')
+             | selectattr('rc', 'ne', 0) | map(attribute='item') | list }}
+        # REFUSED and UNREACHABLE are different faults with different remedies, and
+        # reporting one as the other sends people to look at the network when the answer
+        # is a credential they are not supposed to have (GH #6).
+        _unauthorized: >-
+          {{ _pull.results | default([]) | selectattr('rc', 'defined')
+             | selectattr('rc', 'ne', 0) | map(attribute='stderr') | join(' ') | lower
+             is search('unauthorized|denied|authentication required') }}
+      when:
+        - bootstrap_mode == 'connected'
+        - _unpulled | length > 0
+      tags: [images]
+
+    # ================================================================ handover
+    # Assert ONLY what this play is responsible for. It previously demanded an enrolled
+    # NetBird, the package's compose directory, and the bridge checkout — none of which
+    # bootstrap creates now that enrolment belongs to `join` and a source checkout carries
+    # its own compose. On a fresh clone all three failed, so step 1 refused every time.
+    - name: verify — what bootstrap is responsible for
+      ansible.builtin.shell: |
+        set -uo pipefail
+        fail=0
+        chk()  { if eval "$2" >/dev/null 2>&1; then echo "  OK      $1"; else echo "  MISSING $1"; fail=1; fi; }
+        note() { if eval "$2" >/dev/null 2>&1; then echo "  OK      $1"; else echo "  later   $1"; fi; }
+        chk  "podman runtime"       "podman info"
+        chk  "skopeo (image logistics)" "command -v skopeo"
+        chk  "netbird installed"    "command -v netbird"
+        # Quadlet templates ship with the platform — configure renders them per
+        # declaration; nothing needs a compose directory any more.
+        chk  "quadlet templates"    "test -f {{ playbook_dir }}/templates/pen/octo-pen-zenoh-router.container.j2"
+        # Reported, never fatal — these are steps 2 and 3, not this one.
+        note "netbird enrolled (step 2)"        "netbird status | grep -q 'Management: Connected'"
+        exit $fail
+      args: { executable: /bin/bash }
+      register: _ready
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      tags: [always]
+
+    - name: verify — result
+      ansible.builtin.debug: { msg: "{{ _ready.stdout_lines }}" }
+      tags: [always]
+
+    - name: verify — do not hand over a half-built box
+      ansible.builtin.assert:
+        that: _ready.rc == 0
+        fail_msg: >-
+          Bootstrap incomplete — see the list above. Lines marked "later" are not faults:
+          enrolment is step 2 (octo-pod join) and the bridge source is only needed to
+          publish upstream.
+        success_msg: >-
+          Box ready. Next: octo-pod join --setup-key <KEY> --mgmt <URL> --pod <name>
+        quiet: true
+      tags: [always]
+
+  handlers:
+    - name: restart chrony
+      ansible.builtin.systemd:
+        name: chrony
+        state: restarted
+      failed_when: false
+
+    # Notified by the journald caps. Without it, Ansible stops the play the moment that
+    # task changes anything ("requested handler ... was not found").
+    - name: restart journald
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted

@@ -1,0 +1,202 @@
+// MANAGED BY ANSIBLE — generated from pen_firstparty_namespaces, pen_firstparty_cns,
+// and the ENABLED `peers` (20-peers.yml) + `arms` (30-arms.yml). Hand edits are lost on re-run.
+//
+// Peers hold their own cert; an arm's cert is held by our listener. Same ACL shape,
+// different CN (octo-peer-* vs octo-arm-*), hence the distinct rule/subject ids.
+//
+// A peer is write-only by default. read_keys is the one way to change that, and it uses
+// the SAME downward path and the SAME two gates as an egress destination: each fabric
+// key K must be in downlink_allow (so the downlink bridge brings it down as downlink/K)
+// AND the peer's own release.from_fabric must be true. Only then does THAT peer's CN —
+// never mtls-firstparty, never another peer — get a read on downlink/K, and nothing
+// else. An arm has no read_keys: its source holds no credential to grant a read to.
+//
+// Zenoh combines messages x flows, so "first party may READ a publisher's namespace but
+// never WRITE it" needs two rules: their subscribe/query is ingress, our delivery is egress.
+//
+// Every subject MUST carry cert_common_names. Zenoh reads an absent property as a
+// WILDCARD, so an unscoped subject grants its rules to any pen-CA-rooted cert.
+//
+// THE DOWNWARD PATH (40-egress.yml) mirrors the upward one. The downlink bridge may WRITE
+// downlink/** and nothing else: fabric key K comes down as downlink/K. Each egress arm may
+// READ only downlink/<its own keys>, and only once its destination is released
+// (release.from_fabric true): an unreleased destination's CN matches no subject here, so
+// the pen's default deny applies.
+{%- set downlink = (downlink_users | default([])) | length > 0 %}
+{%- set downlink_ns = 'downlink/**' %}
+{%- set released_egress = [] %}
+{%- for d in active_egress | default([]) %}
+{%-  if (d.release | default({})).from_fabric | default(false) %}
+{%-   set _ = released_egress.append(d) %}
+{%-  endif %}
+{%- endfor %}
+{%- set publishers = [] %}
+{%- for p in active_peers %}
+{%-  set _ = publishers.append({
+       'id': p.id, 'ns': p.namespace, 'cn': p.cert_cn,
+       'rule': p.id ~ '-ingress-write', 'subject': 'mtls-' ~ p.id,
+       'desc': p.description | default('third-party peer'),
+       'how':  'trust tier ' ~ (p.trust_tier | default('T?')) ~ ' · connects as ' ~ (p.connects | default('client')),
+       'reads': (p.read_keys | default([]) | map('regex_replace', '^', 'downlink/') | list)
+                if (p.release | default({})).from_fabric | default(false) else [] }) %}
+{%- endfor %}
+{%- for a in active_arms %}
+{%-  set _ = publishers.append({
+       'id': a.id, 'ns': a.namespace, 'cn': a.cert_cn,
+       'rule': a.id ~ '-arm-write', 'subject': 'mtls-' ~ a.id ~ '-arm',
+       'desc': a.description | default('third-party arm publisher'),
+       'how':  'trust tier ' ~ (a.trust_tier | default('T?')) ~ ' · certless source at ' ~ (a.transport | default('udp')) ~ '/' ~ (a.port | default('?')) }) %}
+{%- endfor %}
+{#- THE POD'S OWN HEALTH is a publisher like any other: one certificate, one namespace,
+    one grant, generated from the same declaration machinery. It writes exactly one key
+    and the router enforces that the same way it enforces an arm's namespace — so nothing
+    new enters the trust model, and a compromised health publisher can write nothing but
+    its own health. #}
+{%- if health_pub_enabled | default(false) %}
+{%-  set _ = publishers.append({
+       'id': 'health', 'ns': health_pub_key, 'cn': health_pub_cn,
+       'rule': 'health-write', 'subject': 'mtls-health', 'messages': ['put'],
+       'desc': "this pod's own health",
+       'how':  'publishes every ' ~ (health_pub_interval | default(60)) ~ 's, jittered by pod id' }) %}
+{%- endif %}
+
+{
+  mode: "router",
+  listen: { endpoints: ["tls/0.0.0.0:{{ pen_listen_port }}"] },
+  // Discovery off. Everything that joins this pen dials a known endpoint holding a
+  // pen-CA certificate, so scouting buys nothing — and left at its default the router
+  // announces itself by multicast on every interface it can see, which on a shared
+  // exercise LAN is every other participant. This lets nobody in who was not already
+  // getting in (mTLS still decides that); it stops us advertising that we are here.
+  scouting: { multicast: { enabled: false } },
+  transport: { link: { tls: {
+    listen_certificate: "/etc/zenoh/tls/pod-cert.pem",
+    listen_private_key: "/etc/zenoh/tls/pod-key.pem",
+    connect_certificate: "/etc/zenoh/tls/pod-cert.pem",
+    connect_private_key: "/etc/zenoh/tls/pod-key.pem",
+    root_ca_certificate: "/etc/zenoh/tls/ca-roots.pem",
+    enable_mtls: true,
+    verify_name_on_connect: false
+  } } },
+  access_control: {
+    enabled: true,
+    default_permission: "deny",
+    rules: [
+      // first party: full authority over our own namespaces
+      { id: "pod-firstparty",
+        messages: ["put","delete","declare_subscriber","query","declare_queryable","reply"],
+        flows: ["egress","ingress"], permission: "allow",
+        key_exprs: [{% for ns in pen_firstparty_namespaces %}"{{ ns }}"{{ ", " if not loop.last }}{% endfor %}] }{{ "," if publishers or downlink }}
+{% for x in publishers %}
+
+      // {{ x.id }} — {{ x.desc }}
+      // {{ x.how }} · CN {{ x.cn }}
+        // messages defaults to put+delete, which is right for a publisher that owns a
+        // namespace and may retract from it. A publisher that only ever puts declares
+        // ["put"] and is granted no more than it uses — an unused grant is a grant
+        // available to whoever takes the identity.
+      { id: "{{ x.rule }}",
+          messages: [{% for m in x.messages | default(["put","delete"]) %}"{{ m }}"{{ ", " if not loop.last }}{% endfor %}],
+        flows: ["ingress"], permission: "allow",
+        key_exprs: ["{{ x.ns }}"] },
+      { id: "firstparty-{{ x.id }}-interest",
+        messages: ["declare_subscriber","query"],
+        flows: ["ingress"], permission: "allow",
+        key_exprs: ["{{ x.ns }}"] },
+      { id: "firstparty-{{ x.id }}-deliver",
+        messages: ["put","delete","reply"],
+        flows: ["egress"], permission: "allow",
+        key_exprs: ["{{ x.ns }}"] }{{ "," if (x.reads | default([])) or not loop.last or downlink }}
+{% if x.reads | default([]) %}
+
+      // {{ x.id }} also READS what was released down to it, on ITS OWN identity only.
+      { id: "{{ x.id }}-read-interest",
+        messages: ["declare_subscriber","query"],
+        flows: ["ingress"], permission: "allow",
+        key_exprs: [{% for k in x.reads %}"{{ k }}"{{ ", " if not loop.last }}{% endfor %}] },
+      { id: "{{ x.id }}-read-deliver",
+        messages: ["put","delete","reply"],
+        flows: ["egress"], permission: "allow",
+        key_exprs: [{% for k in x.reads %}"{{ k }}"{{ ", " if not loop.last }}{% endfor %}] }{{ "," if not loop.last or downlink }}
+{% endif %}
+{% endfor %}
+{% if downlink %}
+
+      // downlink bridge: republishes released fabric keys onto the pen, and may write
+      // {{ downlink_ns }} only. Its fabric session is a separate identity (the slot).
+      { id: "downlink-bridge-write",
+        messages: ["put","delete"],
+        flows: ["ingress"], permission: "allow",
+        key_exprs: ["{{ downlink_ns }}"] },
+      // The audit sink watches the downlink namespace: a namespace that can be written is
+      // a namespace that is audited. Granted to the sink's CN through its own subject,
+      // not through mtls-firstparty, so the uplink bridge (also first party) can never
+      // read what came down and carry it back up.
+      { id: "downlink-audit-interest",
+        messages: ["declare_subscriber","query"],
+        flows: ["ingress"], permission: "allow",
+        key_exprs: ["{{ downlink_ns }}"] },
+      { id: "downlink-audit-deliver",
+        messages: ["put","delete","reply"],
+        flows: ["egress"], permission: "allow",
+        key_exprs: ["{{ downlink_ns }}"] }{{ "," if released_egress }}
+{% for d in released_egress %}
+
+      // {{ d.id }}: egress via {{ d.dest }} · CN {{ d.cert_cn }}
+      // reads its own downlink keys and nothing else; released by its owner
+      { id: "{{ d.id }}-egress-interest",
+        messages: ["declare_subscriber"],
+        flows: ["ingress"], permission: "allow",
+        key_exprs: [{% for k in d['keys'] %}"downlink/{{ k }}"{{ ", " if not loop.last }}{% endfor %}] },
+      { id: "{{ d.id }}-egress-deliver",
+        messages: ["put","delete"],
+        flows: ["egress"], permission: "allow",
+        key_exprs: [{% for k in d['keys'] %}"downlink/{{ k }}"{{ ", " if not loop.last }}{% endfor %}] }{{ "," if not loop.last }}
+{% endfor %}
+{% endif %}
+    ],
+    subjects: [
+      { id: "mtls-firstparty", link_protocols: ["tls"],
+        cert_common_names: [{% for cn in pen_firstparty_cns %}"{{ cn }}"{{ ", " if not loop.last }}{% endfor %}] }{{ "," if publishers or downlink }}
+{% for x in publishers %}
+      { id: "{{ x.subject }}", link_protocols: ["tls"],
+        cert_common_names: ["{{ x.cn }}"] }{{ "," if not loop.last or downlink }}
+{% endfor %}
+{% if downlink %}
+      { id: "mtls-downlink-bridge", link_protocols: ["tls"],
+        cert_common_names: ["octo-downlink-bridge"] },
+      // The audit sink's CN only. It is also in mtls-firstparty; zenoh grants a session
+      // the union of every subject it matches.
+      { id: "mtls-downlink-audit", link_protocols: ["tls"],
+        cert_common_names: ["octo-pen-router"] }{{ "," if released_egress }}
+{% for d in released_egress %}
+      { id: "mtls-{{ d.id }}-egress", link_protocols: ["tls"],
+        cert_common_names: ["{{ d.cert_cn }}"] }{{ "," if not loop.last }}
+{% endfor %}
+{% endif %}
+    ],
+    policies: [
+      { rules: ["pod-firstparty"{% for x in publishers %}, "firstparty-{{ x.id }}-interest", "firstparty-{{ x.id }}-deliver"{% endfor %}],
+        subjects: ["mtls-firstparty"] }{{ "," if publishers or downlink }}
+{% for x in publishers %}
+
+      // {{ x.id }} gets WRITE on its own namespace and nothing else{{ ', plus the reads released to it' if x.reads | default([]) }}. Never in
+      // mtls-firstparty — that grants {{ pen_firstparty_namespaces | join(', ') }}, which bridge_allow releases.
+      { rules: ["{{ x.rule }}"{% if x.reads | default([]) %}, "{{ x.id }}-read-interest", "{{ x.id }}-read-deliver"{% endif %}],
+        subjects: ["{{ x.subject }}"] }{{ "," if not loop.last or downlink }}
+{% endfor %}
+{% if downlink %}
+
+      // The downlink bridge WRITES the downlink namespace and nothing else.
+      { rules: ["downlink-bridge-write"], subjects: ["mtls-downlink-bridge"] },
+      // The audit sink READS it, so every key that came down is recorded.
+      { rules: ["downlink-audit-interest", "downlink-audit-deliver"], subjects: ["mtls-downlink-audit"] }{{ "," if released_egress }}
+{% for d in released_egress %}
+
+      // {{ d.id }} READS its own downlink keys and nothing else.
+      { rules: ["{{ d.id }}-egress-interest", "{{ d.id }}-egress-deliver"], subjects: ["mtls-{{ d.id }}-egress"] }{{ "," if not loop.last }}
+{% endfor %}
+{% endif %}
+    ]
+  }
+}

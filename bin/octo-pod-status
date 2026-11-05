@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+octo-pod-status — what this pod is doing right now, declared against actual.
+
+    octo-pod status              the table
+    octo-pod status --json       the same thing for a machine
+
+NOT a health check. `octo-pod verify` is the pass/fail gate and exits non-zero when
+something is wrong; this always exits 0 and shows you the picture, including the
+states verify has no way to express — a publisher declared but never started, or a
+container running that no declaration accounts for.
+
+The two halves come from different places on purpose:
+
+    declared   /etc/octo-pod/host_vars/<pod>/{20-peers,30-arms}.yml   the identity layer
+    actual     podman ps, the sink's own metrics, the certificate on disk
+
+Reading only the declaration tells you what someone intended. Reading only podman
+tells you what is running. Neither answers "is this pod doing what it was told",
+which is the question an operator actually has, and the reason the two are shown
+side by side rather than as separate commands.
+
+Peers and arms are one table because they are the same thing to the pen: a publisher
+with a namespace, a certificate and a release decision. They differ only in how the
+data arrives — an arm owns a socket on this box, a peer holds its own certificate and
+dials in. That is the TYPE column, not two tables.
+
+The bridge is its own line because it is not a publisher. It is the only way anything
+leaves this pod, so "what is released" is a property of the pod, not of a row.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("python3-yaml is missing — it is a package dependency: sudo apt-get install -f -y")
+
+ETC = os.environ.get("OCTO_POD_ETC", "/etc/octo-pod")
+PEN_STATE = os.environ.get("OCTO_PEN_STATE", "/var/lib/octo-pen")
+METRICS_PORT = os.environ.get("OCTO_AUDIT_METRICS_PORT", "9303")
+
+# An arm's container is named for the image that serves it, so the id alone does not
+# say which to look for. Try each; a declaration names a kind, but an older pod may
+# not, and being wrong here would report a running arm as missing.
+ARM_PREFIXES = ("octo-udp-ingest-", "octo-tcp-ingest-", "octo-tcp-connect-")
+ROUTER = "octo-pen-zenoh-router"
+UPLINK = "octo-uplink-bridge"
+# Pod INFRASTRUCTURE is not an orphan. The router, the default sink and the on-pod
+# registry are not publishers and no declaration names them, but reporting them as
+# "running, nothing declares them, stop them by hand" is advice that breaks the pod.
+# An orphan is specifically a PUBLISHER whose declaration went away. Kept identical to
+# _infra in configure-octo-pod.yml's orphan check; octo-pod describe reads it from here.
+INFRA = {"octo-pen-audit-sink", ROUTER, "octo-registry", "octo-health-pub",
+         UPLINK, "octo-downlink-bridge", "octo-pen-audit-sink-downlink"}
+# A certificate name is joined into a path, so it must not be able to climb out of the
+# TLS directory. The CLI always writes octo-<kind>-<id>; anything else is hand-written.
+CERT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def sh(cmd, timeout=10):
+    """Run a command, return stdout or "" — never raise. Status must not fail."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout.strip() if p.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or default
+    except (OSError, yaml.YAMLError):
+        return default
+
+
+def pod_name():
+    """The pod's handle names its host_vars dir. Prefer the inventory; fall back to
+    the single directory under host_vars, because a hand-written identity may not
+    have gone through join."""
+    inv = os.path.join(ETC, "inventory.ini")
+    try:
+        with open(inv) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith(("[", "#")) and "ansible_connection" in line:
+                    return line.split()[0]
+    except OSError:
+        # An unavailable inventory falls back to the host_vars directory below.
+        pass
+    hv = os.path.join(ETC, "host_vars")
+    try:
+        dirs = sorted(d for d in os.listdir(hv) if os.path.isdir(os.path.join(hv, d)))
+        return dirs[0] if dirs else None
+    except OSError:
+        return None
+
+
+def containers():
+    """name -> status string, for everything running."""
+    out = {}
+    for line in sh(["podman", "ps", "--format", "{{.Names}}\t{{.Status}}"]).splitlines():
+        if "\t" in line:
+            name, status = line.split("\t", 1)
+            out[name] = status
+    return out
+
+
+def sink_live(name):
+    """The sink's own view of its subscription. True/False/None (no sink)."""
+    ip = sh(["podman", "inspect", name, "--format",
+             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"])
+    if not ip:
+        return None
+    body = sh(["curl", "-s", "--max-time", "3", f"http://{ip}:{METRICS_PORT}/metrics"], timeout=6)
+    for line in body.splitlines():
+        if line.startswith("goat_audit_subscriber_session_state"):
+            return line.split()[-1] == "1"
+    return None
+
+
+def cert_expiry(cn_or_id):
+    """Not-after for a publisher's leaf, if the pen signed one."""
+    tls = os.path.join(PEN_STATE, "zenoh", "tls")
+    if not isinstance(cn_or_id, str) or not CERT_NAME.fullmatch(cn_or_id):
+        return None
+    for cand in (f"{cn_or_id}-cert.pem", f"{cn_or_id}-arm-cert.pem", f"octo-arm-{cn_or_id}-cert.pem"):
+        p = os.path.join(tls, cand)
+        if os.path.exists(p):
+            out = sh(["openssl", "x509", "-enddate", "-noout", "-in", p])
+            if out.startswith("notAfter="):
+                # "Nov 13 10:02:07 2028 GMT" -> "2028-11-13"
+                m = re.match(r"notAfter=(\w+)\s+(\d+)\s+[\d:]+\s+(\d{4})", out)
+                if m:
+                    mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].index(m.group(1)) + 1
+                    return f"{m.group(3)}-{mon:02d}-{int(m.group(2)):02d}"
+                return out.split("=", 1)[1]
+    return None
+
+
+def transport_of(p, kind):
+    """How data reaches the pen for this publisher, in one column."""
+    if kind == "peer":
+        how = f"mTLS, LAN from {p['allow_sources']}" if p.get("allow_sources") else "mTLS, mesh"
+        reads = p.get("read_keys") or []
+        if reads and (p.get("release") or {}).get("from_fabric"):
+            how += f", reads {len(reads)} key(s)"
+        return how
+    k = p.get("kind", "udp-ingest")
+    if k == "tcp-connect":
+        return f"tcp -> {p.get('target', '?')}"
+    proto = p.get("transport", "udp")
+    port = p.get("port", "?")
+    src = p.get("allow_sources") or "any"
+    return f"{proto} :{port} from {src}"
+
+
+def collect():
+    pod = pod_name()
+    if not pod:
+        return None, None
+    hv = os.path.join(ETC, "host_vars", pod)
+    arms = load(os.path.join(hv, "30-arms.yml"), {}).get("arms") or []
+    peers = load(os.path.join(hv, "20-peers.yml"), {}).get("peers") or []
+    egress = load(os.path.join(hv, "40-egress.yml"), {}).get("egress") or []
+    podvars = load(os.path.join(hv, "10-pod.yml"), {})
+    fabric = load(os.path.join(hv, "05-fabric.yml"), {})
+    running = containers()
+
+    rows = []
+    claimed = set()
+    for kind, items in (("arm", arms), ("peer", peers)):
+        for p in items:
+            pid = p.get("id", "?")
+            enabled = p.get("enabled", True)
+
+            container, status = None, None
+            if kind == "arm":
+                for pre in ARM_PREFIXES:
+                    if pre + pid in running:
+                        container, status = pre + pid, running[pre + pid]
+                        break
+            if container:
+                claimed.add(container)
+
+            sink = f"octo-pen-audit-sink-{pid}"
+            live = sink_live(sink) if sink in running else None
+            if sink in running:
+                claimed.add(sink)
+
+            if not enabled:
+                state = "disabled"
+            elif kind == "peer":
+                state = "declared"          # a peer runs on someone else's box
+            elif status:
+                state = status.lower().replace("up ", "up ")
+            else:
+                state = "NOT RUNNING"
+
+            rows.append({
+                "type": kind,
+                "id": pid,
+                "state": state,
+                "transport": transport_of(p, kind),
+                "topic": p.get("namespace", "?"),
+                "sink": {True: "live", False: "DOWN", None: "—"}[live],
+                "released": bool((p.get("release") or {}).get("to_fabric", False)),
+                "cert": cert_expiry(p.get("cert_cn", "")) or cert_expiry(pid) or "—",
+            })
+
+    # Egress destinations: the outbound mirror of the arms. "released" means its own
+    # release.from_fabric; the downlink gate is checked by `octo-pod egress check`.
+    for e in egress:
+        eid = e.get("id", "?")
+        container = f"octo-egress-{eid}"
+        status = running.get(container)
+        if status:
+            claimed.add(container)
+        if not e.get("enabled", True):
+            state = "disabled"
+        elif status:
+            state = status.lower()
+        else:
+            state = "NOT RUNNING"
+        rows.append({
+            "type": "egress",
+            "id": eid,
+            "state": state,
+            "transport": e.get("dest", "?"),
+            "topic": ",".join(e.get("keys") or []) or "?",
+            "sink": "—",
+            "released": bool((e.get("release") or {}).get("from_fabric", False)),
+            "cert": cert_expiry(f"{eid}-egress") or "—",
+        })
+
+    # Anything octo-shaped that no declaration accounts for. `apply` creates but never
+    # deletes, so a removed declaration leaves its container running and serving — the
+    # one failure this whole view exists to make visible.
+    orphans = [
+        (n, s) for n, s in sorted(running.items())
+        if n.startswith(("octo-", "octo-pen-audit-sink"))
+        and n != ROUTER and n not in claimed
+        and not n.startswith("octo-pen-audit-sink" + "\0")     # exact-name sink handled below
+    ]
+    orphans = [(n, s) for n, s in orphans if n not in INFRA]
+
+    pod_info = {
+        "pod": pod,
+        "router": running.get(ROUTER, "NOT RUNNING"),
+        "bridge_allow": podvars.get("bridge_allow", ""),
+        "slot": podvars.get("fabric_slot_anchor", "") or "",
+        "endpoint": fabric.get("fabric_endpoint", "") or "",
+        # The uplink by name. "Any container called *bridge*" let a running downlink
+        # bridge stand in for a stopped uplink, the only way data leaves the pod.
+        "bridge_container": f"{UPLINK} ({running[UPLINK]})" if UPLINK in running else None,
+        "orphans": orphans,
+        "default_sink": "octo-pen-audit-sink" in running,
+    }
+    return pod_info, rows
+
+
+def render(info, rows):
+    print(f"\npod {info['pod']}")
+    print(f"  router   {info['router']}")
+
+    # The release gate, stated as what it does rather than as three variables. A pod
+    # that captures locally is a supported shape, so "not releasing" is a state to
+    # report plainly, not a warning.
+    publishers = [r for r in rows if r["type"] in ("arm", "peer")]
+    if not info["slot"]:
+        print("  upstream no slot — this pod captures locally and releases nothing")
+        # release.to_fabric: true on a pod with no slot is a decision that does nothing.
+        # It reads as "this data is being shared" in the file where an operator makes
+        # that call, so say plainly that it is inert rather than leaving the yes in the
+        # RELEASED column to imply otherwise.
+        inert = [r["id"] for r in publishers if r["released"]]
+        if inert:
+            print(f"           note: {', '.join(inert)} declare release.to_fabric: true, "
+                  f"which has no effect without a slot")
+    elif not info["endpoint"]:
+        print("  upstream slot held, but no fabric_endpoint — the bridge cannot start")
+    else:
+        released = sum(1 for r in publishers if r["released"])
+        bc = info["bridge_container"] or "NOT RUNNING"
+        print(f"  upstream {bc} -> {info['endpoint']}")
+        print(f"           gate allows {info['bridge_allow'] or '(nothing)'} · "
+              f"{released} of {len(publishers)} publisher(s) released")
+
+    if not rows:
+        print("\n  no publishers declared yet — octo-pod add-arm <id> ... then octo-pod apply")
+    else:
+        w = {k: max(len(k.upper()), max((len(str(r[k])) for r in rows), default=0))
+             for k in ("type", "id", "state", "transport", "topic")}
+        head = (f"\n  {'TYPE':<{w['type']}}  {'ID':<{w['id']}}  {'STATE':<{w['state']}}  "
+                f"{'TRANSPORT':<{w['transport']}}  {'TOPIC':<{w['topic']}}  SINK  RELEASED  CERT")
+        print(head)
+        print("  " + "-" * (len(head) - 3))
+        for r in rows:
+            print(f"  {r['type']:<{w['type']}}  {r['id']:<{w['id']}}  {r['state']:<{w['state']}}  "
+                  f"{r['transport']:<{w['transport']}}  {r['topic']:<{w['topic']}}  "
+                  f"{r['sink']:<4}  {'yes' if r['released'] else 'no':<8}  {r['cert']}")
+
+    if info["orphans"]:
+        print("\n  ORPHANED — running, but nothing declares them. `apply` creates and never")
+        print("  deletes, so these keep publishing until someone stops them by hand:")
+        for n, s in info["orphans"]:
+            print(f"    {n}  ({s})")
+
+    print()
+
+
+def main():
+    as_json = "--json" in sys.argv[1:]
+    if not os.path.isdir(ETC):
+        print(f"no {ETC} — this box is not a pod yet. Run: octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>", file=sys.stderr)
+        return 0
+    info, rows = collect()
+    if info is None:
+        print(f"{ETC} has no pod identity — run: octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>", file=sys.stderr)
+        return 0
+    if as_json:
+        print(json.dumps({"pod": info, "publishers": rows}, indent=2))
+    else:
+        render(info, rows)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

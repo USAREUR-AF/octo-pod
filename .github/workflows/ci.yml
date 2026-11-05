@@ -1,0 +1,265 @@
+# CI: every push and PR. The Rust workspace, plus the offline suites that guard the
+# generated config. Those used to run only on a release tag, which meant a change to who
+# can write what could sit on main unchecked until someone cut a release.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Supersede an in-flight run for the same ref, but never on main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: arms
+      - name: fmt
+        run: cargo fmt --all --check
+        working-directory: arms
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: arms
+      - name: test
+        run: cargo test --workspace --locked
+        working-directory: arms
+
+  # uuid 1.28 requires Rust 1.89; keep the declared minimum buildable.
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.89.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: arms
+      - name: check the declared minimum Rust version
+        run: cargo check --workspace --all-targets --locked
+        working-directory: arms
+
+  # No pod, no mesh, no credentials. Seconds to run, and the ACL check is the one that
+  # matters: it compares the expanded grant set against a golden file, so a change to who
+  # can publish where cannot merge unnoticed.
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with: { python-version: '3.12' }
+      - name: dependencies
+        run: |
+          pip install --quiet -r platform/tests/requirements.txt ansible-core
+          # The JSON callback used by the playbook fixtures is not in ansible-core.
+          # Same 2.2.2 release, pinned to its upstream commit; avoids Galaxy artifact outages.
+          ansible-galaxy collection install git+https://github.com/ansible-collections/ansible.posix.git,e98d9a0756458be1ac710988498000973889075c
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables shellcheck jq
+
+      - name: templates (ACL semantics, arm env, compose)
+        run: python3 tests/test_templates.py
+        working-directory: platform
+
+      # What a pod actually installs is not the repository. This stages the release
+      # payload and asserts on the tree, so "no credential in the artifact" and "no arm
+      # source on a pod" are checked on every push, not at tag time when it is too late.
+      - name: release payload
+        run: python3 tests/test_release.py
+        working-directory: platform
+
+      - name: join proves the requested management connection
+        run: python3 platform/tests/test_join.py
+
+      - name: Mac image delivery safety
+        run: python3 platform/tests/test_push_images.py
+
+      - name: PR image selection and loader refusal controls
+        run: python3 platform/tests/test_pr_images.py
+
+      - name: playbook syntax
+        run: |
+          for p in configure-octo-pod.yml verify-octo-pod.yml publish-to-portal.yml bootstrap-octo-pod.yml; do
+            ansible-playbook -i ../example/inventory.ini "$p" --syntax-check
+          done
+        working-directory: platform
+
+      - name: shell
+        run: |
+          # EVERY shell file in the repo, listed explicitly — because the three that were
+          # missing from this list were install-to-pod.sh, deprovision-pod.sh and the
+          # completion. The first of those downloads and cryptographically verifies the
+          # release; it is the highest-consequence script here and nothing looked at it.
+          # Two silent bugs shipped in it (a jq expression that would not parse, and an awk
+          # separator that matched nothing) — both are things a linter sees instantly.
+          scripts="bin/octo-pod bin/octo-pod-identity
+                   bin/octo-pod-join bin/octo-pod-upgrade
+                   tools/check-pr-image.sh tools/build-release.sh tools/build-airgap-bundle.sh
+                   tools/install-to-pod.sh tools/deprovision-pod.sh tools/push-images.sh
+                   tools/mint-key.sh tools/build-vm-image.sh tools/vm-image-provision.sh
+                   tools/prove-sapient/run.sh
+                   completions/octo-pod.bash"
+          # Default severity, not -S warning: `info`-level findings include unquoted
+          # expansions, which is how a path with a space becomes two arguments — and one
+          # of those was in the check that stops a credential shipping in a release.
+          # shellcheck disable=SC2086  # word splitting is the point
+          bash -n $scripts
+          # shellcheck disable=SC2086
+          shellcheck $scripts
+
+          # AND NOTHING MAY BE MISSING FROM THAT LIST. The list above is hand-written, which
+          # is exactly how three files came to be absent from it. Find every shell file in the
+          # repo and fail if one is not being linted, so the NEXT script is covered by default
+          # rather than by somebody remembering.
+          # Whitespace-normalised: $scripts is written across several lines, so a
+          # naive `case " $scripts "` compares against embedded newlines and reports
+          # every file as missing. Unquoted expansion re-splits it into single spaces.
+          # shellcheck disable=SC2086,SC2116 # Intentional whitespace normalization.
+          checked=" $(echo $scripts) "
+          missing=0
+          for f in $(git ls-files "bin/*" "tools/*" "completions/*"); do
+            head -1 "$f" | grep -qE "^#!.*(bash|/bin/sh)" || continue
+            case "$checked" in
+              *" $f "*) ;;
+              *) echo "::error file=$f::$f is a shell script CI does not lint — add it to the list in .github/workflows/ci.yml"; missing=1 ;;
+            esac
+          done
+          [ "$missing" = 0 ] || exit 1
+
+      # The Dockerfiles are only ever parsed by images.yml, which runs on pushes to main.
+      # So a Dockerfile that does not parse merges green, and the failure surfaces later
+      # in the one workflow that has to work before an arm64 pod can run anything. That
+      # happened: a trailing `# latest-dev` comment on a FROM line — legal in every other
+      # language here, not in a Dockerfile — broke all three arms. Parse them on every PR.
+      - name: dockerfiles parse
+        run: |
+          for d in arms/*/Dockerfile; do
+            echo "== $d"
+            docker buildx build --check -f "$d" arms
+          done
+
+      # The scripts a pod actually RUNS UNATTENDED are generated from Jinja, and nothing
+      # here ever looked at them — bin/ was checked, the templates were not. A template
+      # edit could ship a script that does not parse to every pod in the fleet and only
+      # fail on a timer at 3am. Render them and check the output.
+      - name: shellcheck the generated scripts
+        run: |
+          pip install --quiet -r platform/tests/requirements.txt
+          python3 - <<'PY'
+          import pathlib, re
+          from jinja2 import Environment, FileSystemLoader
+          e = Environment(loader=FileSystemLoader("platform/templates"),
+                          trim_blocks=True, keep_trailing_newline=True)
+          e.filters["regex_replace"] = lambda s, p, r="": re.sub(p, r, str(s))
+          ctx = dict(pen_state_dir="/var/lib/octo-pen", sub_leaf_dir="/etc/octo-pen-uplink",
+                     arm_tls_dir="/etc/octo-arm/tls", octo_pod_etc="/etc/octo-pod",
+                     audit_metrics_port=9303, pen_listen_port=7447, cert_renew_days=60,
+                     cert_leaf_days=825, cert_expiry_warn_days=90,
+                     selfheal_reboot_after_fails=10, octo_repo_url="https://x.invalid",
+                     octo_repo_keyring="/etc/apt/keyrings/octo-pod.asc",
+                     octo_repo_suite="stable", octo_repo_component="main",
+                     netbird_mgmt_url="https://x", netbird_pending_key_file="/etc/octo-pod/k",
+                     inventory_hostname="pod-x", mesh_iface="wt0")
+          out = pathlib.Path("rendered"); out.mkdir(exist_ok=True)
+          for n in ["pen/cert-renew.sh.j2", "pen/cert-expiry-check.sh.j2",
+                    "host/octo-watchdog.sh.j2", "host/netbird-selfheal.sh.j2",
+                    "host/netbird-enrol-pending.sh.j2", "host/octo-firewall-apply.sh.j2"]:
+              (out / pathlib.Path(n).name.replace(".j2", "")).write_text(
+                  e.get_template(n).render(**ctx))
+          PY
+          bash -n rendered/*.sh
+          shellcheck rendered/*.sh
+
+  # Scanners. They find KNOWN-bad versions and KNOWN-bad patterns — a different job from
+  # reading the threat model, and neither of the two vulnerabilities found by review
+  # would have shown up here. Both kinds of check earn their place; neither replaces the
+  # other.
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # gitleaks scans history, not just the worktree
+
+      # Dependency policy, shared with goat: cargo-deny enforces licenses, bans and
+      # sources; cargo-audit handles vulnerabilities. Maintenance warnings remain
+      # visible without blocking CI.
+      - uses: dtolnay/rust-toolchain@stable
+      # THIRD_PARTY_LICENSES.md ships in every arm image. It is generated from Cargo.lock,
+      # so a dependency change must regenerate it: rebuild it here and fail on any drift.
+      - name: third-party notices are current
+        run: |
+          # The binary is behind the `cli` feature: without it the install succeeds and
+          # installs nothing, and the next line fails with "no such command: about".
+          cargo install --locked cargo-about --version 0.9.2 --features cli
+          cd arms
+          # --frozen checks the local cache; fetch the locked workspace first.
+          cargo fetch --locked
+          cargo about generate --frozen --fail about.hbs -o THIRD_PARTY_LICENSES.md
+          git diff --exit-code -- THIRD_PARTY_LICENSES.md \
+            || { echo "::error::arms/THIRD_PARTY_LICENSES.md is stale: run the command above in arms/ and commit it"; exit 1; }
+
+      - name: cargo-deny (licenses, bans, sources)
+        run: |
+          cargo install --locked cargo-deny
+          cargo deny check licenses bans sources
+        working-directory: arms
+
+      # Match goat: cargo-audit blocks unignored vulnerabilities. Without
+      # --deny warnings, maintenance advisories are reported as warnings.
+      # Keep the existing RSA and compression exceptions; no new ignore is added.
+      - name: cargo-audit
+        run: |
+          cargo install --locked cargo-audit
+          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0041
+        working-directory: arms
+
+      # The languages cargo cannot see: the playbooks, the generated shell, the Python
+      # CLI, the Dockerfiles and these workflows. `--error` fails the job on ERROR
+      # severity only — the mutable-action-tag warnings are a known fleet-wide item
+      # (pin actions to SHA, supply-chain doc P2) and would otherwise drown the signal.
+      - name: semgrep
+        run: |
+          pip install --quiet semgrep
+          PACKS="--config p/security-audit --config p/secrets --config p/dockerfile
+                 --config p/python --config p/ci --config p/command-injection"
+          # Report everything so warnings stay visible in the log...
+          # shellcheck disable=SC2086
+          semgrep $PACKS --metrics=off . || true
+          # ...but fail only on ERROR. The WARNING set is dominated by mutable action
+          # tags (`@v4`), which is a real issue and a known fleet-wide one — supply-chain
+          # doc P2, fixed by SHA-pinning via Dependabot, not by blocking every PR here.
+          # shellcheck disable=SC2086
+          semgrep $PACKS --severity=ERROR --error --metrics=off --quiet .
+
+      # History as well as the worktree: a credential that was committed and then
+      # removed is still published. This repo nearly shipped a real site address.
+      #
+      # The gitleaks BINARY, not gitleaks-action. The tool is MIT; the action refuses to
+      # run for organisation accounts without a paid GITLEAKS_LICENSE, which is a billing
+      # boundary, not a security one. Invoking the release binary keeps the same scan
+      # with no licence, no third-party action in the credential path, and a version we
+      # pin ourselves rather than a floating v2 tag.
+      - name: gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          # `git` mode walks every commit; --redact so a hit never prints the secret
+          # itself into a public log. Non-zero exit on any finding is the point.
+          /tmp/gitleaks git --redact --verbose --exit-code 1 .

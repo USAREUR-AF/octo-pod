@@ -1,0 +1,185 @@
+# Synthetic inputs for the offline template tests. NOT the live pod — deliberately
+# different values, so a test that accidentally reads real host_vars fails loudly
+# instead of passing against production data.
+#
+# Covers the three shapes that matter: a zenoh-native peer, an enabled socket arm,
+# and a declared-but-disabled arm (which must appear NOWHERE in any rendered output).
+
+pen_state_dir: /var/lib/octo-pen
+pen_namespace: "raw/testpod"
+pen_listen_port: 7447
+zenoh_image: "eclipse/zenoh:1.9.0"
+audit_image: "ghcr.io/usareur-af/goat-audit-subscriber:sha-deadbeef"
+audit_runtime_uid: 65532
+mesh_ip: "100.127.0.1"
+
+pen_firstparty_namespaces:
+  - "raw/testpod/**"
+  - "cot/**"
+pen_firstparty_cns:
+  - octo-pen-router
+  - octo-uplink-bridge
+
+peers:
+  - id: alpha
+    description: "test peer"
+    cert_cn: octo-peer-alpha
+    namespace: "raw/alpha/**"
+    enabled: true
+    connects: client
+    trust_tier: T2
+  # A peer released to READ a fabric key, reaching the pen over the LAN. Proves the read
+  # lands on india's own CN only, on downlink/<key> only, and that the firewall opens the
+  # pen to india's declared sources only.
+  - id: india
+    description: "test peer with a released read, over the LAN"
+    cert_cn: octo-peer-india
+    namespace: "raw/india/**"
+    allow_sources: "100.127.0.25, 100.127.0.26"
+    read_keys:
+      - "1d18de66e8a09a5e68170b3b3de6563b/sensors/sensor2/**"
+    enabled: true
+    connects: client
+    trust_tier: T2
+    release:
+      to_fabric: false
+      from_fabric: true
+  # Declares a read but is NOT released: must get no read grant at all.
+  - id: juliet
+    description: "test peer with a declared but shut read"
+    cert_cn: octo-peer-juliet
+    namespace: "raw/juliet/**"
+    read_keys:
+      - "1d18de66e8a09a5e68170b3b3de6563b/sensors/tpq50/**"
+    enabled: true
+    connects: client
+    trust_tier: T2
+    release:
+      to_fabric: false
+      from_fabric: false
+
+arms:
+  - id: bravo
+    description: "test arm, enabled"
+    cert_cn: octo-arm-bravo
+    namespace: "raw/bravo/**"
+    enabled: true
+    feed: cat62-v1
+    transport: udp
+    port: 48030
+    allow_sources: "100.127.0.9"
+    trust_tier: T1
+  # The dial-out shape. It owns no port on this box — the port is the sensor's — so it
+  # carries `target` instead, and must render TCP_CONNECT_FEEDS rather than a listener.
+  - id: delta
+    kind: tcp-connect
+    description: "test arm, dial-out — the sensor serves its own stream"
+    cert_cn: octo-arm-delta
+    namespace: "raw/delta/**"
+    enabled: true
+    feed: cat62-v1
+    transport: tcp
+    target: "100.127.0.25:7005"
+    framing: len32be
+    allow_sources: "100.127.0.25"
+    trust_tier: T1
+  - id: charlie
+    description: "test arm, DISABLED — must not appear in any output"
+    cert_cn: octo-arm-charlie
+    namespace: "raw/charlie/**"
+    enabled: false
+    feed: cat62-v1
+    transport: udp
+    port: 48031
+    allow_sources: "TODO-not-yet-known"
+    trust_tier: T1
+# Arm images. Present so the env test asserts a real reference, not an empty variable:
+# an undefined var renders as blank, compose falls back to its :latest default, and the
+# pod runs an unpinned image while the test still passes.
+udp_ingest_image: "ghcr.io/example/octo-udp-ingest@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+tcp_ingest_image: "ghcr.io/example/octo-tcp-ingest@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+tcp_connect_image: "ghcr.io/example/octo-tcp-connect@sha256:3333333333333333333333333333333333333333333333333333333333333333"
+
+# The outbound direction: three released destinations (one per way a consumer connects
+# would be ideal; here a datagram, a dialled stream that is shut, and a listener a consumer
+# dials), one declared but shut, and one disabled. Keys are publishers' own keys, plus one
+# release-lane key, which still works. A shut destination's CN must match no subject.
+downlink_allow: "1d18de66e8a09a5e68170b3b3de6563b/sensors/radar1/asterix/data,1d18de66e8a09a5e68170b3b3de6563b/sensors/radar1/radar-one/**,1d18de66e8a09a5e68170b3b3de6563b/sapient/**,1d18de66e8a09a5e68170b3b3de6563b/sensors/sensor2/**"
+egress_image: "ghcr.io/example/octo-egress@sha256:4444444444444444444444444444444444444444444444444444444444444444"
+sapient_image: "ghcr.io/example/octo-sapient@sha256:5555555555555555555555555555555555555555555555555555555555555555"
+egress_session_schemes: [sapient]
+egress_audit_dir: /var/lib/octo-egress
+downlink_tls_dir: /etc/octo-downlink/tls
+fabric_uplink_dir: /etc/octo-uplink
+sub_leaf_dir: /etc/octo-pen-uplink
+fabric_endpoint: "tls/fabric.example.invalid:7447"
+fabric_slot_anchor: "0123456789abcdef0123456789abcdef"
+bridge_allow: "raw/testpod/**"
+uplink_bridge_image: "registry.example/octo-uplink-bridge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+egress:
+  - id: echo
+    description: "test egress, released"
+    cert_cn: octo-egress-echo
+    enabled: true
+    dest: "udp://100.127.0.29:4001"
+    allow_dest: "100.127.0.29:4001"
+    keys:
+      - "1d18de66e8a09a5e68170b3b3de6563b/sensors/radar1/asterix/data"
+    release:
+      from_fabric: true
+  - id: foxtrot
+    description: "test egress, declared but shut"
+    cert_cn: octo-egress-foxtrot
+    enabled: true
+    dest: "tcp://100.127.0.30:4100"
+    allow_dest: "100.127.0.30:4100"
+    keys:
+      - "release/REL-TEST/sensor-b/radar/cat062"
+    release:
+      from_fabric: false
+  - id: golf
+    description: "test egress, DISABLED, released: must not appear in any output"
+    cert_cn: octo-egress-golf
+    enabled: false
+    dest: "udp://100.127.0.52:4002"
+    allow_dest: "100.127.0.52:4002"
+    keys:
+      - "efbbf9fdddf57e9d8d5863335a30ca76/sensors/radar9/asterix/data"
+    release:
+      from_fabric: true
+  - id: hotel
+    description: "test egress, released: a consumer dials the pod, as it would the radar"
+    cert_cn: octo-egress-hotel
+    enabled: true
+    dest: "tcp-server://192.0.2.10:9000"
+    allow_dest: "192.0.2.10:9000"
+    allow_sources: "192.0.2.20"
+    max_clients: 1
+    replay: 2
+    keys:
+      - "1d18de66e8a09a5e68170b3b3de6563b/sensors/radar1/radar-one/**"
+    release:
+      from_fabric: true
+  - id: india
+    description: "test egress, released: a SAPIENT session to a controller"
+    cert_cn: octo-egress-india
+    enabled: true
+    dest: "sapient://192.0.2.30:48000"
+    allow_dest: "192.0.2.30:48000"
+    sapient:
+      node_type: RADAR
+      status_interval_s: 5
+    keys:
+      - "1d18de66e8a09a5e68170b3b3de6563b/sapient/**"
+    release:
+      from_fabric: true
+  - id: juliet
+    description: "test egress, declared but shut: a SAPIENT session, so it must not run"
+    cert_cn: octo-egress-juliet
+    enabled: true
+    dest: "sapient://192.0.2.31:48000"
+    allow_dest: "192.0.2.31:48000"
+    keys:
+      - "1d18de66e8a09a5e68170b3b3de6563b/sapient/**"
+    release:
+      from_fabric: false

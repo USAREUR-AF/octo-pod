@@ -1,0 +1,224 @@
+# Per-arm image publish to ghcr on pushes to main.
+#
+# MULTI-ARCH IS THE POINT. Pods are frequently arm64 (Jetson); operator laptops and
+# cloud runners are amd64. An amd64-only image is the reason arms were compiled on the
+# box, which made every pod's dependency tree a function of the day it was built and
+# put crates.io in the deployment path of a border site.
+#
+# Native runners, not QEMU: emulated Rust builds take tens of minutes and time out.
+# Each arch builds on its own runner and pushes by digest; a final job stitches the two
+# digests into one manifest list, so a single tag serves both architectures.
+#
+# Registry path derives from the repo owner (never hardcode the org — a hardcoded org
+# silently 403s when the repo moves; substrate finding).
+#
+# Deploys pin the pushed DIGEST, never a tag. After this workflow runs, copy the digest
+# it prints into platform/group_vars/all/10-infrastructure.yml.
+name: images
+
+on:
+  push:
+    branches: [main]
+    paths: ['arms/**', '.github/workflows/images.yml']
+  workflow_dispatch:
+
+# Supersede an in-flight run for the same ref, but never on main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # health-pub is not an arm — it publishes the pod's own health rather than a
+        # sensor's data — but it is built, pushed and pinned by exactly the same rules,
+        # so it rides the same matrix rather than growing a second pipeline that would
+        # drift from this one.
+        arm: [udp-ingest, tcp-ingest, tcp-connect, health-pub, egress, sapient, uplink-bridge]
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - { platform: linux/amd64, runner: ubuntu-24.04 }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: lowercase the owner
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/octo-${{ matrix.arm }}" >> "$GITHUB_ENV"
+
+      # Push by digest only — no tag. Tags are applied once, by the merge job, so a
+      # half-finished matrix never leaves a tag pointing at one architecture.
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: arms
+          file: arms/${{ matrix.arm }}/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arm }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arm }}-${{ matrix.platform }}
+
+      - name: export the digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ matrix.arm }}@${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arm }}-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        # MUST MATCH THE BUILD MATRIX. It did not: health-pub was added to build and not
+        # here, so its per-architecture images were pushed and no manifest list was ever
+        # created. `:latest` then resolves to whichever architecture pushed last, and an
+        # arm64 pod pulling it gets "exec format error" — found on a Jetson, months later.
+        # The coverage job below now fails when the two drift.
+        arm: [udp-ingest, tcp-ingest, tcp-connect, health-pub, egress, sapient, uplink-bridge]
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with: { path: /tmp/digests, pattern: 'digest-*', merge-multiple: true }
+
+      - name: create the manifest list
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/octo-${{ matrix.arm }}"
+          SHA="sha-${GITHUB_SHA::7}"
+          # One file per (arm, arch), named <arm>@<digest>. Select this arm's.
+          REFS=""
+          for f in /tmp/digests/${{ matrix.arm }}@*; do
+            [ -e "$f" ] || continue
+            REFS="$REFS ${IMAGE}@sha256:$(basename "$f" | cut -d@ -f2)"
+          done
+          [ -n "$REFS" ] || { echo "::error::no digests for ${{ matrix.arm }}"; exit 1; }
+          # Feature-branch builds provide immutable pins for review; latest moves only
+          # after a main build has passed the architecture checks below.
+          # shellcheck disable=SC2086
+          docker buildx imagetools create -t "${IMAGE}:${SHA}" $REFS
+
+          # The manifest-list digest is what deploys pin. Print it prominently: it is
+          # the one value that has to reach group_vars, and it is not derivable later
+          # without querying the registry.
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${SHA}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          # The group_vars key is not derivable from the arm name by string munging: a
+          # two-way ternary silently mislabelled tcp-connect as tcp_ingest_image, so the
+          # summary told you to paste a digest over the WRONG arm's pin. Explicit map,
+          # and a new arm fails here rather than shipping a plausible wrong line.
+          case "${{ matrix.arm }}" in
+            udp-ingest)  var=udp_ingest_image ;;
+            tcp-ingest)  var=tcp_ingest_image ;;
+            tcp-connect) var=tcp_connect_image ;;
+            health-pub)  var=health_pub_image ;;
+            egress)      var=egress_image ;;
+            sapient)     var=sapient_image ;;
+            uplink-bridge) var=uplink_bridge_image ;;
+            *) echo "::error::no group_vars pin name known for ${{ matrix.arm }}"; exit 1 ;;
+          esac
+          # TO STDOUT AS WELL AS THE SUMMARY. The manifest-list digest is the one value
+          # that has to reach group_vars, and it cannot be derived afterwards without
+          # querying the registry — which needs a credential the person doing the pinning
+          # may not have. Writing it only to the step summary put it in a web page: not
+          # greppable, not pipeable, and gone when the run expires.
+          echo "PIN-THIS ${var}_upstream: \"${IMAGE}@${DIGEST}\"  # ${SHA}"
+
+          echo "### \`octo-${{ matrix.arm }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '```yaml' >> "$GITHUB_STEP_SUMMARY"
+          echo "${var}_upstream: \"${IMAGE}@${DIGEST}\"  # ${SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: prove it is a real manifest list
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/octo-${{ matrix.arm }}"
+          set -euo pipefail
+          SHA="sha-${GITHUB_SHA::7}"
+          docker buildx imagetools inspect "${IMAGE}:${SHA}" --raw | jq -e '
+            [.manifests[]? | .platform | select(.os == "linux") | .architecture]
+            | unique | contains(["amd64", "arm64"])
+          ' || { echo "::error::manifest must carry both linux/amd64 and linux/arm64"; exit 1; }
+
+      - name: promote a verified main build
+        if: github.ref == 'refs/heads/main'
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/octo-${{ matrix.arm }}"
+          SHA="sha-${GITHUB_SHA::7}"
+          docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${SHA}"
+
+  # EVERY IMAGE THAT WAS BUILT MUST HAVE A MANIFEST LIST. This exists because the build
+  # matrix and the merge matrix are two lists that must agree and nothing made them.
+  # health-pub was added to one and not the other: four architectures were pushed, no
+  # manifest list was created, and `:latest` resolved to whichever architecture happened
+  # to push last. Nothing failed. The symptom would have been an arm64 pod reporting
+  # "exec format error" for an image that pulls perfectly on a laptop.
+  #
+  # Checked by OUTCOME rather than by comparing the two matrices — comparing config would
+  # only prove the lists match, not that a manifest list exists. This asks the registry.
+  # It also covers an image nobody has thought of yet, which a config comparison cannot.
+  coverage:
+    needs: merge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with: { path: /tmp/digests, pattern: 'digest-*', merge-multiple: true }
+
+      - name: every built image is multi-arch
+        run: |
+          set -euo pipefail
+          # One file per (image, arch), named <image>@<digest>. The distinct prefixes are
+          # exactly the set of images this run built, whatever the matrices say.
+          built=$(for f in /tmp/digests/*@*; do basename "$f" | cut -d@ -f1; done | sort -u)
+          [ -n "$built" ] || { echo "::error::no digest artifacts — did the build matrix run?"; exit 1; }
+          echo "built this run: $(echo "$built" | tr '\n' ' ')"
+          bad=0
+          for name in $built; do
+            image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/octo-${name}"
+            sha="sha-${GITHUB_SHA::7}"
+            if docker buildx imagetools inspect "${image}:${sha}" --raw | jq -e '
+              [.manifests[]? | .platform | select(.os == "linux") | .architecture]
+              | unique | contains(["amd64", "arm64"])
+            '; then
+              echo "  ok        ${image}:${sha} — amd64 and arm64"
+            else
+              echo "::error::${image}:${sha} is missing linux/amd64 or linux/arm64 — check its build and merge matrices."
+              bad=1
+            fi
+          done
+          [ "$bad" = 0 ]
+

@@ -1,0 +1,41 @@
+# /etc/containers/systemd/octo-downlink-bridge.container  MANAGED BY ANSIBLE
+{#
+   One per pod with egress destinations: the uplink bridge, run in reverse. It holds the
+   slot's fabric session, subscribes ONLY to the keys in downlink_allow, and republishes
+   each fabric key K on the pen as downlink/K, the only namespace the pen ACL lets it
+   write. With nothing released it opens no fabric session at all.
+#}
+
+[Unit]
+Description=octo-pod downlink bridge (released fabric keys to the pen, under downlink/)
+After=octo-pen-zenoh-router.service network-online.target
+Wants=octo-pen-zenoh-router.service network-online.target
+
+[Container]
+Image={{ egress_image }}
+ContainerName=octo-downlink-bridge
+Exec=/usr/local/bin/downlink-bridge
+# Host networking: the fabric leg is the mesh interface and resolves the fabric's name
+# through the pins in this host's /etc/hosts; the pen leg is this host.
+Network=host
+PodmanArgs=--stop-signal=SIGINT
+Environment=DOWNLINK_FABRIC_ENDPOINT={{ fabric_endpoint }}
+Environment=DOWNLINK_FABRIC_CERT={{ fabric_uplink_dir }}/{{ fabric_slot_anchor }}-cert.pem
+Environment=DOWNLINK_FABRIC_KEY={{ fabric_uplink_dir }}/{{ fabric_slot_anchor }}-key.pem
+Environment=DOWNLINK_FABRIC_ROOT_CA={{ fabric_uplink_dir }}/fabric-ca-root.pem
+Environment=DOWNLINK_PEN_ENDPOINT=tls/{{ mesh_ip }}:{{ pen_listen_port }}
+Environment=DOWNLINK_PEN_CERT=/etc/octo/tls/downlink-cert.pem
+Environment=DOWNLINK_PEN_KEY=/etc/octo/tls/downlink-key.pem
+Environment=DOWNLINK_PEN_ROOT_CA=/etc/octo/tls/ca-root.pem
+Environment=DOWNLINK_ALLOW={{ downlink_allow | default('') }}
+Environment=RUST_LOG=info
+Volume={{ fabric_uplink_dir }}:{{ fabric_uplink_dir }}:ro
+Volume={{ downlink_tls_dir }}:/etc/octo/tls:ro
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

@@ -1,0 +1,20 @@
+# cargo-about's input for THIRD_PARTY_LICENSES.md, the notices every arm image ships.
+# The accepted list is deny.toml's [licenses].allow; test_release.py checks they agree.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "0BSD",
+    "BSL-1.0",
+    "OpenSSL",
+]

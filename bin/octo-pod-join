@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# octo-pod-join — step 2 of 3. Everything needed to become part of the wider fabric.
+#
+# When this finishes the pod IS joined: on the mesh, holding its own identity, its pen
+# running, its upstream leg wired if the token carried a slot. Not "now go and converge
+# it" — that was two steps pretending to be one, and it left people with a box that had
+# joined nothing.
+#
+# It composes tools that each do one job, and prints every command it runs:
+#
+#   octo-pod-identity write                      writes /etc/octo-pod
+#   bootstrap-octo-pod.yml --tags netbird        enrols on the mesh
+#   configure-octo-pod.yml                       converges the pod
+#   verify-octo-pod.yml                          proves it
+#
+# Nothing here is a black box: run those four yourself, in that order, for the same
+# result. Every step is idempotent, so a failure halfway is recovered by running this
+# again — not by working out which half succeeded.
+#
+# STEP 1 (octo-pod bootstrap) MUST HAVE RUN. This assumes podman and the netbird agent
+# are already installed; it is the identity and fabric step, not the box-prep step.
+#
+#   octo-pod join --setup-key <KEY> --mgmt <URL> --pod <name>
+#   octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>
+#   octo-pod join --setup-key - --mgmt <URL> --pod <name>      < key on stdin
+#
+# One pasteable line. The setup key is a credential that proves who you are and nothing
+# else; there is no signature to check locally, because the mesh accepting the key in
+# step 4 IS the verification. The upstream slot is supplied later, at apply time, since a
+# pod does not need one to capture and retain.
+set -uo pipefail
+
+ETC="${OCTO_POD_ETC:-/etc/octo-pod}"
+SETUP_KEY=""; MGMT=""; POD=""; KEY_FILE=""
+usage() {
+  cat >&2 <<'USAGE'
+usage: octo-pod join --setup-key <KEY>       --mgmt <URL> --pod <name>
+       octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>
+       octo-pod join --setup-key -           --mgmt <URL> --pod <name>   < key on stdin
+
+The key is a credential. Prefer --setup-key-file or stdin when anyone can see
+the screen: --setup-key puts it in shell history and in the scrollback.
+USAGE
+  exit 2
+}
+# A REJECTED ARGUMENT MAY BE THE KEY: a mistyped flag in front of it, or the key pasted
+# on its own. The refusal names the flag and never the value, because this output is
+# what the support banner asks the operator to send on.
+rejected() {
+  case "$1" in
+    --*=*) printf '%s=<redacted>' "${1%%=*}" ;;
+    -*)    [[ "$1" =~ ^--?[a-z][a-z-]*$ ]] && printf '%s' "$1" || printf '<redacted>' ;;
+    *)     printf '<redacted>' ;;
+  esac
+}
+# A value flag with nothing after it is a usage error, not bash's "$2: unbound variable".
+need_value() { [ "$2" -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    # --flag=VALUE as well as --flag VALUE: the = form is the one a person types from
+    # habit, and it used to fall through to the unknown-option echo, key and all.
+    --setup-key=*)      SETUP_KEY="${1#*=}"; shift ;;
+    --setup-key)        need_value "$1" $#; SETUP_KEY="$2"; shift 2 ;;
+    # A KEY ON THE COMMAND LINE IS A KEY IN SHELL HISTORY, and in the scrollback of
+    # whoever is watching. Reading it from a file lets the credential reach the pod
+    # without ever being typed, which matters when an install is being recorded, done
+    # over someone's shoulder, or driven from a script that is committed somewhere.
+    --setup-key-file=*) KEY_FILE="${1#*=}"; shift ;;
+    --setup-key-file)   need_value "$1" $#; KEY_FILE="$2"; shift 2 ;;
+    --mgmt=*)           MGMT="${1#*=}"; shift ;;
+    --mgmt)             need_value "$1" $#; MGMT="$2"; shift 2 ;;
+    --pod=*)            POD="${1#*=}"; shift ;;
+    --pod)              need_value "$1" $#; POD="$2"; shift 2 ;;
+    -h|--help)          sed -n '2,30p' "$0"; exit 0 ;;
+    *)                  echo "unknown option: $(rejected "$1")" >&2; usage ;;
+  esac
+done
+
+# `--setup-key -` reads stdin, so a key can be piped from a password manager without
+# touching the filesystem at all.
+if [ "$SETUP_KEY" = "-" ]; then
+  SETUP_KEY="$(cat)"
+elif [ -n "$KEY_FILE" ]; then
+  [ -n "$SETUP_KEY" ] && {
+    echo "give --setup-key or --setup-key-file, not both: they would disagree" >&2; exit 2; }
+  [ -r "$KEY_FILE" ] || {
+    echo "cannot read setup key file: $KEY_FILE" >&2; exit 2; }
+  # Trailing newline stripped: an editor adds one, and netbird rejects the key with it
+  # attached while reporting only that the key is invalid.
+  SETUP_KEY="$(tr -d '\r\n' < "$KEY_FILE")"
+fi
+
+[ -n "$SETUP_KEY" ] || usage
+
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+ANSIBLE_DIR="$REPO/platform"; BIN="$REPO/bin"
+
+die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+step() { printf '\n=== %s\n' "$*"; }
+# ANYTHING FOLLOWING --setup-key IS A CREDENTIAL. run() prints the command it is about
+# to execute, and the failure path below tells operators to send that output with a
+# support request, so the value is replaced before it is printed. The command still
+# receives the real one. --setup-key-file is the better habit and prints its path
+# happily; this covers the operator who pasted the key inline anyway.
+_redact() {
+  local _shown=() skip=0 a
+  for a in "$@"; do
+    if [ "$skip" = 1 ]; then _shown+=("<setup-key>"); skip=0; continue; fi
+    case "$a" in
+      --setup-key)   _shown+=("$a"); skip=1 ;;
+      --setup-key=*) _shown+=("--setup-key=<setup-key>") ;;
+      *)             _shown+=("$a") ;;
+    esac
+  done
+  printf '%s' "${_shown[*]}"
+}
+run()  { printf '$ %s\n' "$(_redact "$@")"; "$@"; }
+
+[ "$(id -u)" = 0 ] || die "run with sudo"
+command -v podman >/dev/null || die "podman is missing — it comes with the base image (packages.manifest); run step 1 first: octo-pod bootstrap"
+
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+
+[ -n "$POD" ]  || die "--pod <name> is required (it is this pod's handle)"
+[ -n "$MGMT" ] || die "--mgmt <url> is required"
+# Validate before writing an identity or asking the daemon to enrol.
+python3 "$BIN/octo_pod_mesh.py" validate "$MGMT" \
+  || die "--mgmt must be an HTTP(S) URL with a host and optional port"
+# The whole name, not its first character: it becomes a directory under $ETC, so a name
+# that only starts well ('ab/../../x') walked out of it. The same rule as 'octo-pod init'.
+[[ "$POD" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+  || die "pod name must be lowercase [a-z0-9-], starting with a letter or digit: it is the slot alias, the mesh peer name and the inventory host"
+
+step "1/4  pod '$POD' on $MGMT"
+mkdir -p "$WORK/netbird"
+printf '%s' "$SETUP_KEY" > "$WORK/netbird/setup-key"; chmod 0600 "$WORK/netbird/setup-key"
+printf 'pod_name: %s\nnetbird_management_url: %s\n' "$POD" "$MGMT" > "$WORK/manifest.yaml"
+
+step "2/4  write identity"
+run "$BIN/octo-pod-identity" write "$WORK" || die "identity not written"
+INV="$ETC/inventory.ini"
+
+step "3/4  enrol on the mesh"
+# --tags netbird: the runtime and the AGENT were step 1's job. Enrolment needs the setup key,
+# which only arrives with the token, so it could not have happened before now.
+EXTRA=()
+if [ -f "$WORK/netbird/setup-key" ]; then
+  # THE KEY GOES IN A FILE, NEVER ON THE COMMAND LINE. run() echoes the command it is
+  # about to execute, and this CLI tells operators to paste that output into a support
+  # request. A key on argv therefore lands in terminal scrollback, in any screen
+  # recording of an install, and in every bug report anyone files. It is also readable
+  # from `ps` by any local user for as long as the play runs.
+  #
+  # The playbook's own tasks already carry no_log and write the deferred stash 0600.
+  # This closes the one gap in front of them: the window before ansible starts.
+  #
+  # Single-quoted YAML with doubled quotes, so whatever characters a future key format
+  # uses survive intact instead of becoming a parse error at enrolment time. WORK is a
+  # mktemp -d (0700) that the EXIT trap removes.
+  ( umask 077
+    printf "netbird_setup_key: '%s'\n" \
+      "$(sed "s/'/''/g" "$WORK/netbird/setup-key")" > "$WORK/netbird-vars.yml" )
+  EXTRA+=(-e "@$WORK/netbird-vars.yml")
+fi
+NB_URL=$(python3 -c "import yaml;print(yaml.safe_load(open('$WORK/manifest.yaml')).get('netbird_management_url',''))")
+[ -n "$NB_URL" ] && EXTRA+=(-e "netbird_mgmt_url=$NB_URL")
+( cd "$ANSIBLE_DIR" && run ansible-playbook -i "$INV" bootstrap-octo-pod.yml --tags netbird "${EXTRA[@]}" ) \
+  || die "mesh enrolment failed. Fix the cause and run 'octo-pod join' again."
+
+# Bootstrap may defer enrolment when management is unreachable. That is valid
+# for box preparation, but join must prove this pod reached the requested mesh.
+NB_ON=""
+for _attempt in {1..12}; do
+  # Never accept stale/partial stdout from a failed daemon command.
+  if NB_STATUS=$(timeout 10 netbird status --json 2>/dev/null) &&
+     printf '%s\n' "$NB_STATUS" | python3 "$BIN/octo_pod_mesh.py" connected "$MGMT"; then
+    NB_ON=1
+    break
+  fi
+  [ "$_attempt" -eq 12 ] || sleep 5
+done
+[ "$NB_ON" = 1 ] || die "not connected to the requested management server. If enrolment was deferred, check /var/log/netbird-enrol.log and rerun 'octo-pod join' after the mesh is reachable."
+
+# THE FIRST MOMENT A MESH REGISTRY EXISTS FOR THIS POD. Images are the one thing step 1
+# cannot be sure of: ghcr is reachable before enrolment, a mesh registry is reachable
+# only after it. Fetching here means the pod's only requirement on the wider internet is
+# enrolment itself — and a site that serves images over the mesh needs nothing beyond it.
+#
+# Non-fatal: a pod whose images are already local (an airgap load, or step 1 got them)
+# has nothing to do, and configure asserts what it actually needs before it starts a
+# container. This is where the fetch BELONGS, not where it is enforced.
+step "3.5/4  fetch images, now that the mesh is up"
+( cd "$ANSIBLE_DIR" && run ansible-playbook -i "$INV" bootstrap-octo-pod.yml --tags images ) \
+  || printf '\nWARNING: some images could not be fetched. converge will name any that are\n         actually needed.\n'
+
+step "4/4  converge and prove it"
+# No slot here on purpose. This converges a pod that captures and retains locally, which
+# is a complete and legitimate state. Publishing upstream is a later, deliberate apply
+# with the slot material passed as extra-vars.
+( cd "$ANSIBLE_DIR" && run ansible-playbook -i "$INV" configure-octo-pod.yml ) \
+  || die "convergence failed. It is safe to re-run 'octo-pod join'."
+( cd "$ANSIBLE_DIR" && run ansible-playbook -i "$INV" verify-octo-pod.yml ) \
+  || die "verification failed. The pod is not proven — read the output above and rerun 'octo-pod join'."
+
+cat <<NEXT
+
+  Joined. This box is pod '$POD', on the mesh, and its pen is running.
+
+  Add a sensor — a declaration, then step 3:
+
+    octo-pod add-arm radar1 --udp 48021 --from <sensor-ip> --feed cat62-v1
+    octo-pod apply
+
+  The source address must be static: it is the only access control an arm has, and
+  traffic from anywhere else is dropped and logged by the arm.
+
+NEXT

@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/octo-firewall-apply  MANAGED BY ANSIBLE
+#
+# Load a new pod firewall, then prove the pod can still reach what keeps it manageable,
+# and put the previous ruleset back if it cannot. A firewall that cuts the mesh on a
+# remote pod removes the only way back in, so a change is kept only after the box shows
+# it still works:
+#
+#   - if the pod is joined to the mesh, the agent is still connected to its management
+#     service, a NEW connection to that service is still allowed, and so is a new
+#     connection to at least one of the relays it was told to use;
+#   - if the pod holds a slot and the fabric router answered before the change, it still
+#     accepts a new TCP connection. One that was already unreachable (an outage, a pod
+#     that has not joined) is not required: an outage must not block every change.
+#
+# Every check opens a new connection. The established rule keeps the agent's current
+# management stream alive under any ruleset, so "connected" alone would pass a ruleset
+# that blocks the next reconnect, and the pod would fall off the mesh at its next blip.
+#
+# Whether the pod is joined is read from the kernel (the mesh interface holds an
+# address), not from the agent's CLI output, so a change in that output cannot make a
+# joined pod look unjoined and skip the mesh check. A check that cannot run fails, and
+# the previous ruleset comes back.
+#
+# Usage: octo-firewall-apply <new ruleset file>
+set -euo pipefail
+
+readonly NEW="${1:?usage: octo-firewall-apply <new ruleset file>}"
+readonly LIVE="{{ pod_firewall_file | default('/etc/octo-pod-firewall.nft', true) }}"
+# Long enough for NetBird to rebuild relayed tunnels when a change opens their ports;
+# the checks return as soon as they pass.
+readonly WAIT_SECS={{ firewall_verify_secs | default(120) }}
+readonly MESH_IFACE="{{ mesh_iface | default('wt0', true) }}"
+readonly -a ROUTERS=({% for pin in (fabric_host_pins | default([], true)) if (fabric_slot_anchor | default('', true)) %}"{{ pin.ip }}" {% endfor %})
+
+tcp_opens() {
+  timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+}
+
+mesh_joined() {
+  ip -o -4 addr show dev "${MESH_IFACE}" 2>/dev/null | grep -q ' inet '
+}
+
+# The management URL, from the agent's own status, only while the agent reports it is
+# connected to it.
+management_url() {
+  timeout 10 netbird status --json 2>/dev/null \
+    | jq -r 'select(.management.connected == true) | .management.url // empty'
+}
+
+mesh_connected() {
+  local url hostport port
+  url="$(management_url)" || return 1
+  [[ -n "${url}" ]] || return 1
+  hostport="${url#*://}"
+  hostport="${hostport%%/*}"
+  port=443
+  [[ "${hostport}" != *:* ]] || port="${hostport##*:}"
+  tcp_opens "${hostport%:*}" "${port}"
+}
+
+# The relays the agent was told to use (rel:// and rels://, TCP). Relayed peers, most of
+# them behind NAT, reconnect through these after every blip and every reboot. A ruleset
+# that blocks them passes every other check while the old tunnels last; this was found
+# by a reboot, after an apply had passed.
+relay_endpoints() {
+  timeout 10 netbird status --json 2>/dev/null \
+    | jq -r '.relays.details[]?.uri // empty' \
+    | sed -nE 's#^rels?://([^:/]+):([0-9]+).*#\1 \2#p'
+}
+
+relays_reachable() {
+  local host port listed=0
+  while read -r host port; do
+    listed=1
+    tcp_opens "${host}" "${port}" && return 0
+  done < <(relay_endpoints)
+  [[ "${listed}" -eq 0 ]]
+}
+
+router_answers() {
+  local ip
+  for ip in "${ROUTERS[@]}"; do
+    tcp_opens "${ip}" 7447 || return 1
+  done
+}
+
+restore() {
+  echo "octo-firewall-apply: $1; restoring the previous ruleset" >&2
+  nft delete table inet octo_pod 2>/dev/null || true
+  if [[ -s "${LIVE}" ]]; then
+    nft -f "${LIVE}"
+  fi
+  exit 1
+}
+
+main() {
+  local joined=0 router_before=0 i ok=0
+  nft -c -f "${NEW}"
+  if mesh_joined; then
+    joined=1
+    if ! command -v netbird >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+      echo "octo-firewall-apply: joined to the mesh, but netbird or jq is missing, so the mesh cannot be checked; nothing changed" >&2
+      exit 1
+    fi
+  fi
+
+  if router_answers; then router_before=1; fi
+
+  nft -f "${NEW}"
+
+  for (( i = 0; i < WAIT_SECS; i += 2 )); do
+    if { [[ "${joined}" -eq 0 ]] || { mesh_connected && relays_reachable; }; } \
+      && { [[ "${router_before}" -eq 0 ]] || router_answers; }; then
+      ok=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "${ok}" -eq 1 ]] \
+    || restore "the mesh's management service, its relays or the fabric router did not accept a new connection within ${WAIT_SECS}s"
+
+  install -m 0600 "${NEW}" "${LIVE}"
+  echo "octo-firewall-apply: applied and verified (mesh $([[ "${joined}" -eq 1 ]] && echo 'and relays reachable' || echo 'not joined'), router $([[ "${router_before}" -eq 1 ]] && echo 'still answers' || echo 'was not answering before, so not required'))"
+}
+
+main "$@"

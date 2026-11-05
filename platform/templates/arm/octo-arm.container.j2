@@ -1,0 +1,69 @@
+# /etc/containers/systemd/octo-{{ _kind }}{{ '-' ~ a.id if a.id is defined }}.container — MANAGED BY ANSIBLE
+{#
+   ONE template for every arm — the pod's built-in one and every per-publisher
+   one — because they run the same binary and must present the same variables
+   to it. This replaces arm/env.j2 + the compose service mapping: the env
+   contract still lives in exactly one home (here), it just renders straight
+   into the unit instead of routing through a .env file compose interpolates.
+
+   Two compose-era hacks die with this template, on purpose:
+   * "ALL THREE feed variables, always" — compose interpolated the whole file
+     before selecting a service, so a missing var for an arm you did not run
+     still killed the arm you did. A quadlet carries only its own env.
+   * override.<id>.yml for container names — ContainerName renders directly.
+
+   Caller supplies `a` (the arm dict) exactly as before: a per-publisher arm
+   passes its 30-arms.yml entry; the built-in arm passes feeds ready-made.
+#}
+{% set _kind = a.kind | default('tcp-ingest' if a.transport is not defined else ('udp-ingest' if a.transport == 'udp' else 'tcp-ingest')) %}
+{% set _envp = {'udp-ingest': 'UDP_INGEST', 'tcp-ingest': 'TCP_INGEST', 'tcp-connect': 'TCP_CONNECT'}[_kind] %}
+{% set _image = {'udp-ingest': udp_ingest_image, 'tcp-ingest': tcp_ingest_image, 'tcp-connect': tcp_connect_image}[_kind] %}
+{% set _prefix = a.namespace | regex_replace('/\*\*$', '') if a.namespace is defined else a.key_prefix %}
+{% if a.tls_dir is defined %}{% set _tls = a.tls_dir %}{% else %}{% set _tls = '/etc/octo-arm-' ~ a.id ~ '/tls' %}{% endif %}
+
+[Unit]
+Description=octo-pod arm — {{ _kind }}{{ ' for ' ~ a.id if a.id is defined }} ({{ a.description | default('arm publisher') }})
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image={{ _image }}
+ContainerName=octo-{{ _kind }}{{ '-' ~ a.id if a.id is defined }}
+# host networking: the arm binds the LAN leg the site's source systems are
+# statically programmed to send to, and dials the local router directly.
+Network=host
+{% if _kind == 'tcp-connect' %}
+{# DIAL-OUT: the port belongs to the sensor, not this box — no bind, no listener. #}
+Environment={{ _envp }}_FEEDS={{ a.feed }}={{ a.target }}{{ ':' ~ a.framing if a.framing is defined }}
+{% elif a.transport is not defined %}
+{# the pod's built-in arm, handed its feed strings ready-made #}
+Environment={{ _envp }}_FEEDS={{ a.tcp_feeds if _kind == 'tcp-ingest' else a.udp_feeds }}
+Environment={{ _envp }}_BIND_HOST={{ a.bind_host | default(mesh_ip) }}
+{% else %}
+Environment={{ _envp }}_FEEDS={{ a.feed }}={{ a.port }}{{ ':' ~ a.framing if a.framing is defined }}
+# Bind the leg the publisher actually reaches us on. A listener on the wrong
+# leg never receives a datagram and still reports healthy.
+Environment={{ _envp }}_BIND_HOST={{ a.bind_host | default(mesh_ip) }}
+{% endif %}
+{% if _kind != 'udp-ingest' %}
+Environment={{ _envp }}_DEFAULT_FRAMING={{ a.framing | default(arm_default_framing) }}
+{% endif %}
+Environment={{ _envp }}_KEY_PREFIX={{ _prefix }}
+Environment={{ _envp }}_ENDPOINT=tls/{{ mesh_ip }}:{{ pen_listen_port }}
+Environment={{ _envp }}_CERT=/etc/octo/tls/arm-cert.pem
+Environment={{ _envp }}_KEY=/etc/octo/tls/arm-key.pem
+Environment={{ _envp }}_ROOT_CA=/etc/octo/tls/ca-root.pem
+# The only access control an arm has — its publisher presents no credential.
+Environment={{ _envp }}_ALLOW_SOURCES={{ a.allow_sources | default('') }}
+Environment=RUST_LOG={{ a.log_level | default('info') }}
+# per-publisher TLS mount, one per id — one partner's key is not readable by
+# another partner's arm. The built-in arm passes tls_dir explicitly.
+Volume={{ _tls }}:/etc/octo/tls:ro
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

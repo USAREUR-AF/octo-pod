@@ -1,0 +1,42 @@
+# /etc/containers/systemd/octo-health-pub.container — MANAGED BY ANSIBLE
+#
+# The pod's own health publisher. Under compose this was a SEPARATE project,
+# because `compose up` pulls every service in a file before starting any —
+# a health image the pod could not fetch stopped the ROUTER, so the feature
+# added for visibility cost capture in exactly the disconnected case the
+# bundle exists for. Under systemd that hazard is structural history: every
+# unit is its own failure domain, pulls and all. The rule it taught stays:
+# health must never be a reason a pod stops capturing — so nothing Requires=
+# this unit, and the play starts it failed_when: false.
+
+[Unit]
+Description=octo-pod — health publisher
+After=octo-pen-zenoh-router.service
+# restart WITH the router (health-pub dials it like the sinks do); PartOf
+# never propagates the other way, so a health failure cannot touch the pen.
+PartOf=octo-pen-zenoh-router.service
+
+[Container]
+Image={{ health_pub_image }}
+ContainerName=octo-health-pub
+PodmanArgs=--add-host penhost:host-gateway
+Environment=HEALTH_KEY={{ health_pub_key }}
+Environment=HEALTH_STATUS_FILE=/var/lib/octo-pod/health.json
+Environment=HEALTH_INTERVAL_SECS={{ health_pub_interval | default(60) }}
+Environment=HEALTH_STALE_AFTER_SECS={{ health_pub_stale_after | default(180) }}
+Environment=INGEST_ENDPOINT=tls/penhost:{{ pen_listen_port }}
+Environment=INGEST_TLS_CERT=/etc/zenoh/tls/health-cert.pem
+Environment=INGEST_TLS_KEY=/etc/zenoh/tls/health-key.pem
+Environment=INGEST_TLS_CA=/etc/zenoh/tls/ca-roots.pem
+Volume={{ pen_state_dir }}/zenoh/tls:/etc/zenoh/tls:ro
+# One file, read-only. This container has no reason to see anything else the
+# pod keeps in /var/lib/octo-pod, and no podman socket at all.
+Volume={{ arm_repo_dir }}/health.json:/var/lib/octo-pod/health.json:ro
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target default.target

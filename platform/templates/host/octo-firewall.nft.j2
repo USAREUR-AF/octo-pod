@@ -1,0 +1,195 @@
+#!/usr/sbin/nft -f
+# /etc/octo-pod-firewall.nft  MANAGED BY ANSIBLE; hand edits are lost on the next apply.
+#
+# DENY BY DEFAULT IN EVERY DIRECTION. This pod sits between the mesh and a LAN it does not
+# own, and carries data both ways, so inbound, outbound and routed traffic all start at
+# drop. Every opening below is one of two kinds:
+#
+#   FIXED       management and the mesh's own control traffic. No declaration adds or
+#               removes these, so a bad declaration cannot lock anyone out.
+#   DECLARED    rendered from 30-arms.yml, 40-egress.yml, 20-peers.yml and the fabric
+#               pins, from the same declarations the pen ACL is rendered from.
+#
+# Nothing routes between the legs: a LAN host can never reach the mesh through this pod,
+# and the mesh can never reach the LAN. The pen's own ACL and mutual TLS still apply on
+# top of every opening here; this is the layer beneath them.
+#
+# Its own table, beside podman's: netavark keeps its NAT and container rules in its own
+# table, and this one accepts the container bridges' traffic so both can hold.
+{% set _lan = lan_iface | default('', true) %}
+{% set _wan = firewall_wan_iface | default('', true) %}
+{% set _mesh = mesh_iface | default('wt0', true) %}
+{% set _mcidr = mesh_cidr | default('100.64.0.0/10', true) %}
+{% set _ssh = [_mcidr] + (mgmt_ssh_sources | default([], true)) %}
+
+table inet octo_pod
+delete table inet octo_pod
+
+table inet octo_pod {
+  # FIXED: who may reach SSH. The mesh range, as on GOAT's bridge hosts, plus the
+  # management sources declared for this site (for example, a jump host on the LAN).
+  set mgmt_ssh {
+    type ipv4_addr; flags interval;
+    elements = { {{ _ssh | join(', ') }} }
+  }
+
+  chain input {
+    type filter hook input priority filter; policy drop;
+
+    iif lo accept
+    ct state established,related accept
+    ct state invalid drop
+
+    # FIXED: the ICMP and ICMPv6 a host needs to stay reachable and routable.
+    ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded, parameter-problem } limit rate 10/second accept
+    meta l4proto ipv6-icmp icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, packet-too-big, destination-unreachable, time-exceeded, parameter-problem, echo-request } accept
+
+    # FIXED: management.
+    tcp dport 22 ip saddr @mgmt_ssh accept
+
+    # FIXED: the mesh's underlay. WireGuard on the WAN leg, and the DHCP replies that keep
+    # the WAN leg addressed.
+{% if _wan %}
+    iifname "{{ _wan }}" udp dport {{ netbird_wg_port | default(51820) }} accept
+{% else %}
+    udp dport {{ netbird_wg_port | default(51820) }} accept
+{% endif %}
+    udp sport 67 udp dport 68 accept
+
+    # FIXED: the pen, from this host's container bridges (the audit sinks dial it there).
+    iifname "podman*" tcp dport {{ pen_listen_port }} accept
+{% if active_peers | default([]) | length > 0 %}
+
+    # DECLARED: zenoh-native peers dial the pen over the mesh, and present a certificate
+    # the pen's ACL checks. Only rendered while a peer is declared.
+    iifname "{{ _mesh }}" tcp dport {{ pen_listen_port }} accept
+{% endif %}
+{% for x in active_peers | default([]) %}
+{%  if x.allow_sources | default('', true) %}
+
+    # DECLARED: peer {{ x.id }} dials the pen over the LAN, from {{ x.allow_sources }} only.
+    # Its certificate and the pen's ACL still decide what it may do once connected.
+    {{ ('iifname "' ~ _lan ~ '" ') if _lan else '' }}ip saddr { {{ x.allow_sources | replace(' ', '') | replace(',', ', ') }} } tcp dport {{ pen_listen_port }} accept
+{%  endif %}
+{% endfor %}
+{% for a in active_arms | default([]) %}
+{%  if a.port is defined and (a.kind | default('')) != 'tcp-connect' %}
+
+    # DECLARED: arm {{ a.id }}: {{ a.transport | default('udp') }}/{{ a.port }} from {{ a.allow_sources }} only
+    {{ ('iifname "' ~ _lan ~ '" ') if _lan else '' }}ip saddr { {{ a.allow_sources | replace(' ', '') | replace(',', ', ') }} } {{ a.transport | default('udp') }} dport {{ a.port }} accept
+{%  endif %}
+{% endfor %}
+
+{% for d in active_egress | default([]) %}
+{%  if (d.release | default({})).from_fabric | default(false) and d.dest is match('^tcp-server://') %}
+{%   set _hp = d.dest.split('://')[1].rsplit(':', 1) %}
+
+    # DECLARED: egress {{ d.id }}, released: consumers {{ d.allow_sources }} dial {{ d.dest }}
+    {{ ('iifname "' ~ _lan ~ '" ') if _lan else '' }}ip saddr { {{ d.allow_sources | replace(' ', '') | replace(',', ', ') }} } ip daddr {{ _hp[0] }} tcp dport {{ _hp[1] }} accept
+{%  endif %}
+{% endfor %}
+
+    limit rate 5/minute log prefix "octo-fw drop in: " level info
+  }
+
+  chain output {
+    type filter hook output priority filter; policy drop;
+
+    oif lo accept
+    ct state established,related accept
+    ct state invalid drop
+
+    # FIXED: diagnostics, name resolution, time, and the mesh's control plane: NetBird's
+    # management and signal (TCP), its relays (TCP for WebSocket, UDP for QUIC), STUN and
+    # TURN (UDP), on the ports the mesh's management assigned this agent, and WireGuard to
+    # its peers. Relayed peers reconnect through the relays after every blip and reboot.
+    ip protocol icmp accept
+    meta l4proto ipv6-icmp accept
+    udp dport 53 accept
+    tcp dport 53 accept
+    udp sport 68 udp dport 67 accept
+{% set _mtcp = firewall_mesh_tcp_ports | default([443], true) %}
+{% set _mudp = firewall_mesh_udp_ports | default([443, 3478], true) %}
+{% if _wan %}
+    oifname "{{ _wan }}" udp dport 123 accept
+    oifname "{{ _wan }}" tcp dport { {{ _mtcp | join(', ') }} } accept
+    oifname "{{ _wan }}" udp dport { {{ _mudp | join(', ') }} } accept
+    oifname "{{ _wan }}" udp sport {{ netbird_wg_port | default(51820) }} accept
+{% else %}
+    udp dport 123 accept
+    tcp dport { {{ _mtcp | join(', ') }} } accept
+    udp dport { {{ _mudp | join(', ') }} } accept
+    udp sport {{ netbird_wg_port | default(51820) }} accept
+{% endif %}
+
+    # FIXED: the mesh's own name service. NetBird forwards the mesh's domains to the
+    # nameservers its management assigns, over the mesh, often on NetBird's DNS forwarder
+    # port rather than 53. Blocked, NetBird marks those nameservers down and mesh names
+    # stop resolving.
+    oifname "{{ _mesh }}" ip daddr {{ _mcidr }} udp dport { {{ (mesh_dns_ports | default([53, 5353], true)) | join(', ') }} } accept
+    oifname "{{ _mesh }}" ip daddr {{ _mcidr }} tcp dport { {{ (mesh_dns_ports | default([53, 5353], true)) | join(', ') }} } accept
+{% set _mgmt_mesh = firewall_mesh_mgmt_ips | default([], true) | select('match', '^[0-9]+(\\.[0-9]+){3}$') | list %}
+{% if _mgmt_mesh | length > 0 %}
+
+    # FIXED: the mesh's management, at the mesh addresses its name resolves to. NetBird's
+    # own DNS can answer the management name with a mesh address first; with only the
+    # WAN leg open, the agent's next reconnect and octo-firewall-apply's check both go
+    # to that address and are dropped, so every ruleset change is refused. Its control
+    # ports, to those addresses only, over the mesh. Resolved by configure; addresses
+    # only, never a name (nft would resolve a name at boot, before the network is up).
+    oifname "{{ _mesh }}" ip daddr { {{ _mgmt_mesh | join(', ') }} } tcp dport { {{ _mtcp | join(', ') }} } accept
+{% endif %}
+
+    # FIXED: this host to its own containers (the on-pod registry, the audit sinks).
+    oifname "podman*" accept
+{% if fabric_portal_url | default('', true) | length > 0 %}
+
+    # DECLARED: the portal over the mesh, where publish-to-portal registers topics.
+    oifname "{{ _mesh }}" ip daddr {{ _mcidr }} tcp dport 443 accept
+{% endif %}
+{% if fabric_slot_anchor | default('', true) | length > 0 %}
+
+    # DECLARED: the fabric router, over the mesh only, at its pinned address.
+{%  for pin in fabric_host_pins | default([], true) %}
+    oifname "{{ _mesh }}" ip daddr {{ pin.ip }} tcp dport 7447 accept
+{%  else %}
+    oifname "{{ _mesh }}" ip daddr {{ _mcidr }} tcp dport 7447 accept
+{%  endfor %}
+{% endif %}
+{% for d in active_egress | default([]) %}
+{%  if (d.release | default({})).from_fabric | default(false) and d.dest is not match('^tcp-server://') %}
+{%   set _p = d.dest.split('://') %}
+{%   set _hp = _p[1].rsplit(':', 1) %}
+{%   set _fam = 'ip6' if _hp[0].startswith('[') else 'ip' %}
+{#-  The scheme is not the protocol: udp:// is UDP; tcp://, zenoh:// and sapient:// all
+     ride TCP. Rendering the scheme itself gave "zenoh dport", which nft refuses. #}
+{%   set _proto = 'udp' if _p[0] == 'udp' else 'tcp' %}
+
+    # DECLARED: egress {{ d.id }}, released: exactly {{ d.dest }}
+    {{ ('oifname "' ~ _lan ~ '" ') if _lan else '' }}{{ _fam }} daddr {{ _hp[0] | replace('[', '') | replace(']', '') }} {{ _proto }} dport {{ _hp[1] }} accept
+{%  endif %}
+{% endfor %}
+{% for a in active_arms | default([]) %}
+{%  if (a.kind | default('')) == 'tcp-connect' and a.target is defined %}
+
+    # DECLARED: arm {{ a.id }} dials its sensor at {{ a.target }}. Opened to the arm's
+    # allow_sources, not to the target string: the arm refuses a stream from any other
+    # address, the declaration check holds them to literal IPv4, and a hostname here
+    # would make nft resolve it at load time, which fails at boot, before the network.
+    {{ ('oifname "' ~ _lan ~ '" ') if _lan else '' }}ip daddr { {{ a.allow_sources | replace(' ', '') | replace(',', ', ') }} } tcp dport {{ a.target.rsplit(':', 1)[1] }} accept
+{%  endif %}
+{% endfor %}
+
+    limit rate 5/minute log prefix "octo-fw drop out: " level info
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+
+    # FIXED: traffic between this host's own containers. Nothing else is routed, in
+    # either direction, between any two legs.
+    ct state established,related accept
+    iifname "podman*" oifname "podman*" accept
+    limit rate 5/minute log prefix "octo-fw drop fwd: " level info
+  }
+}

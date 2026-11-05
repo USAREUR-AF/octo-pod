@@ -1,0 +1,11 @@
+table inet net_isolation
+delete table inet net_isolation
+table inet net_isolation {
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+{% for ifc in isolated_ifaces %}
+    iifname "{{ ifc }}" counter drop
+    oifname "{{ ifc }}" counter drop
+{% endfor %}
+  }
+}

@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+# octo-pod — three steps, in order, then publishers.
+#
+#   1. octo-pod bootstrap        everything needed BEFORE you can join   (once)
+#   2. octo-pod join --setup-key everything needed to BE joined          (once)
+#   3. octo-pod apply            converge after a change                 (any time)
+#
+# The split is by what each needs, not by what each touches. Step 1 is identical on
+# every pod and needs no identity, so it can run on a box before anyone has decided
+# what it is. Step 2 needs a setup key. Step 3 needs neither and is the one you keep
+# running: adding a sensor is a declaration followed by step 3, not a fourth step.
+#
+# A pod IS this clone. The playbooks run from platform/ right here, which is why the
+# clone has to live somewhere permanent. Identity is separate and lives at /etc/octo-pod:
+# it belongs to the box, not to a checkout that happens to be sitting on it, so pulling
+# new code never touches it.
+set -uo pipefail
+
+SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ETC="${OCTO_POD_ETC:-/etc/octo-pod}"
+
+REPO="$(cd "$SELF/.." && pwd)"
+ANSIBLE_DIR="$REPO/platform"
+BIN="$REPO/bin"
+INV="$ETC/inventory.ini"
+
+die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+# The package declares ansible-core as a dependency; a git clone declares nothing, so on
+# a bare box the first command would fail with "ansible-playbook: command not found" and
+# no indication that the fix is one apt install. Say it once, here.
+need_ansible() {
+  command -v ansible-playbook >/dev/null || die "ansible-playbook is not installed.
+  sudo apt update && sudo apt install -y --no-install-recommends ansible-core
+
+  --no-install-recommends matters: ansible-core recommends the full ansible package,
+  which is 287 MB of collections these playbooks never load."
+}
+# Print, then run. The operator can re-run it by hand or paste it into a support
+# request; nothing this wrapper does is hidden from them.
+# ANYTHING FOLLOWING --setup-key IS A CREDENTIAL. run() prints the command it is about
+# to execute, and the failure path below tells operators to send that output with a
+# support request, so the value is replaced before it is printed. The command still
+# receives the real one. --setup-key-file is the better habit and prints its path
+# happily; this covers the operator who pasted the key inline anyway.
+_redact() {
+  local _shown=() skip=0 a
+  for a in "$@"; do
+    if [ "$skip" = 1 ]; then _shown+=("<setup-key>"); skip=0; continue; fi
+    case "$a" in
+      --setup-key)   _shown+=("$a"); skip=1 ;;
+      --setup-key=*) _shown+=("--setup-key=<setup-key>") ;;
+      *)             _shown+=("$a") ;;
+    esac
+  done
+  printf '%s' "${_shown[*]}"
+}
+run()  { printf '\n$ %s\n\n' "$(_redact "$@")" >&2; "$@"; }
+
+escalate() {
+  cat >&2 <<ESC
+
+────────────────────────────────────────────────────────────────────
+That failed. It is safe to re-run — every step is idempotent.
+Send this with any support request:
+  octo-pod version
+  the command line printed above, and its output
+────────────────────────────────────────────────────────────────────
+ESC
+  exit 1
+}
+
+need_identity() {
+  [ -f "$INV" ] || die "no $INV — this box is not a pod yet. Run: octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>"
+}
+
+ap() { need_ansible; need_identity; ( cd "$ANSIBLE_DIR" && run ansible-playbook -i "$INV" "$@" ) || escalate; }
+
+case "${1:-}" in
+  # ---- 1. prepare the box ---------------------------------------------------
+  # Deliberately runnable BEFORE the box has an identity: this prepares the runtime and the
+  # netbird agent, which is the same work on every pod and has nothing to do with which
+  # pod this is. Without an inventory it targets localhost; enrolment needs a setup key
+  # and is therefore join's job, not this one.
+  bootstrap)
+    shift
+    [ "$(id -u)" = 0 ] || die "run with sudo"
+    need_ansible
+    # No setup key here by design: enrolment is join's job, because the key arrives
+    # with the token. This installs the agent; it does not join anything.
+    if [ -f "$INV" ]; then
+      ( cd "$ANSIBLE_DIR" && run ansible-playbook -i "$INV" bootstrap-octo-pod.yml "$@" ) || escalate
+    else
+      tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+      printf '[octopod]\noctopod ansible_connection=local\n\n[octopod:vars]\nansible_python_interpreter=/usr/bin/python3\n' > "$tmp/inventory.ini"
+      echo "no identity yet — preparing this box only (runtime checks, netbird agent)." >&2
+      ( cd "$ANSIBLE_DIR" && run ansible-playbook -i "$tmp/inventory.ini" bootstrap-octo-pod.yml "$@" ) || escalate
+    fi
+    # Put the CLI on PATH so later commands do not depend on remembering where the
+    # clone lives. A symlink, not a copy: `readlink -f` above resolves it back to this
+    # checkout, so the playbooks and the CLI can never drift apart the way a copied
+    # script would.
+    if [ ! -e /usr/local/bin/octo-pod ]; then
+      ln -sf "$REPO/bin/octo-pod" /usr/local/bin/octo-pod \
+        && echo "linked /usr/local/bin/octo-pod -> $REPO/bin/octo-pod (run 'octo-pod' from anywhere)"
+    fi
+    # SAY WHAT HAPPENS NEXT. install-to-pod.sh ends by naming the next command and so
+    # does join, but bootstrap ended on a PLAY RECAP and a shell prompt — leaving an
+    # operator who has just watched fifty tasks scroll past unsure whether they are done.
+    # The step that says nothing is the step people repeat.
+    #
+    # Which command comes next depends on something bootstrap deliberately does not know:
+    # whether this pod will ever join a mesh. Both are offered rather than guessed at,
+    # because a wrong next step is worse than two right ones.
+    if [ -d "$ETC/host_vars" ] && [ -n "$(ls -A "$ETC/host_vars" 2>/dev/null)" ]; then
+      cat <<'DONE'
+
+  The box is prepared, and it already has an identity — so this was a re-run.
+  Nothing else is needed here. To converge it:
+
+    sudo octo-pod apply
+    sudo octo-pod status
+
+DONE
+    else
+      cat <<'DONE'
+
+  The box is prepared: container runtime, netbird agent, clock, bounded logs.
+  It is NOT a pod yet — it has no identity and nothing is running.
+
+  Next, one of these:
+
+    sudo octo-pod join --setup-key-file <PATH> --mgmt https://<netbird-host> --pod <name>
+
+    The key is a credential. --setup-key <KEY> still works, but puts it in your
+    shell history; --setup-key-file keeps it out, and `--setup-key -` reads stdin.
+        ...if this pod joins a mesh. Writes the identity, enrols, converges, verifies.
+
+    sudo octo-pod init --pod <name>
+        ...if it does not. A pod that captures and retains locally and releases
+        nothing is a complete pod. Follow it with 'sudo octo-pod apply'.
+
+  Lowercase letters, digits and hyphens for <name>. It is also the mesh peer name
+  and the slot alias, and the three must be the same string.
+
+DONE
+    fi
+
+    ;;
+
+  # ---- 2. identity + mesh ---------------------------------------------------
+  join)     shift; run "$BIN/octo-pod-join" "$@" || escalate ;;
+
+  # 2, FOR A POD THAT JOINS NOTHING. `join` needs a setup key and a management URL;
+  # `identity write` needs an unpacked token directory. Neither exists for a pod whose
+  # publishers sit on the same LAN and which forwards nothing onward — a shape the
+  # README calls supported and which had no command at all, only a hand-written YAML
+  # file and a heredoc. A documented shape with no verb is one nobody uses correctly.
+  init)
+    shift
+    [ "$(id -u)" = 0 ] || die "run with sudo"
+    POD=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --pod) if [ $# -lt 2 ] || [ -z "$2" ]; then die "--pod needs a name"; fi; POD="$2"; shift 2 ;;
+        *) die "unknown option: $1 (usage: octo-pod init --pod <name>)" ;;
+      esac
+    done
+    [ -n "$POD" ] || die "usage: octo-pod init --pod <name>
+
+  <name> becomes this pod's handle: its directory under $ETC, its inventory host, and
+  the name it would use on a mesh if it ever joins one. Lowercase letters, digits and
+  dashes."
+    printf '%s' "$POD" | grep -qE '^[a-z0-9][a-z0-9-]*$' \
+      || die "'$POD' must be lowercase letters, digits and dashes, starting with a
+  letter or digit — it becomes a directory name, an inventory host and part of a
+  certificate subject."
+    [ -f "$INV" ] && die "$ETC already holds an identity. Nothing was changed.
+  Adding publishers is 'octo-pod add-arm'; this command makes a pod, once."
+    need_ansible
+    # ANSIBLE, not a script that writes files. The identity is declared state: six
+    # templates with force: false, so a re-run reports "ok" instead of overwriting a
+    # pod's own arms with an empty list. --check and --diff come free.
+    #
+    # A temporary inventory, because the real one IS part of the identity being written
+    # — the same bootstrap-before-you-have-an-inventory problem, solved the same way.
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    printf '[octopod]\noctopod ansible_connection=local\n\n[octopod:vars]\nansible_python_interpreter=/usr/bin/python3\n' > "$tmp/inventory.ini"
+    ( cd "$ANSIBLE_DIR" && run ansible-playbook -i "$tmp/inventory.ini" write-identity.yml \
+        -e "pod_name=$POD" ) || escalate
+    # BY COMMAND, NOT BY HAND. This used to end by telling the operator to edit
+    # 05-fabric.yml if they wanted to join a mesh later — the one thing every other
+    # declaration has a verb precisely to avoid. A typo in a management URL presents as
+    # `netbird up` hanging with no error, which is a bad afternoon for a saved keystroke.
+    printf '\nThis pod captures locally and joins nothing. That is a complete pod.\n'
+    printf '\nNext:\n'
+    printf '  sudo octo-pod apply                                build the pen and start it\n'
+    printf '\nTo join a mesh later:\n'
+    printf '  sudo octo-pod set-mesh --mgmt https://<netbird-host>   record which mesh\n'
+    printf '  sudo octo-pod join --setup-key-file <PATH> --mgmt <url> --pod %s\n\n' "$POD" ;;
+
+  # What is this pod doing right now — declared against actual, in one table. Reads
+  # the declaration and podman; changes nothing and always exits 0, because it answers
+  # "what is going on" rather than "is everything fine". `verify` is the pass/fail gate.
+  status)   shift; exec python3 "$BIN/octo-pod-status" "$@" ;;
+
+  # The same picture, live: rates from each container's own stats lines, the mesh, and
+  # what needs a look. Read-only, like status; it prints commands and never runs them.
+  top)      shift; exec python3 "$BIN/octo-pod-top" "$@" ;;
+
+  # One question at a time, in the shapes kubectl taught everyone: a row per item, one
+  # item in full, one item's logs, every certificate. Read-only, from the same collector
+  # as top. The verb is passed through, because one script answers all four.
+  get|describe|logs|certs) exec python3 "$BIN/octo-pod-inspect" "$@" ;;
+
+  # ---- 3. converge ----------------------------------------------------------
+  edit)     shift; run python3 "$BIN/octo-pod-edit" "$@" ;;
+
+  apply)    shift; ap configure-octo-pod.yml "$@" ;;
+  check)    shift; ap configure-octo-pod.yml --check --diff "$@" ;;
+  verify)   shift; ap verify-octo-pod.yml "$@" ;;
+
+  # Is data actually arriving? A DIFFERENT QUESTION from "is this pod built correctly",
+  # and it only has an answer once sensors exist. `verify` reports silence; this one
+  # fails on it, which is what a deployed pod's health check wants and what a box being
+  # set up does not.
+  verify-flowing)
+    shift; ap verify-octo-pod.yml -e drift_must_flow=true "$@" ;;
+
+  # A field box was converged before it shipped, so a non-empty diff is not a decision
+  # to make on site — it is a fault. Turns "read and understand the diff" into "it
+  # should be empty", checkable by someone who has never seen a Zenoh ACL.
+  verify-clean)
+    shift; need_ansible; need_identity
+    if ! out=$( cd "$ANSIBLE_DIR" && run ansible-playbook -i "$INV" configure-octo-pod.yml --check --diff "$@" 2>&1 ); then
+      printf '%s\n' "$out"
+      die "verification failed; cleanliness could not be established"
+    fi
+    printf '%s\n' "$out"
+    if printf '%s' "$out" | grep -qE 'changed=[1-9]'; then
+      printf '\nNOT CLEAN — this pod differs from its declared state.\nDo NOT apply. Send the diff above to the pod owner.\n' >&2
+      exit 1
+    fi
+    printf '\nCLEAN — running state matches the declaration.\n'
+    ;;
+
+  # ---- declarations: edit, then step 3 --------------------------------------
+  add-arm|add-peer|set-lan|set-mesh|set-firewall|release)
+    v="$1"; shift; run "$BIN/octo-pod-declare" "$v" "$@" || escalate
+    printf '\nDeclared. Nothing on the pod has changed yet:\n  octo-pod check\n  octo-pod apply\n' ;;
+
+  # Removal is NOT the mirror of the above, and deliberately does not print the same
+  # "nothing has changed yet". apply creates and never deletes, so a removal that only
+  # edited the declaration would leave the container running and bound to its port with
+  # its ACL grant withdrawn — writes denied silently, data arriving and vanishing, and
+  # `podman ps` still green. This tears the running thing down first, then declares it.
+  # No `|| escalate`: this command's failures are the operator's own — the wrong verb,
+  # an id that is not declared, a refusal at the prompt — and each already says exactly
+  # what to do. Printing "send this with any support request" over a sentence that
+  # names the fix teaches people the message above it is not worth reading.
+  remove-arm|remove-peer)
+    v="${1#remove-}"; shift
+    run python3 "$BIN/octo-pod-remove-arm" "$v" "$@" ;;
+
+  # The outbound direction: declare, release, revoke, check and remove destinations.
+  # No `|| escalate`, as for removal: every refusal names its own fix.
+  egress)
+    shift; run python3 "$BIN/octo-pod-egress" "$@" ;;
+
+  # What a zenoh-native peer may reach and read, and its bundle for hand-off. Same
+  # refusal discipline as egress: every error names its own fix.
+  peer)
+    shift; run python3 "$BIN/octo-pod-peer" "$@" ;;
+
+  # ---- 4. take a new version of the software --------------------------------
+  # Not "step 4" in the install: a pod that is never upgraded still works. It is here
+  # because it is the other thing an operator does to a running pod, and because the
+  # alternative — teaching every site to use git — is not a thing to ask of them.
+  upgrade)  shift; run "$BIN/octo-pod-upgrade" "$@" ;;
+
+  # The container images, over the same verified channel as the software — so an edge
+  # pod never holds a registry credential. Same fetch, same signature, same refusal to
+  # install anything unverifiable; only the artifact differs.
+  fetch-images) shift; run "$BIN/octo-pod-upgrade" --images "$@" ;;
+
+  # The other direction: a box that CAN reach the registry builds the bundle the boxes
+  # that cannot will install from. It may need a registry credential, which is why it
+  # belongs on one seed box per site and not on every pod.
+  build-images)
+    shift
+    [ -x "$REPO/tools/build-airgap-bundle.sh" ] \
+      || die "tools/build-airgap-bundle.sh is missing — this install predates it, or is
+  a payload that did not ship it. octo-pod upgrade will bring it."
+    run "$REPO/tools/build-airgap-bundle.sh" "$@" ;;
+
+  # ---- plumbing, exposed so nothing is a black box --------------------------
+  identity) shift; run "$BIN/octo-pod-identity" "$@" || escalate ;;
+  test)     ( cd "$ANSIBLE_DIR" && run python3 tests/test_templates.py ) || escalate ;;
+
+  # ---- acting on a pod FROM SOMEWHERE ELSE ----------------------------------
+  #
+  # Everything above converges the box it runs on. These three reach a pod from outside
+  # it, over ssh, and they are the ones an operator was running as loose scripts with
+  # three different invocations.
+  #
+  # WHY THEY ARE NOT A --target ON THE VERBS ABOVE. `octo-pod --target <host> apply` reads
+  # as the obvious generalisation and it is the wrong one: it makes every converge
+  # remotely drivable, which is a fleet control plane, and the whole reason this tool
+  # exists rather than extending the fleet CLI is that a pod converges itself. A remote
+  # apply also fails in a way a local one cannot, half-done with a dropped ssh, and it
+  # puts privileged operations on N boxes behind one laptop. Bootstrap, join and apply
+  # stay local by construction.
+  #
+  # These three are different in kind: they act on a box that is not yet a pod, or is
+  # about to stop being one, or needs a credential it cannot mint for itself. There is
+  # nowhere else they could run.
+  #
+  # Remote helpers ship in both release packages and source checkouts.
+  remote)
+    shift
+    sub="${1:-}"; [ $# -gt 0 ] && shift
+    case "$sub" in
+      install)     script="install-to-pod.sh" ;;
+      deprovision) script="deprovision-pod.sh" ;;
+      mint-key)    script="mint-key.sh" ;;
+      ""|-h|--help)
+        cat >&2 <<'REMOTE'
+octo-pod remote — act on a pod from your laptop, over ssh.
+
+  octo-pod remote mint-key    <user>@<host> [--pod <name>]
+  octo-pod remote install     <user>@<host> [--with-images] [--version X.Y.Z]
+  octo-pod remote deprovision <user>@<host> [--yes] [--wipe-stage]
+
+Set OCTO_POD_TARGET once and the address becomes optional:
+
+  export OCTO_POD_TARGET=<user>@<host>
+  octo-pod remote install --with-images
+
+Converging a pod is deliberately NOT here. bootstrap, join and apply run on the
+pod, because a pod converges itself; driving that from a laptop is a fleet
+control plane and a different tool.
+REMOTE
+        exit 2 ;;
+      *) die "unknown: octo-pod remote $sub  (install | deprovision | mint-key)" ;;
+    esac
+    home="$(sed -n 's/^repository=//p' "$REPO/RELEASE" 2>/dev/null | head -1)"
+    [ -x "$REPO/tools/$script" ] || die "octo-pod remote helper $script is missing from this installation.
+  Run these from a checkout: git clone https://github.com/${home:-<owner>/<repo>}"
+    # THE TARGET IS THE FIRST POSITIONAL, and $OCTO_POD_TARGET fills in when the first
+    # argument is a flag or there is none. Deliberately not a --target flag: these wrap
+    # scripts that already take it positionally, and two ways to say the same thing is
+    # how they end up disagreeing.
+    case "${1:-}" in
+      ""|-*) [ -n "${OCTO_POD_TARGET:-}" ] && set -- "$OCTO_POD_TARGET" "$@" ;;
+    esac
+    exec "$REPO/tools/$script" "$@" ;;
+
+  # What a support request needs, in one screen: which software, installed how, against
+  # which identity, running which arm binaries. `git describe` answered none of that on
+  # a pod that was never a checkout.
+  version)
+    v="unknown"
+    [ -f "$REPO/VERSION" ] && v="$(tr -d '[:space:]' < "$REPO/VERSION")"
+    printf 'octo-pod %s\n' "$v"
+    printf '  %s\n' "$("$BIN/octo-pod-upgrade" --describe 2>/dev/null || echo "install at $REPO")"
+    printf '  identity at %s%s\n' "$ETC" "$([ -f "$INV" ] || echo '  (not a pod yet)')"
+    printf '  arm images pinned by this version:\n'
+    # The _upstream vars, not the derived ones: what a pod PULLS is those refs through
+    # image_mirror, which is a per-pod setting, while these are what this version pins.
+    # The derived vars are folded scalars, so grepping them printed "udp_ingest_image: >-"
+    # and no digest at all — a version output that answers nothing.
+    grep -hE '^(udp_ingest|tcp_ingest|tcp_connect)_image_upstream:' \
+      "$ANSIBLE_DIR/group_vars/all/10-infrastructure.yml" 2>/dev/null \
+      | sed 's/_upstream//; s/ *#.*//; s/^/    /'
+    mirror=$(sed -n 's/^image_mirror: *"\(.*\)".*/\1/p' \
+      "$ANSIBLE_DIR/group_vars/all/10-infrastructure.yml" 2>/dev/null)
+    for f in "$ETC"/host_vars/*/*.yml; do
+      [ -f "$f" ] || continue
+      m=$(sed -n 's/^image_mirror: *"\(.*\)".*/\1/p' "$f"); [ -n "$m" ] && mirror="$m"
+    done
+    # No apostrophe in the default: inside ${var:-word} an unbalanced quote is a parse
+    # error even within double quotes, and it takes the whole script with it.
+    printf '  pulled from: %s\n' "${mirror:-the registry each image names}" ;;
+
+  *)
+    cat >&2 <<USAGE
+octo-pod — three steps, in order.
+
+  1  octo-pod bootstrap          runtime checks, netbird agent, images     (once)
+  2  octo-pod join --setup-key … identity, mesh, local fabric              (once)
+     octo-pod init --pod <name>   ...or this, for a pod that joins nothing   (once)
+  3  octo-pod apply              converge after a change                   (any time)
+
+After step 2 the pod is joined and running. Step 3 is for what you change afterwards.
+
+Adding a publisher is not a fourth step — declare it, then run step 3:
+
+     octo-pod add-arm <id> --udp <port> --from <ip> --feed <label>
+     octo-pod add-arm <id> --dial <host>:<port>      sensor serves its own stream
+     octo-pod edit arms <id> --from <ip> --udp <port>
+                                           correct the same sensor; check, then apply
+     octo-pod add-peer <id> [--from <ip>]  --from: it dials the pen over the LAN from there
+     octo-pod set-lan --iface <if> --addr <ip>/<prefix> [--ssh-from <jump host>/32]
+     octo-pod set-firewall on|off          deny by default; openings come from the declarations
+     octo-pod release <id> --slot <dir> --ca-fingerprint <fp>
+                                           open both upstream gates for one publisher,
+                                           once the bundle's signature checks out
+     octo-pod apply
+
+A zenoh-native peer: what it reaches, what it reads, and its bundle, then step 3:
+     octo-pod peer allow-from <id> --from <ip>[,<ip>]   open the pen to it on the LAN
+     octo-pod peer allow-from <id> --clear              mesh-only again
+     octo-pod peer allow-read <id> --key <anchor>/<key> release fabric keys down to it;
+                                           it subscribes to downlink/<key>
+     octo-pod peer revoke-read <id> [--key <k>]         close them (all, without --key)
+     octo-pod peer bundle <id> [--out <file>]           cert, key, CA and instructions,
+                                           packaged for hand-off (after apply)
+     octo-pod peer check                   every destination's and peer's downward gates
+
+Removing one (tears down first, then declares — see 'why' in the command):
+     octo-pod remove-arm <id>              stop it, revoke its key, drop the declaration
+     octo-pod remove-peer <id>
+
+Sending fabric data to a system that cannot join, the way it expects the sensor, then step 3:
+     octo-pod egress add <id> --dest udp://<ip>:<port> --key <anchor>/<key>      it listens
+     octo-pod egress add <id> --dest tcp-server://<pod-ip>:<port> --from <ip> --key ...
+                                           it dials the pod, as it would dial the radar
+     octo-pod egress add <id> --dest zenoh://<ip>:<port> --prefix <p> --partner-bundle <dir> --key ...
+                                           it runs Zenoh: the pod publishes into its router,
+                                           with the certificate it issued us
+     octo-pod egress release <id>          open both downward gates for one destination
+     octo-pod egress revoke <id>           close them again
+     octo-pod egress check                 do the two gates agree for every destination?
+     octo-pod egress remove <id>           stop it, delete its key, drop the declaration
+
+Read-only:
+     octo-pod status             every arm and peer: state, transport, topic, release
+     octo-pod status --json      the same, for a machine
+     octo-pod top                live: rates per arm, bridge and destination, mesh, problems
+     octo-pod top --once         one snapshot as text (--json for a machine)
+     octo-pod get [KIND] [-o wide|json]
+                                 a row per item: flows, arms, ingress, peers, egress, bridges,
+                                 mesh, problems, certs
+     octo-pod describe [TYPE] <id> one item in full: declaration, container, flow,
+                                 certificate, recent logs, what to run next
+     octo-pod logs [TYPE] <id> [-f] [--tail N] [--since T]
+                                 its container's logs (a peer shows its audit sink;
+                                 a stopped container, its unit's journal)
+     octo-pod certs [--check]    every certificate, when it ends, and the renewal
+                                 timer (--check fails within --days, default 30,
+                                 or when one cannot be read: run it as root)
+     octo-pod check              what step 3 would change
+     octo-pod verify             prove it is BUILT right: acl, sink, certs, decode
+     octo-pod verify-flowing     ...and that data is actually arriving (needs sensors)
+     octo-pod verify-clean       fails if anything would change (field deployments)
+
+New software (never touches $ETC):
+     octo-pod upgrade            take the newest release, then run step 3
+     octo-pod upgrade --check    what it would take; changes nothing
+     octo-pod upgrade --rollback go back to the version you came from
+     octo-pod fetch-images       the container images, so this pod needs no
+                                 registry credential of its own
+     octo-pod build-images       build that bundle here, for boxes that cannot pull
+                                 (needs a credential; run it on one seed box)
+
+Mesh and remote tools:
+     octo-pod set-mesh --mgmt <URL>        declare the mesh management URL
+     octo-pod remote --help                install, mint a key, or deprovision over SSH
+
+Plumbing:
+     octo-pod identity write <dir>         write /etc/octo-pod by hand
+     octo-pod test                         offline template tests — no pod, no network
+     octo-pod version
+
+Identity:  $ETC              (yours; never touched by an upgrade)
+Playbooks: $ANSIBLE_DIR
+
+Removal verbs stop containers immediately. Bootstrap, join, apply, upgrade,
+fetch-images, build-images and remote actions also change state.
+USAGE
+    exit 1 ;;
+esac

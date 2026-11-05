@@ -1,0 +1,96 @@
+# Exercise action upgrades without registry writes, signing or releases.
+name: Action contracts
+on:
+  pull_request:
+    paths: ['.github/workflows/**']
+permissions:
+  contents: read
+concurrency:
+  group: action-contracts-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        leg: [one, two]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: create a registry-free build context
+        env:
+          LEG: ${{ matrix.leg }}
+        run: |
+          mkdir -p /tmp/action-context
+          printf 'FROM scratch\nLABEL smoke.leg="%s"\n' "$LEG" > /tmp/action-context/Dockerfile
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        id: image
+        with:
+          context: /tmp/action-context
+          tags: local/action-contract:smoke
+          load: true
+          push: false
+          provenance: false
+      - name: verify the image and export an empty digest marker
+        env:
+          IMAGE_ID: ${{ steps.image.outputs.imageid }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          LEG: ${{ matrix.leg }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(docker image inspect local/action-contract:smoke --format '{{.Id}}')" = "$IMAGE_ID"
+          test "$(docker image inspect local/action-contract:smoke --format '{{index .Config.Labels "smoke.leg"}}')" = "$LEG"
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/fixture-${LEG}@${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-smoke-${{ matrix.leg }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+  artifacts:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digest-smoke-*
+          merge-multiple: true
+      - name: verify both digest markers survived the archive handoff
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          files = sorted(Path('/tmp/digests').iterdir())
+          assert len(files) == 2, files
+          assert {p.name.split('@')[0] for p in files} == {'fixture-one', 'fixture-two'}
+          assert all(p.is_file() and p.stat().st_size == 0 for p in files)
+          assert all(re.fullmatch(r'fixture-(one|two)@[0-9a-f]{64}', p.name) for p in files)
+          PY
+      - name: create a multi-file release fixture
+        run: |
+          mkdir -p /tmp/release-fixture
+          printf 'synthetic package\n' > /tmp/release-fixture/package.txt
+          (cd /tmp/release-fixture && sha256sum package.txt > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-smoke
+          path: /tmp/release-fixture/*
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-smoke
+          path: /tmp/release-downloaded
+      - name: verify the named multi-file artifact
+        working-directory: /tmp/release-downloaded
+        run: |
+          sha256sum -c SHA256SUMS
+          test "$(cat package.txt)" = 'synthetic package'

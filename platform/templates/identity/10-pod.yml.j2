@@ -1,0 +1,17 @@
+# This pod's identity. Yours; never overwritten by a package upgrade.
+pen_id: "{{ pod_name }}"
+fabric_slot_anchor: "{{ upstream_anchor | default('') }}"
+# What authenticated this pod's slot bundle, pinned by `octo-pod release --slot`: the
+# fingerprint of the key that signs GOAT bundles, as the goatnet's operators gave it out
+# of band, and the SHA-256 of the fabric CA roots that bundle carried. apply refuses any
+# other roots.
+goatnet_ca_fingerprint: ""
+fabric_ca_roots_sha256: ""
+# THE RELEASE GATE. A namespace leaves this pod only if it is listed here AND that
+# publisher's own release.to_fabric is true. Two edits in two files, deliberately.
+bridge_allow: "raw/octo/**"
+
+# THE DOWNWARD GATE, the mirror of bridge_allow. Fabric data reaches a destination only
+# if its keys are listed in downlink_allow AND that destination's own release.from_fabric
+# is true. Empty means nothing comes down. 'octo-pod egress release' makes both edits.
+downlink_allow: ""

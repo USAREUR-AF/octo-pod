@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Correct an existing arm's endpoint without replacing its identity or applying it."""
+import argparse
+import copy
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import tempfile
+import yaml
+
+
+class Invalid(ValueError):
+    pass
+
+
+class UniqueLoader(yaml.SafeLoader):
+    pass
+
+
+def unique_mapping(loader, node, deep=False):
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise Invalid(f"duplicate YAML key: {key}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
+
+
+def ipv4(value, flag):
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ValueError:
+        raise Invalid(f"{flag} requires an IPv4 address, got {value!r}") from None
+
+
+def edit(args):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', args.name):
+        raise Invalid('arm name must be an existing identifier')
+    root = Path(os.environ.get('OCTO_POD_ETC', '/etc/octo-pod'))
+    pods = list((root / 'host_vars').glob('*/'))
+    if len(pods) != 1:
+        raise Invalid('expected exactly one pod identity under host_vars')
+    path = pods[0] / '30-arms.yml'
+    if path.is_symlink() or not path.is_file():
+        raise Invalid('30-arms.yml must be a regular file, not a symlink')
+    original = path.read_text()
+    doc = yaml.load(original, Loader=UniqueLoader)
+    arms = doc.get('arms') if isinstance(doc, dict) else None
+    if not isinstance(arms, list) or not all(isinstance(a, dict) for a in arms):
+        raise Invalid('arms must be a list of mappings')
+    hits = [(i, a) for i, a in enumerate(arms) if a.get('id') == args.name]
+    if len(hits) != 1:
+        raise Invalid(f'{args.name!r} must name exactly one existing arm')
+    index, arm = hits[0]
+    kind = arm.get('kind', 'udp-ingest' if arm.get('transport') == 'udp' else 'tcp-ingest')
+    if kind not in ('udp-ingest', 'tcp-ingest', 'tcp-connect') or 'transport' not in arm:
+        raise Invalid('edit supports declared per-sensor UDP/TCP arms, not legacy feed lists')
+    updates = {}
+    for flag, expected in [('udp', 'udp-ingest'), ('tcp', 'tcp-ingest'), ('dial', 'tcp-connect')]:
+        if getattr(args, flag) is not None and kind != expected:
+            raise Invalid(f'--{flag} cannot change arm kind {kind}; this command only corrects endpoints')
+    port = args.udp if args.udp is not None else args.tcp
+    if port is not None:
+        if not 1 <= port <= 65535 or port in (22, 7447):
+            raise Invalid('listener port must be 1-65535 and not reserved (22, 7447)')
+        if any(i != index and a.get('kind') != 'tcp-connect' and a.get('port') == port
+               for i, a in enumerate(arms)):
+            raise Invalid(f'port {port} is already declared by another arm')
+        egress_file = pods[0] / '40-egress.yml'
+        if egress_file.exists():
+            egress = yaml.load(egress_file.read_text(), Loader=UniqueLoader) or {}
+            if not isinstance(egress, dict) or not isinstance(egress.get('egress') or [], list):
+                raise Invalid('egress must be a list of mappings')
+            for dest in egress.get('egress') or []:
+                if not isinstance(dest, dict):
+                    raise Invalid('egress must be a list of mappings')
+                address = dest.get('dest', '')
+                if kind == 'tcp-ingest' and address.startswith('tcp-server://') and address.rsplit(':', 1)[-1] == str(port):
+                    raise Invalid(f'port {port} is already declared by an egress listener')
+        updates['port'] = port
+    if args.dial is not None:
+        m = re.fullmatch(r'([A-Za-z0-9][A-Za-z0-9._-]*):([0-9]+)', args.dial)
+        if not m or not 1 <= int(m[2]) <= 65535:
+            raise Invalid('--dial requires HOST:PORT with a port in 1-65535')
+        host = m[1]
+        if args.src is None:
+            try:
+                updates['allow_sources'] = ipv4(host, '--dial without --from')
+            except Invalid:
+                raise Invalid('--from is required with a hostname target; name resolution must not change trust implicitly') from None
+        updates['target'] = args.dial
+    if args.src is not None:
+        updates['allow_sources'] = ','.join(ipv4(x.strip(), '--from') for x in args.src.split(','))
+    if args.bind is not None:
+        if kind == 'tcp-connect':
+            raise Invalid('--bind is only for listening arms')
+        updates['bind_host'] = ipv4(args.bind, '--bind')
+    if not updates:
+        raise Invalid('supply --from, --bind, or the matching --udp/--tcp/--dial endpoint')
+    updates = {k: v for k, v in updates.items() if arm.get(k) != v}
+    if not updates:
+        print('No changes; declaration already matches.')
+        return
+    # Edit only scalar spans of this entry. Preserve comments and every other byte.
+    tree = yaml.compose(original, Loader=UniqueLoader)
+    arm_nodes = next(v for k, v in tree.value if k.value == 'arms')
+    node = arm_nodes.value[index]
+    fields = {k.value: v for k, v in node.value}
+    replacements = []
+    additions = []
+    for key, value in updates.items():
+        encoded = json.dumps(value)
+        if key in fields:
+            old = fields[key]
+            if not isinstance(old, yaml.ScalarNode):
+                raise Invalid(f'{key} must be a scalar')
+            replacements.append((old.start_mark.index, old.end_mark.index, encoded))
+        else:
+            additions.append(' ' * node.start_mark.column + f'{key}: {encoded}\n')
+    if additions:
+        after_id = original.find('\n', fields['id'].end_mark.index)
+        if after_id < 0:
+            raise Invalid('entry must end with a newline before adding fields')
+        replacements.append((after_id + 1, after_id + 1, ''.join(additions)))
+    updated = original
+    for start, end, value in sorted(replacements, reverse=True):
+        updated = updated[:start] + value + updated[end:]
+    expected = copy.deepcopy(doc)
+    expected['arms'][index].update(updates)
+    if yaml.load(updated, Loader=UniqueLoader) != expected:
+        raise Invalid('YAML aliases or layout prevent an isolated edit; declaration left unchanged')
+    print(f'Proposed edit for arm {args.name}:')
+    for key, value in updates.items():
+        print(f'  {key}: {arm.get(key)!r} -> {value!r}')
+    trust_change = bool({'allow_sources', 'target'} & updates.keys())
+    release = arm.get('release') or {}
+    released = release.get('to_fabric', False) if isinstance(release, dict) else True
+    # Treat malformed release values conservatively; apply still validates the schema.
+    if args.dry_run:
+        print('Dry run: no declaration or service changed.')
+        if trust_change and released:
+            print('Saving this released source change requires --acknowledge-trust-change.')
+        return
+    if trust_change and released and not args.acknowledge_trust_change:
+        raise Invalid('this arm is released; changing its trusted endpoint requires '
+                      '--acknowledge-trust-change. Preview with --dry-run. '
+                      'Onboard a replacement sensor as a new identity instead.')
+    before = path.stat()
+    fd, temporary = tempfile.mkstemp(prefix='.octo-edit-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            os.fchmod(f.fileno(), stat.S_IMODE(before.st_mode))
+            if os.geteuid() == 0 and (before.st_uid, before.st_gid) != (os.getuid(), os.getgid()):
+                os.fchown(f.fileno(), before.st_uid, before.st_gid)
+            f.write(updated)
+            f.flush()
+            os.fsync(f.fileno())
+        if path.is_symlink() or path.read_text() != original:
+            raise Invalid('declaration changed concurrently; retry after reviewing it')
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print(f'Saved endpoint correction for {args.name}.')
+    print('Identity, namespace and release settings preserved. No service was changed.')
+    if 'allow_sources' in updates or 'target' in updates:
+        print('This changes the trusted sensor endpoint. Use it only for the same onboarded sensor.')
+    print('Review: sudo octo-pod check\nApply:  sudo octo-pod apply')
+    print('Applying an endpoint correction restarts the changed arm and may interrupt its feed.')
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='octo-pod edit', description=__doc__)
+    parser.add_argument('kind', choices=['arm', 'arms'])
+    parser.add_argument('name')
+    parser.add_argument('--from', dest='src', help='trusted source IPv4 address(es), comma separated')
+    parser.add_argument('--bind', help='local listening IPv4 address')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--udp', type=int, help='correct a UDP listener port')
+    group.add_argument('--tcp', type=int, help='correct a TCP listener port')
+    group.add_argument('--dial', help='correct a TCP dial-out target HOST:PORT')
+    parser.add_argument('--dry-run', action='store_true', help='show the proposed edit without writing')
+    parser.add_argument('--acknowledge-trust-change', action='store_true',
+                        help='acknowledge a trusted endpoint correction on an already released arm')
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.exit(2, 'Run with sudo; editing writes the pod declaration.\n')
+    try:
+        edit(args)
+    except (Invalid, OSError, yaml.YAMLError) as exc:
+        parser.exit(1, f'error: {exc}\n')
+
+
+if __name__ == '__main__':
+    main()

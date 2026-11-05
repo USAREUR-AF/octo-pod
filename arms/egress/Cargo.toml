@@ -1,0 +1,72 @@
+# octo-egress: the pod's outbound direction. Three binaries and the trust logic they share:
+#
+#   downlink-bridge  subscribes on the fabric, as the pod's slot identity, ONLY to the keys
+#                    in downlink_allow, and republishes them on the pen under downlink/<key>
+#                    (the uplink bridge, run in reverse)
+#   egress-arm       one per external destination: its own pod-CA certificate, reads only
+#                    its granted downlink keys, and delivers them the way the consumer
+#                    connects (datagram, dialled stream, or a listener the consumer dials),
+#                    with a local audit record
+#   zenoh-egress-arm one per partner that already runs their own Zenoh mesh: reads the same
+#                    granted downlink keys, and republishes them into the partner's own
+#                    router, dialled in client mode under a certificate THEY issued,
+#                    confined to a prefix THEY granted, same local audit record
+#
+# The lints are stricter than the workspace default (pedantic; unwrap, expect and panic
+# warned) because this crate decides what leaves the pod. Test code may unwrap; see
+# clippy.toml beside this file.
+
+[package]
+name = "octo-egress"
+version = "0.1.0"
+# Never goes to crates.io: these are binaries baked into a container image. Saying so is
+# also what lets cargo-deny accept the workspace path dependency: crates.io forbids path
+# deps, so a crate that CLAIMS to be publishable while using one is a real defect.
+publish = false
+description = "octo-pod egress: per-destination egress arms behind a downlink gate"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "egress-arm"
+path = "src/bin/egress-arm.rs"
+
+[[bin]]
+name = "downlink-bridge"
+path = "src/bin/downlink-bridge.rs"
+
+[[bin]]
+name = "zenoh-egress-arm"
+path = "src/bin/zenoh-egress-arm.rs"
+
+[dependencies]
+octo-arm-common = { workspace = true }
+zenoh = { workspace = true }
+# io-util for the TCP writer, sync for each served consumer's queue. Named here rather
+# than inherited through feature unification, so the crate states what it uses.
+tokio = { workspace = true, features = ["io-util", "sync"] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+# All four are already in the zenoh dependency tree at these majors: no new
+# supply-chain surface, and no new entries in Cargo.lock beyond this package.
+serde_json = "1"
+ring = "0.17"
+hex = "0.4"
+humantime = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"

@@ -1,0 +1,62 @@
+# PEERS — Zenoh-native publishers.
+#
+# A peer already speaks Zenoh and holds an mTLS identity WE minted. It publishes
+# straight into the pen; no listener of ours sits in the path. Authorised by
+# certificate CN in the pen ACL, never by convention.
+#
+# Socket-only publishers go in 30-arms.yml instead. Ids must be unique across BOTH
+# files — configure-octo-pod.yml asserts that.
+#
+# Peers connect as CLIENTS, never router-to-router. Router federation would make
+# their router a transitive trust bridge: everything it can reach becomes reachable
+# through us, with no schema and nowhere to store it (ADR 1020 §3-4).
+#
+# The cert and the ACL are BOTH generated from this file, so a hand-minted cert has
+# no policy and a hand-written policy has no cert. Do not create either by hand.
+#
+# `expect:` is DESIRED state. Nothing consumes it yet, but declaring it makes the
+# diff against reality computable — a declared peer that stops publishing is the
+# failure mode that goes unnoticed for a day. `verify --tags drift` catches it.
+#
+# Two optional fields widen a peer, each explicit and each per peer (ADR 0002). Set them
+# with commands, not by hand: `octo-pod peer allow-from` and `octo-pod peer allow-read`.
+#
+#   allow_sources   literal IPv4 addresses that may dial the pen over the LAN. Without
+#                   it, the peer reaches the pen over the mesh only.
+#   read_keys       fabric keys released DOWN to this peer, through the same two gates as
+#                   an egress destination: each key in downlink_allow (10-pod.yml) AND this
+#                   entry's release.from_fabric true. The peer then reads downlink/<key>,
+#                   and only that. For a partner outside your organization, use its lane
+#                   key (release/<lane>/...), not a publisher's raw key.
+
+peers:
+  - id: partner1
+    kind: zenoh-native
+    description: "Partner middleware — sensor aggregator, publishes direct into the pen"
+    cert_cn: octo-peer-partner1        # minted from {{ pen_ca_cn }}, clientAuth only
+    namespace: "raw/partner1/**"       # write-only grant; reads nothing
+    # allow_sources: "10.1.2.30"                            # optional: see above
+    # read_keys: ["release/REL-PARTNER/<anchor>/radar1/**"]   # optional: see above
+    enabled: true                      # false = declared but not provisioned
+    connects: client                   # NEVER peer/router
+    trust_tier: T2                     # handshake + a crypto identity we verified
+    affiliation: { id: partner-org, kind: partner }
+    contact: "Partner NOC"
+    onboarded: "2026-01-18"
+    verified:                          # tested live against the running pen
+      write_own_namespace: true        #   publish to raw/partner1/… ARRIVED
+      write_our_namespace: false       #   publish to raw/octo/…    DENIED
+      lands_in_fabric: true
+      reconnects_after_restart: true   #   survived a router restart unaided. Confirm
+                                       #   they set exit_on_failure:false + retry, or
+                                       #   our routine restart silently kills their feed
+    expect:
+      continuous: true                 # silence is a fault, and drift will fail on it
+      schema: "SAPIENT"
+    release:
+      to_fabric: true                    # OPEN — see bridge_allow in 10-pod.yml
+    revoke: |
+      Remove cert_cn from the mtls-partner1 subject in
+      {{ pen_state_dir }}/zenoh/config.json5 and restart octo-pen-zenoh-router.
+      Their session is refused at the next handshake; an established one is not
+      torn down until it reconnects.

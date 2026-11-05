@@ -1,0 +1,330 @@
+# octo-pod — INFRASTRUCTURE
+#
+# Things WE run: the local pen fabric, the arm, the sync leg, host hardening.
+# Publishers live in 20-peers.yml (zenoh-native) and 30-arms.yml (socket sources).
+
+# ---- the pen (local goat fabric) ------------------------------------------
+pen_state_dir: /var/lib/octo-pen
+pen_namespace: "raw/octo"              # arm publishes {{ pen_namespace }}/<feed>/<src>
+pen_listen_port: 7447
+
+# Which ingest NICs are forward-dropped, so a sensor leg can never route into your
+# LANs. Empty means isolate nothing, which is correct for a pod whose only leg is the
+# mesh — and is the state EVERY pod is in before its first arm is declared.
+#
+# This had no platform default: it was set only in example/host_vars, so the example
+# converged and every pod built by `identity write` failed on the first `apply` with
+# "'isolated_ifaces' is undefined". A declaration that every pod needs, and that is
+# empty until an operator says otherwise, belongs here rather than in a file the
+# operator is expected to already have.
+isolated_ifaces: []
+pen_ca_cn: "octo-pen-local-ca"
+# ---------------------------------------------------------------------------------
+# WHERE IMAGES ARE PULLED FROM. Empty means each image's own registry, above.
+#
+# Set it and every image is taken from that one host at the SAME DIGEST. This is what
+# makes an airgapped or mesh-only pod possible without weakening anything: a digest is
+# content-addressed, so it names the same bytes in any registry that holds them. The pod
+# still runs exactly what CI published and can still prove it; only the host serving
+# the bytes changes.
+#
+#   ""                     each image's own registry — needs the internet
+#   registry.<site>.<zone> a mesh registry — needs the mesh, not the internet
+#   localhost:5000         a registry ON the pod, seeded from a carried bundle
+#
+# It exists because a carried tar CANNOT satisfy a digest-pinned reference. Measured on
+# Docker 29.6.2 with the containerd snapshotter: pull by index digest OR by platform
+# digest, save, remove, load — and neither reference resolves afterwards. RepoDigests is
+# registry metadata and `docker load` cannot reconstruct it. Tags do survive, which is
+# how the registry that serves the digests is itself bootstrapped from a tar.
+#
+# The rewrite strips a leading registry host — a first path segment containing a dot or
+# a colon — and prefixes the mirror. `eclipse/zenoh` has no host at all (implicit Docker
+# Hub) and is left alone, so the mirror must hold it under that same path. One rule for
+# all five, so a mirror never serves four images and silently miss the fifth.
+image_mirror: ""
+
+
+zenoh_image_upstream: "eclipse/zenoh@sha256:157965d71e0bfd0a044d76a985ff0e5c306ad3968929168fb9678cd2a7fec23f"   # 1.9.0
+# The zenoh Python client verify-octo-pod.yml tests the pen's ACL with. Keep it at the
+# pen's version above (and the arms' crate, arms/Cargo.toml); test_templates.py checks.
+verify_zenoh_version: "1.9.0"
+audit_image_upstream: "ghcr.io/usareur-af/goat-audit-subscriber@sha256:6aacd50c4f6a8937e1750374a4e0b9a1150ddffe66a81d37fdb77c9e1ff49ae5"   # sha-b6ae695
+# TLS material is chowned to this gid so the sinks can read the pod key. Wrong value =
+# `Permission denied (os error 13)` = silent audit gap with every health signal green.
+# Confirm with: podman image inspect {{ audit_image }} --format '{{ "{{" }}.Config.User{{ "}}" }}'
+audit_runtime_uid: 65532
+# Where each sink serves goat_audit_subscriber_session_state. verify-octo-pod.yml reads
+# it to distinguish a live subscriber from a zombie; `podman ps` cannot.
+audit_metrics_port: 9303
+pen_firstparty_namespaces:
+  - "{{ pen_namespace }}/**"           # raw/octo/** — arm captures
+  - "cot/**"                           # CoT emitters
+
+# Identities minted from {{ pen_ca_cn }} that get first-party rights.
+# MUST be enumerated: an empty cert_common_names in a Zenoh ACL subject is a
+# WILDCARD, so leaving it off grants every CA-rooted cert our full namespace —
+# the ADR 1020 §5 ingress-write over-grant. Third parties go in `peers` instead.
+# Anything listed here can write raw/octo/** and cot/** AND read EVERY publisher's
+# namespace. Keep it to components that genuinely need all of it — this is the pod's
+# own infrastructure, not a place to add a publisher.
+#
+# octo-arm-sapient is here ONLY when the legacy single arm is switched on. It was
+# unconditional, so every pod minted a key for a component that is off by default and
+# never runs — and granted that key first-party rights, which by the paragraph above
+# means read access to EVERY publisher's namespace. An unused credential is bad; an
+# unused credential that can read everything is the kind found later and explained by
+# nobody. Declared publishers get their own scoped CN from `arms:`, so nothing else
+# depends on this one existing.
+pen_firstparty_cns: >-
+  {{ ['octo-pen-router', 'octo-uplink-bridge']
+     + (['octo-arm-sapient'] if (arm_enabled | default(false)) else []) }}
+
+# Leaf certs minted from the pen CA for our own components. Peers in
+# 20-peers.yml are appended to this loop automatically by configure-octo-pod.yml.
+# The arm leaf is minted only when that arm is enabled, for the same reason: a private
+# key on disk for something that does not run is a liability with no benefit.
+pen_leaf_certs: >-
+  {{ [ {'name': 'pod', 'cn': 'octo-pen-router', 'eku': 'serverAuth,clientAuth',
+        'san': 'IP:' ~ (pod_san_ips | default([mesh_ip]) | join(',IP:'))
+                ~ ',IP:127.0.0.1,DNS:localhost,DNS:octo-pen-router'} ]
+     + ([ {'name': 'arm', 'cn': 'octo-arm-sapient', 'eku': 'clientAuth,serverAuth',
+           'san': 'DNS:octo-arm'} ] if (arm_enabled | default(false)) else []) }}
+
+# ---- the arm (tcp-ingest) --------------------------------------------------
+# An ARM gives identity to a certless source at a socket (stage 1). Compare with
+# the zenoh-native peers in 20-peers.yml, which arrive already identified.
+# Feeds: label=port[:framing]  framing = stream|newline|len32be|len32le
+arm_tls_dir: /etc/octo-arm/tls
+# Bind leg for the first-party arm. Loopback by default; set to {{ lan_ip }} to expose
+# it on the ingest LAN.
+arm_default_framing: "stream"
+# Generated state (per-partner overrides) is written under arm_repo_dir at runtime so
+# nothing writes into the checkout.
+arm_repo_dir: /var/lib/octo-pod
+
+# Arm images are PULLED, never built on the pod. The binary is identical for every pod
+# and every partner — nothing is baked in at build time and identity is mounted — so a
+# per-pod build bought nothing and cost three things: a dependency tree that varied with
+# the day a pod was built, crates.io in a border site's deployment path, and minutes per
+# pod. Published multi-arch by .github/workflows/images.yml; that job prints the digest
+# to paste here.
+#
+# TAGS ARE NOT PINS. A tag is a mutable pointer, so an image swapped upstream reaches
+# every pod at the next apply. platform/tests/test_templates.py fails if either of these
+# lacks a digest, and CI runs it on every push.
+udp_ingest_image_upstream: "ghcr.io/usareur-af/octo-udp-ingest@sha256:b39ac316a538dbd109fba7b71c0b5a0d439f1cff20a1c169a6af5e8b3dde5372"   # sha-fd74ba8, multi-arch amd64+arm64
+tcp_ingest_image_upstream: "ghcr.io/usareur-af/octo-tcp-ingest@sha256:21c9ba1f4c7b0e98dbac602f5f2670ddefc0fc38268ffda6dd81f8aaf165d8cf"   # sha-fd74ba8, multi-arch amd64+arm64
+tcp_connect_image_upstream: "ghcr.io/usareur-af/octo-tcp-connect@sha256:ef917f7b2f940f2cd8c780dbd5d6de2b8f1344729073aa3e09369fd50bb8ed38"   # sha-fd74ba8, multi-arch amd64+arm64
+health_pub_image_upstream: "ghcr.io/usareur-af/octo-health-pub@sha256:807b43a5288c0d7bfbf6a9d3ae61895d97c053ca373c66fff6ed272059ebbe88"   # sha-fd74ba8, multi-arch amd64+arm64
+# NOTE: tcp-ingest is a passive LISTENER — fire-and-forget feeds and raw sampling only.
+# A protocol that requires a session, or one where the sensor listens and expects us to
+# dial out, needs its own arm. No such arm exists yet.
+
+# ---- the sync leg (uplink bridge → the fabric) ------------------------------
+# The fabric org slot is minted OFF-box on the portal. Its cert/key +
+# CA + anchor are INPUTS here — provide fabric_slot_* at runtime, never commit them.
+# The anchor itself and bridge_allow are per-pod and live in host_vars/<pod>/10-pod.yml.
+fabric_uplink_dir: /etc/octo-uplink
+sub_leaf_dir: /etc/octo-pen-uplink
+# The uplink bridge (arms/uplink-bridge) is published with the arm images by
+# .github/workflows/images.yml and pinned the same way. It runs as a Quadlet unit.
+uplink_bridge_image_upstream: "ghcr.io/usareur-af/octo-uplink-bridge@sha256:240e9fa9c4eae1f2d9f3daf06b9c36d05ff3916e9a55b8d19d7b0fd0b409c61f"   # sha-fd74ba8, multi-arch amd64+arm64
+
+# ---- pod firewall ------------------------------------------------------------
+# Deny by default inbound, outbound and routed, with openings rendered from the
+# declarations (templates/host/octo-firewall.nft.j2): management and the mesh's control
+# traffic are fixed, arms, egress destinations, peers and the fabric router are declared.
+# OFF until proven on a live pod: turn it on per pod with pod_firewall_enabled: true in
+# 10-pod.yml, after mgmt_ssh_sources names any non-mesh management path (set-lan
+# --ssh-from), or that path is closed with everything else.
+pod_firewall_enabled: false
+# The last ruleset that was applied and verified; the boot unit loads it.
+pod_firewall_file: /etc/octo-pod-firewall.nft
+mesh_iface: wt0
+# NetBird's default overlay range (RFC 6598 shared address space). A deployment that
+# configured another range sets it here; the firewall's mesh openings follow it.
+mesh_cidr: "100.64.0.0/10"
+netbird_wg_port: 51820
+# Relay ports opened before the pod has joined, when the agent cannot say yet. After it
+# joins, the firewall also opens whatever relays, STUN and TURN servers the mesh's
+# management assigned it (read from `netbird status --json` at each apply).
+netbird_relay_ports: [443]
+# Ports the mesh's nameservers answer on, reached over the mesh only: 53, and 5353, the
+# port NetBird's DNS forwarder uses. A deployment whose nameservers use another port adds it.
+mesh_dns_ports: [53, 5353]
+mgmt_ssh_sources: []
+
+# ---- egress: released fabric data out to certless destinations -------------
+# The mirror of the arms. One egress arm per destination declared in 40-egress.yml, each
+# with its own pen certificate, one literal destination and an audit record of every
+# send, and one downlink bridge per pod that holds the slot's fabric session and brings
+# only the keys in downlink_allow onto the pen under downlink/<lane>/**.
+#
+# Published with the other arm images. Both the egress arm and downlink bridge
+# use this immutable multi-arch index; release bundles carry it for offline pods.
+egress_image_upstream: "ghcr.io/usareur-af/octo-egress@sha256:227dc6e4c1475b1b18d7b71a9b6a8eac6a9d9f03a48ecf1fc8fa0e7cae191eb8"   # sha-fd74ba8, multi-arch amd64+arm64
+# sapient:// destinations run the SAPIENT session arm from its own immutable
+# multi-arch image. A pod pulls the pinned reference or its carried registry mirror.
+sapient_image_upstream: "ghcr.io/usareur-af/octo-sapient@sha256:3a88d03032dd93b93dd08f9e6d0b943e9aed23fce716d130f741ff57c5999b95"   # sha-fd74ba8, multi-arch amd64+arm64
+# Schemes whose arm holds a session with the destination: it registers and heartbeats
+# whether or not data flows. A declared but unreleased session destination is therefore
+# not started, so the far side never sees this pod before its data is released; udp://,
+# tcp:// and tcp-server:// arms run unreleased and receive nothing. `octo-pod egress`
+# holds the same list (SESSION_SCHEMES), and the template tests check the two agree.
+egress_session_schemes: [sapient]
+downlink_tls_dir: /etc/octo-downlink/tls
+egress_audit_dir: /var/lib/octo-egress
+
+# Where an airgapped install stages carried artifacts (debs, image tars, the bridge
+# tarball). Defined here rather than only in bootstrap-octo-pod.yml because BOTH
+# playbooks name it: bootstrap unpacks from it, and configure-octo-pod.yml points a
+# missing-bridge-source error at it. It lived only in bootstrap's vars, so that error
+# raised "'stage_dir' is undefined" on a configure run instead of the message it meant.
+stage_dir: /opt/octo-stage
+
+# ---- WHERE the fabric is: the identity layer, not this file ---------------
+# The four values below name a specific deployment's hosts. They used to carry real
+# addresses right here, which meant every site that received the platform layer also
+# received the mesh, upstream and package-repo addresses of a fabric it is not part of.
+# They now live in host_vars/<pod>/05-fabric.yml, written from the pod's token, and are
+# empty here so that this file names no site at all.
+#
+# Empty is a legitimate state, not a broken one: a pod that captures and retains locally
+# needs none of them. Each is guarded where it is USED, so an absent value fails loudly
+# at the step that needs it rather than rendering a broken config that fails later.
+fabric_endpoint: ""          # tls/<zenoh host>:7447 — the upstream fabric the bridge dials
+fabric_host_pins: []         # [{ ip: , names: }] — mesh DNS, resolvable nowhere else
+fabric_portal_url: ""        # where publish-to-portal.yml registers topics and schemas
+netbird_mgmt_host: ""      # the mesh management server, when no --mgmt url is given
+octo_repo_url: ""          # release FILE surface: LATEST + tarball + SHA256SUMS
+# An APT REPOSITORY is a different thing from the file surface above: apt wants
+# dists/<suite>/… metadata, not a directory of tarballs. Pointing an apt source at the
+# release surface makes apt 404 on every update — and a broken source fails EVERY apt
+# operation on the box, including the installs provisioning depends on.
+#
+# Empty until something actually publishes a repository. Nothing does today: releases
+# attach a .deb to a GitHub release, which is not a repo. Install that .deb by file.
+octo_apt_repo_url: ""
+
+# ---- network isolation (SAFE forward-drop) -------------------------------
+# Ingest NICs whose networks must NOT route through the box to your other LANs.
+# INPUT/OUTPUT (ingest to/from the box) still work — only transit is dropped.
+#
+# Consider adding {{ lan_iface }} when it is a shared LAN carrying other participants'
+# traffic: transit through this box onto your other networks is not something to permit
+# by default. Captures on a shared exercise LAN routinely show unrelated multicast.
+#
+# Mesh-only egress lockdown is deliberately not automated here. It can sever the mesh,
+# which on a remote pod is the only way back in, so it needs console access and a
+# dead-man's switch. Four settings used to live here and converged nothing: the only task
+# reading them printed that they were not automated.
+
+# ---- self-heal (keep the mesh alive) -----------------------------------
+# ONLY FOR A POD THAT ACTUALLY JOINS A MESH. This installs a cron that restarts netbird
+# when the mesh is down and REBOOTS THE BOX after ten consecutive failures — sound on a
+# pod whose remote access depends on that mesh, and catastrophic on one that has none:
+# the condition is permanent, so the box reboots every ten minutes forever. It did,
+# four times, on a pod created by `octo-pod init` with no mesh at all.
+#
+# Derived rather than declared, so the answer comes from the same place as everything
+# else about which fabric this pod is part of. Set it explicitly to override.
+selfheal_enabled: "{{ (netbird_mgmt_host | default('') | trim) | length > 0 }}"
+selfheal_reboot_after_fails: 10
+
+# ---- host log hygiene ------------------------------------------------------
+# Added after a pod filled its disk with a 2.2 GB syslog. journald's default cap is 10%
+# of the filesystem, which on a large disk is tens of gigabytes of logs nobody reads.
+logrotate_keep: 8
+logrotate_maxsize: "100M"      # rotate on size OR weekly, whichever first
+journald_max_use: "2G"
+journald_max_file: "200M"
+
+# ---- derived: which publishers actually get provisioned --------------------
+# Pure expressions over the per-pod lists, identical on every pod, so they live here
+# rather than in host_vars. Evaluated lazily on first reference. A publisher missing
+# `enabled` raises here — deliberately, since a silent default would make a forgotten
+# publisher vanish rather than complain.
+active_peers: "{{ peers | default([]) | selectattr('enabled') | list }}"
+active_arms: "{{ arms | default([]) | selectattr('enabled') | list }}"
+active_egress: "{{ egress | default([]) | selectattr('enabled') | list }}"
+# The subset that dials a partner's own router (kind: zenoh-egress), not a socket. Its
+# partner-issued cert/key/CA are placed from partner_bundle_dir, never minted on this pod.
+active_zenoh_egress: "{{ active_egress | selectattr('kind', 'defined') | selectattr('kind', 'equalto', 'zenoh-egress') | list }}"
+# Peers released to READ fabric keys (read_keys + release.from_fabric: true). They use the
+# downward path exactly as an egress destination does, so they count wherever "is the
+# downlink needed?" is asked.
+active_peer_readers: >-
+  {{ active_peers | selectattr('read_keys', 'defined') | selectattr('read_keys')
+     | selectattr('release', 'defined') | selectattr('release.from_fabric', 'defined')
+     | selectattr('release.from_fabric') | list }}
+# Everything that reads through the downlink: one list, so a condition can never count
+# egress destinations and forget peer readers (or the reverse).
+downlink_users: "{{ active_egress + active_peer_readers }}"
+
+# ---- package distribution (mesh-only) --------------------------------------
+# A pod is provisioned airgapped from removable media, then reaches out over NetBird and
+# nothing else. Updates therefore come from a repository that is only resolvable and
+# routable on the mesh — which makes "can this box be updated" the same question as "is
+# this box still an authorised mesh member". Revoking the peer revokes the update path.
+#
+# The source is written only AFTER enrolment succeeds: apt fails every operation if a
+# configured source is unreachable, so writing it on an airgapped box would break the
+# local installs that provisioning depends on. octo_repo_url itself is per-deployment
+# and lives in the identity layer; the suite/component/keyring below are conventions of
+# the software and name no host, so they stay here.
+octo_repo_suite: stable
+octo_repo_component: main
+octo_repo_keyring: /etc/apt/keyrings/octo-pod.asc
+
+# Where the setup key waits when a pod is provisioned with no route to the mesh.
+netbird_pending_key_file: /etc/octo-pod/netbird-setup-key
+
+# What a pod actually pulls: the upstream reference, through the mirror when one is set.
+zenoh_image: >-
+  {{ (image_mirror ~ "/" ~ (zenoh_image_upstream | regex_replace("^[a-z0-9-]+[.:][a-z0-9.:-]*/", "")))
+      if image_mirror else zenoh_image_upstream }}
+audit_image: >-
+  {{ (image_mirror ~ "/" ~ (audit_image_upstream | regex_replace("^[a-z0-9-]+[.:][a-z0-9.:-]*/", "")))
+      if image_mirror else audit_image_upstream }}
+udp_ingest_image: >-
+  {{ (image_mirror ~ "/" ~ (udp_ingest_image_upstream | regex_replace("^[a-z0-9-]+[.:][a-z0-9.:-]*/", "")))
+      if image_mirror else udp_ingest_image_upstream }}
+tcp_ingest_image: >-
+  {{ (image_mirror ~ "/" ~ (tcp_ingest_image_upstream | regex_replace("^[a-z0-9-]+[.:][a-z0-9.:-]*/", "")))
+      if image_mirror else tcp_ingest_image_upstream }}
+tcp_connect_image: >-
+  {{ (image_mirror ~ "/" ~ (tcp_connect_image_upstream | regex_replace("^[a-z0-9-]+[.:][a-z0-9.:-]*/", "")))
+      if image_mirror else tcp_connect_image_upstream }}
+health_pub_image: >-
+  {{ (image_mirror ~ "/" ~ (health_pub_image_upstream | regex_replace("^[a-z0-9-]+[.:][a-z0-9.:-]*/", "")))
+      if image_mirror else health_pub_image_upstream }}
+egress_image: >-
+  {{ (image_mirror ~ "/" ~ (egress_image_upstream | regex_replace("^[a-z0-9-]+[.:][a-z0-9.:-]*/", "")))
+      if (image_mirror and egress_image_upstream) else egress_image_upstream }}
+sapient_image: >-
+  {{ (image_mirror ~ "/" ~ (sapient_image_upstream | regex_replace("^[a-z0-9-]+[.:][a-z0-9.:-]*/", "")))
+      if (image_mirror and sapient_image_upstream) else sapient_image_upstream }}
+uplink_bridge_image: >-
+  {{ (image_mirror ~ "/" ~ (uplink_bridge_image_upstream | regex_replace("^[a-z0-9-]+[.:][a-z0-9.:-]*/", "")))
+      if image_mirror else uplink_bridge_image_upstream }}
+
+# ---- this pod's own health ------------------------------------------------
+# A pod repairs itself silently: a watchdog restarts a dead container, a timer renews an
+# expiring certificate. A pod that repaired itself four hundred times is indistinguishable,
+# from anywhere else, from one that never had a problem. This publishes what
+# `octo-pod status` computes, so a pod's state is knowable without reaching it.
+#
+# ON BY DEFAULT, because a pod nobody can see is the failure this exists to end, and an
+# opt-in observability feature is one that is off exactly where it was needed.
+health_pub_enabled: true
+# ONE KEY PER POD, never one per metric. Keyexpr cardinality is an O(N) read tax on every
+# broad walk — measured on this fabric at 227 ms for 15k keys, and seconds at 50k when
+# writes collide with a crawl. Varying data goes in the payload.
+health_pub_key: "ops/pod/health/{{ inventory_hostname }}"
+health_pub_cn: "octo-health-{{ inventory_hostname }}"
+health_pub_interval: 60
+# A reading older than this is published as stale rather than as current. Three intervals:
+# long enough that one missed write is not an alarm, short enough that a dead writer is
+# not reported as a healthy pod.
+health_pub_stale_after: 180

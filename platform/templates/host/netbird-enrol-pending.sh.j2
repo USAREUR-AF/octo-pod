@@ -1,0 +1,67 @@
+#!/bin/bash
+# Complete NetBird enrolment once a network path exists.
+#
+# A pod is provisioned airgapped: no route to the management server, so `netbird up`
+# cannot run at install time. The setup key is stored here instead, and this script —
+# run from a timer — enrols the moment connectivity appears, then removes the key and
+# disables itself.
+#
+# The key is deleted after successful enrolment. Expiry is enforced by the server;
+# a failed or expired key remains staged for an operator to replace or remove.
+KEYFILE={{ netbird_pending_key_file }}
+LOG=/var/log/netbird-enrol.log
+MGMT="{{ netbird_mgmt_url | default('https://' ~ netbird_mgmt_host) }}"
+# The peer name must equal this machine's registry handle: that pair is the join key for
+# the fleet provenance audit and for `goat machine revoke`. Enrolling under the appliance
+# hostname produces a peer that grades `violation` and cannot be cut.
+HANDLE="{{ inventory_hostname }}"
+ts() { date -u +%FT%TZ; }
+
+[ -f "$KEYFILE" ] || exit 0
+
+if netbird status 2>/dev/null | grep -q "Management: Connected"; then
+  echo "$(ts) already enrolled; removing pending key" >> "$LOG"
+  shred -u "$KEYFILE" 2>/dev/null || rm -f "$KEYFILE"
+  systemctl disable --now netbird-enrol-pending.timer 2>/dev/null
+  exit 0
+fi
+
+# Cheap reachability probe first: netbird up blocks and retries, which is wrong for a
+# timer that fires every minute.
+host=$(echo "$MGMT" | sed -E 's#^[a-z]+://##; s#/.*##; s#:.*##')
+if ! timeout 5 bash -c "cat < /dev/null > /dev/tcp/$host/443" 2>/dev/null; then
+  exit 0    # no path yet; stay quiet, try again next tick
+fi
+
+echo "$(ts) management reachable, enrolling" >> "$LOG"
+if timeout --kill-after=5 30 netbird up --management-url "$MGMT" --hostname "$HANDLE" \
+     --setup-key "$(cat "$KEYFILE")" >>"$LOG" 2>&1; then
+  echo "$(ts) enrolled; removing key" >> "$LOG"
+  shred -u "$KEYFILE" 2>/dev/null || rm -f "$KEYFILE"
+
+  # Enrolment is what unlocks the update path. The repository is only resolvable and
+  # routable on the mesh, so this source is written here rather than at provisioning
+  # time — an unreachable source makes every apt operation fail.
+  #
+  # Both guards matter, and both were learned the same way: apt fails EVERY operation
+  # on a source with an empty URL, and again on a signed-by keyring that is not there.
+  # This script runs unattended on a box nobody is watching, so it writes nothing it
+  # cannot write correctly.
+{% if octo_apt_repo_url | default('') | length > 0 %}
+  if [ -f "{{ octo_repo_keyring }}" ]; then
+    cat > /etc/apt/sources.list.d/octo-pod.list <<APT
+# octo-pod updates. Reachable only over NetBird.
+deb [signed-by={{ octo_repo_keyring }}] {{ octo_apt_repo_url }} {{ octo_repo_suite }} {{ octo_repo_component }}
+APT
+    echo "$(ts) wrote mesh-only apt source" >> "$LOG"
+  else
+    echo "$(ts) no signing key at {{ octo_repo_keyring }} — no apt source written" >> "$LOG"
+  fi
+{% else %}
+  echo "$(ts) no octo_apt_repo_url in this pod's identity — no apt source written" >> "$LOG"
+{% endif %}
+
+  systemctl disable --now netbird-enrol-pending.timer 2>/dev/null
+else
+  echo "$(ts) enrolment failed, will retry" >> "$LOG"
+fi

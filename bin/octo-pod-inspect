@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""
+octo-pod get, describe, logs and certs: one question about the pod, one answer.
+
+    sudo octo-pod get [KIND] [-o table|wide|json]     one row per item of a kind
+    sudo octo-pod describe <id>                       everything about one item
+    sudo octo-pod logs <id> [-f] [--tail N] [--since T]
+    sudo octo-pod certs [--check] [--days N]          every certificate, and when it ends
+
+READ-ONLY, like status and top. These run podman ps, stats, logs and inspect, netbird
+status, journalctl, openssl x509 and systemctl show, and read the declaration. Nothing
+here starts, stops, writes or renews anything; where a fix exists, it prints the command.
+
+None of this has its own idea of the pod. Rates, problems and the mesh come from octo-pod
+top's collector, and the declaration from octo-pod status's collect(), both loaded from
+beside this file. So `get`, `top` and `status` cannot disagree about what is running.
+
+Why a second way to read the same data: `top` is a screen and `status` is one table.
+Neither answers "tell me everything about radar1" or "which certificate ends first"
+without the operator reading around the answer, and neither is a stable row format a
+script can grep. These are the kubectl shapes people already know.
+"""
+import argparse
+import difflib
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.dont_write_bytecode = True  # never leave __pycache__ inside a verified release dir
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def load_top():
+    """octo-pod top, as a module. Its file name has a dash, so it is not importable."""
+    path = os.path.join(HERE, "octo-pod-top")
+    loader = importlib.machinery.SourceFileLoader("octo_pod_top", path)
+    spec = importlib.util.spec_from_loader("octo_pod_top", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+TOP = load_top()
+STATUS = TOP.load_status()
+clean = TOP.clean   # every string a container or a file wrote goes through this
+
+KINDS = ("flows", "arms", "ingress", "peers", "egress", "bridges", "mesh", "problems", "certs")
+ALIASES = {"flow": "flows", "arm": "arms", "peer": "peers", "destination": "egress",
+           "destinations": "egress", "bridge": "bridges", "problem": "problems",
+           "cert": "certs", "certificate": "certs", "certificates": "certs"}
+BRIDGES = {"uplink": "octo-uplink-bridge", "downlink": "octo-downlink-bridge"}
+# Problems that name an item in words rather than by "<id>:".
+MENTIONS = {"octo-uplink-bridge": "uplink bridge", "octo-downlink-bridge": "downlink bridge",
+            "octo-pen-zenoh-router": "pen router"}
+# The pod's own certificates, by the container that presents them. The audit sinks
+# subscribe with the router's leaf (AUDIT_SUBSCRIBER_CERT in their unit).
+OWN_CERT = {"octo-pen-zenoh-router": "pen-router", "octo-health-pub": "health-publisher",
+            "octo-pen-audit-sink": "pen-router"}
+# An id is also a container suffix and a file name, so the same characters apply. It may
+# carry a kind, like kubectl's arm/radar1, for the rare id that is both an arm and a peer.
+# It must start with a letter or digit: an id is never allowed to become a podman flag.
+ID = re.compile(r"^(?:(arm|peer|egress|bridge|infra|container)/)?([A-Za-z0-9][A-Za-z0-9_.-]*)$")
+# Parts of a key name that mean its value is, or names, a credential. Matched with
+# camelCase split and separators dropped, so setupKey, setup-key and setup_key are one
+# key. `keys` (an egress destination's key expressions, not secrets) still shows.
+SECRET_PARTS = ("secret", "token", "passw", "passphrase", "private", "credential",
+                "setupkey", "apikey", "psk", "bearer")
+# Where certificates live besides the pen's TLS dir: the copies `apply` places so one
+# arm or destination cannot read another's key, the uplink's pen leaf, the downlink
+# bridge's copy, and the slot certificate with the fabric's root, which nothing on the
+# pod renews. A test reads the playbook and fails if it writes certificates elsewhere.
+DEFAULT_COPIES = ("/etc/octo-arm/tls:/etc/octo-arm-*/tls:/etc/octo-egress-*/tls:"
+                  "/etc/octo-pen-uplink:/etc/octo-downlink/tls:/etc/octo-uplink")
+COPIES = os.environ.get("OCTO_POD_CERT_COPIES", DEFAULT_COPIES)
+TIMERS = ("pen-cert-renew.timer", "pen-cert-expiry.timer")
+CA_FILES = ("ca-roots.pem", "ca-root.pem", "root-cert.pem")
+DUE = ("EXPIRED", "renew soon", "unreadable", "missing")
+CERT_GAP = 2   # a copy's row runs to 81 columns with kubectl's 3; a field console has 80
+
+
+def fail(msg, code=1):
+    print(msg, file=sys.stderr)
+    return code
+
+
+# ---------------------------------------------------------------- what the pod declares
+
+def host_vars(name):
+    pod = STATUS.pod_name()
+    doc = STATUS.load(os.path.join(STATUS.ETC, "host_vars", pod, name), {}) if pod else {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def declared():
+    """[(kind, id, entry)] from host_vars, in the order status lists them."""
+    out = []
+    for kind, name, key in (("arm", "30-arms.yml", "arms"), ("peer", "20-peers.yml", "peers"),
+                            ("egress", "40-egress.yml", "egress")):
+        for e in host_vars(name).get(key) or []:
+            if isinstance(e, dict) and e.get("id"):
+                out.append((kind, str(e["id"]), e))
+    return out
+
+
+def arm_container(iid, entry, running):
+    """The arm's container: the running one, else the name its unit would give it."""
+    for pre in STATUS.ARM_PREFIXES:
+        if pre + iid in running:
+            return pre + iid
+    # Same default as templates/arm/octo-arm.container.j2, so a stopped arm still
+    # resolves to the unit whose journal holds its history.
+    kind = entry.get("kind")
+    if f"octo-{kind}-" not in STATUS.ARM_PREFIXES:
+        kind = "udp-ingest" if entry.get("transport") == "udp" else "tcp-ingest"
+    return f"octo-{kind}-{iid}"
+
+
+def catalog(running):
+    """Everything an id can name: declared items, the bridges, pod infrastructure and
+    running containers. Infrastructure is listed whether it runs or not: a stopped
+    router is exactly when someone types `describe pen-zenoh-router`."""
+    items = []
+    decl = declared()
+    for kind, iid, entry in decl:
+        container = None   # a peer runs on its own box
+        if kind == "arm":
+            container = arm_container(iid, entry, running)
+        elif kind == "egress":
+            container = f"octo-egress-{iid}"
+        items.append({"kind": kind, "id": iid, "container": container, "entry": entry})
+    for iid, name in BRIDGES.items():
+        items.append({"kind": "bridge", "id": iid, "container": name, "entry": None})
+    sinks = {f"octo-pen-audit-sink-{iid}" for kind, iid, _ in decl if kind != "egress"}
+    for name in sorted((STATUS.INFRA - set(BRIDGES.values())) | sinks):
+        items.append({"kind": "infra", "id": name.removeprefix("octo-"), "container": name,
+                      "entry": None})
+    claimed = {i["container"] for i in items}
+    for name in sorted(running):
+        if name.startswith("octo-") and name not in claimed:
+            items.append({"kind": "container", "id": name, "container": name, "entry": None})
+    for i in items:   # whose logs `logs` shows: a peer's are its audit sink's
+        i["logs"] = i["container"] or f"octo-pen-audit-sink-{i['id']}"
+        i["up"] = i["logs"] in running
+    return items
+
+
+def resolve(query, resource=None):
+    """(item, None), or (None, exit code) after saying what went wrong and what to try."""
+    m = ID.match(query or "")
+    if not m:
+        return None, fail(f"'{query}' is not an id. An id starts with a letter or digit.\n"
+                          "List them: octo-pod get flows")
+    want_kind, name = m.groups()
+    items = catalog(STATUS.containers())
+    allowed = None
+    if resource is not None:
+        resource = ALIASES.get(resource, resource)
+        groups = {"flows": {"arm", "peer", "egress", "bridge"},
+                  "arms": {"arm", "egress"}, "ingress": {"arm"}, "peers": {"peer"}, "egress": {"egress"},
+                  "bridges": {"bridge"}}
+        if resource not in groups:
+            return None, fail(f"unknown resource type '{resource}'. Choose: "
+                              + ", ".join(groups), 2)
+        allowed = groups[resource]
+    pool = [i for i in items if (not want_kind or i["kind"] == want_kind)
+            and (allowed is None or i["kind"] in allowed)]
+    hits = [i for i in pool if i["id"] == name]
+    if not hits:   # a container name, with or without the octo- prefix
+        hits = [i for i in pool if i["container"] in (name, f"octo-{name}")]
+    if len(hits) == 1:
+        return hits[0], None
+    if hits:
+        return None, fail(f"'{name}' names more than one thing. Say which:\n"
+                          + "".join(f"  {i['kind']}/{i['id']}\n" for i in hits))
+    known = sorted({i["id"] for i in items} | {i["container"] for i in items if i["container"]})
+    # A substring first: "oldarm" should find octo-udp-ingest-oldarm, which is too far
+    # from it for difflib's ratio. Then near misses, for the typo; a weak match is no help.
+    close = [k for k in known if name in k][:3] or difflib.get_close_matches(name, known, n=3,
+                                                                             cutoff=0.75)
+    hint = f"Did you mean: {', '.join(close)}?\n" if close else ""
+    return None, fail(f"nothing on this pod is called '{query}'.\n{hint}"
+                      "List them: octo-pod get flows   (or get arms, peers, egress, bridges)")
+
+
+def secret_key(key):
+    words = re.findall(r"[a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).lower())
+    joined = "".join(words)
+    return bool({"key", "pass", "pwd"} & set(words)) or any(p in joined for p in SECRET_PARTS)
+
+
+def redact(value, key=""):
+    """The declaration with every credential-looking value replaced. A setup key never
+    reaches the screen: this output is exactly what gets pasted into a support request."""
+    if secret_key(key):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {k: redact(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    if isinstance(value, str):
+        if "PRIVATE KEY" in value or "-----BEGIN" in value:
+            return "<redacted>"
+        return re.sub(r"\b([A-Za-z][\w+.-]*://)[^/@\s]+@", r"\1<redacted>@", value)
+    return value
+
+
+# ---------------------------------------------------------------- certificates
+
+def pen_tls():
+    return os.path.join(STATUS.PEN_STATE, "zenoh", "tls")
+
+
+def x509(block):
+    """(subject CN, not-after as a UTC timestamp) for one PEM certificate."""
+    try:
+        p = subprocess.run(["openssl", "x509", "-noout", "-subject", "-enddate"], input=block,
+                           capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    # Subject formats differ by openssl version ("/CN=x", "CN = x", "CN=x"); the CN does not.
+    cn = re.search(r"CN\s*=\s*([^,/\n]+)", p.stdout)
+    end = re.search(r"notAfter=(.+)", p.stdout)
+    try:
+        ts = (datetime.strptime(end.group(1).strip(), "%b %d %H:%M:%S %Y %Z")
+              .replace(tzinfo=timezone.utc).timestamp()) if end else None
+    except ValueError:
+        ts = None
+    return (cn.group(1).strip() if cn else None), ts
+
+
+def owner_of(path, anchor):
+    """Who a certificate belongs to, from where `apply` put it and what it named it."""
+    d, f = os.path.split(path)
+    parent = os.path.basename(os.path.dirname(d))
+    if f == "fabric-ca-root.pem":
+        return "fabric-ca"
+    if anchor and f == f"{anchor}-cert.pem":
+        return "slot"   # both bridges present it to the fabric
+    if f in CA_FILES:
+        return "ca"
+    for pre, kind in (("octo-egress-", "egress"), ("octo-arm-", "arm")):
+        if parent.startswith(pre):
+            return f"{kind}/{parent[len(pre):]}"
+    fixed = {"pod-cert.pem": "pen-router", "health-cert.pem": "health-publisher",
+             "uplink-bridge-cert.pem": "bridge/uplink", "downlink-cert.pem": "bridge/downlink",
+             "downlink-bridge-cert.pem": "bridge/downlink", "arm-cert.pem": "first-party-arm"}
+    if f in fixed:
+        return fixed[f]
+    m = re.match(r"(.+)-(arm|egress)-cert\.pem$", f)
+    if m:
+        return f"{m.group(2)}/{m.group(1)}"
+    m = re.match(r"(.+)-cert\.pem$", f)
+    return f"peer/{m.group(1)}" if m and d == pen_tls() else ""   # the pen names peers so
+
+
+def short(path):
+    """Where a certificate lives, in a few characters: pen/x, egress/<id>/x, slot/x. The
+    full path is in -o wide and json; a long name (a slot anchor) loses its middle."""
+    d, f = os.path.split(path)
+    f = f if len(f) <= 30 else f"{f[:13]}..{f[-15:]}"
+    if d == pen_tls():
+        return f"pen/{f}"
+    base = os.path.basename(os.path.dirname(d) if os.path.basename(d) == "tls" else d)
+    base = base.removeprefix("octo-")
+    for pre in ("egress-", "arm-"):
+        if base.startswith(pre):
+            base = f"{pre[:-1]}/{base[len(pre):]}"
+    return f"{'slot' if base == 'octo-uplink' else base}/{f}"
+
+
+def certificates(days, now=None):
+    """One dict per certificate the pod holds (a CA roots file can hold several), and one
+    per directory that should hold some and cannot be read. A certificate this cannot
+    see must not pass --check, so those rows count as due."""
+    now = now or time.time()
+    decl = {f"{kind}/{iid}" for kind, iid, _ in declared()}
+    anchor = str(host_vars("10-pod.yml").get("fabric_slot_anchor") or "")
+    pen = pen_tls()
+    dirs = [pen] + sorted(d for g in COPIES.split(":") if g for d in glob.glob(g)
+                          if os.path.isdir(d))
+    out = []
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d))   # glob would hide a permission error
+        except OSError as e:
+            out.append({"cert": "pen/" if d == pen else d + "/", "path": d, "dir": True,
+                        "cn": None, "owner": "", "expires": None, "days_left": None,
+                        "status": "missing" if isinstance(e, FileNotFoundError)
+                        else "unreadable"})
+            continue
+        for f in names:
+            if not f.endswith(".pem") or f.endswith("key.pem"):
+                continue   # a private key is not a certificate, and is never read here
+            path = os.path.join(d, f)
+            try:
+                with open(path, errors="replace") as fh:
+                    # An empty or half-written file is a row too: it is due, not absent.
+                    blocks = re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----",
+                                        fh.read(), re.DOTALL) or [None]
+            except OSError:
+                blocks = [None]
+            owner = owner_of(path, anchor)
+            # Removing an arm, peer or destination keeps its certificate for the audit
+            # trail and deletes its key. Nothing presents or renews it again, so it is
+            # listed but never fails --check.
+            retired = (d == pen and owner.split("/")[0] in ("arm", "egress", "peer")
+                       and owner not in decl and not os.path.exists(path[:-8] + "key.pem"))
+            for n, block in enumerate(blocks, 1):
+                cn, end = x509(block) if block else (None, None)
+                left = None if end is None else (end - now) / 86400
+                state = ("retired" if retired else "unreadable" if end is None
+                         else "EXPIRED" if left < 0 else "renew soon" if left < days else "ok")
+                out.append({"cert": short(path) + (f" [{n}/{len(blocks)}]" if len(blocks) > 1
+                                                   else ""),
+                            "path": path, "cn": cn, "owner": owner,
+                            "expires": None if end is None else
+                            datetime.fromtimestamp(end, timezone.utc).strftime("%Y-%m-%d"),
+                            "days_left": None if left is None else int(left),   # -10: ten days ago
+                            "status": state})
+    return out
+
+
+def advice(c):
+    """What to do about one certificate that is due, addressed to whoever can fix it."""
+    if c["status"] == "missing":
+        return f"no {c['path']}: the pen was never built here. Run: sudo octo-pod apply"
+    if c.get("dir"):
+        return f"cannot read {c['path']}: run it with sudo"
+    if c["status"] == "unreadable":
+        return (f"cannot read a certificate in {c['path']}: run it with sudo. If the file "
+                "is empty or cut short, sudo octo-pod apply writes it again")
+    if c["owner"] in ("slot", "fabric-ca"):
+        return (f"{c['cert']} ends {c['expires']}. It is minted off-box and nothing on this "
+                "pod renews it: ask the fabric operator for a new one, then sudo octo-pod apply")
+    if c["owner"] == "ca":
+        return "the pen CA itself is due. pen-cert-renew does not renew a CA: plan a rebuild"
+    return ("renew the pen's leaves now: sudo systemctl start pen-cert-renew.service, "
+            "then sudo octo-pod apply to refresh the copies")
+
+
+def renewal():
+    """What systemd says about the renewal timers, and the last run's own status line."""
+    props = "--property=Id,LoadState,ActiveState,NextElapseUSecRealtime,LastTriggerUSec"
+    text = TOP.sh(["systemctl", "show", *TIMERS, props], timeout=6)
+    units = []
+    for chunk in text.strip().split("\n\n") if text.strip() else []:
+        u = dict(line.split("=", 1) for line in chunk.splitlines() if "=" in line)
+        if u.get("Id"):
+            units.append(u)
+    try:
+        with open(os.path.join(STATUS.PEN_STATE, "cert-renew.status")) as f:
+            last = f.read().strip()
+    except OSError:
+        last = None
+    return {"timers": units, "systemctl": bool(text), "last_run": last}
+
+
+# ---------------------------------------------------------------- the live picture
+
+def collect(kind):
+    """A snapshot from top's collector. Two stats lines per container give the rates."""
+    if kind == "mesh":
+        nb = TOP.sh(["netbird", "status", "--json"], timeout=6)
+        return {"mesh": TOP.parse_mesh(nb) if nb else None}
+    c = TOP.Collector()
+    try:
+        c.poll_once()
+    except Exception as e:   # noqa: BLE001  a view reports what broke; it does not crash
+        snap = c.snapshot()
+        snap["error"] = f"{type(e).__name__}: {e}"
+        return snap
+    return c.snapshot()
+
+
+def problems(snap, rows, now):
+    broke = [("bad", f"could not read the pod: {snap['error']}")] if snap.get("error") else []
+    return broke + TOP.problems(snap, rows, now)
+
+
+def flows(snap):
+    rows = TOP.flow_rows(snap)
+    topics = {(r["type"], r["id"]): r.get("topic") for r in snap.get("rows") or []}
+    for r in rows:
+        r.pop("trend", None)
+        if r["kind"] in ("arm", "egress"):
+            r["direction"] = "ingress" if r["kind"] == "arm" else "egress"
+        r["topic"] = topics.get((r["kind"], r["id"]))
+    return rows
+
+
+def dash(v):
+    """status marks "unknown" with its own character; a table here uses one: -."""
+    return "-" if v in (None, "", "\u2014") else str(v)
+
+
+def flow_cells(r, now):
+    q = (f"{r['pending']}/{r['capacity']}" if r.get("capacity")
+         else "-" if r.get("pending") is None else str(r["pending"]))
+    return {"NAME": r["id"], "KIND": r["kind"], "DIRECTION": r.get("direction", "-"), "STATE": r.get("state") or "-",
+            "IN/s": TOP.fmt_rate(r.get("in")), "OUT/s": TOP.fmt_rate(r.get("out")),
+            "DROP": "-" if r.get("drops") is None else str(r["drops"]),
+            "LAST": TOP.fmt_age(now - r["last"]) if r.get("last") else "-",
+            "QUEUE": q, "CONN": "-" if r.get("consumers") is None else str(r["consumers"]),
+            "CPU": r.get("cpu", "-"), "MEM": r.get("mem", "-"),
+            "SINK": dash(r.get("sink")), "RELEASED": "yes" if r.get("released") else "no",
+            "CERT": dash(r.get("cert")), "TOPIC": dash(r.get("topic")),
+            "WHERE": dash(r.get("where"))}
+
+
+# kind: (columns, extra columns for -o wide)
+COLUMNS = {
+    "flows": (["NAME", "KIND", "STATE", "IN/s", "OUT/s", "DROP", "LAST"],
+              ["QUEUE", "CONN", "CPU", "MEM", "WHERE"]),
+    "arms": (["NAME", "DIRECTION", "STATE", "IN/s", "OUT/s", "DROP", "LAST"],
+             ["RELEASED", "CERT", "SINK", "TOPIC", "WHERE", "CPU", "MEM"]),
+    "ingress": (["NAME", "STATE", "IN/s", "OUT/s", "DROP", "LAST", "RELEASED", "CERT"],
+             ["SINK", "TOPIC", "WHERE", "CPU", "MEM"]),
+    "peers": (["NAME", "STATE", "SINK", "RELEASED", "CERT"], ["TOPIC", "WHERE"]),
+    "egress": (["NAME", "STATE", "IN/s", "OUT/s", "DROP", "CONN", "LAST", "RELEASED"],
+               ["QUEUE", "TOPIC", "WHERE", "CPU", "MEM"]),
+    "bridges": (["NAME", "STATE", "OUT/s", "DROP", "LAST"], ["WHERE", "CPU", "MEM"]),
+    "mesh": (["NAME", "IP", "STATUS", "PATH", "RTT", "HANDSHAKE"], ["RX", "TX"]),
+    "problems": (["SEVERITY", "PROBLEM"], []),
+    "certs": (["CERT", "OWNER", "EXPIRES", "LEFT", "STATUS"], ["SUBJECT CN", "PATH"]),
+}
+
+
+def items_of(kind, wide=False, days=30):
+    """(items for JSON, cells for the table, extra JSON fields)."""
+    now = time.time()
+    if kind == "certs":
+        items = certificates(days, now)
+        return items, cert_cells(items), {}
+    snap = collect(kind)
+    if kind == "mesh":
+        mesh = snap.get("mesh") or {}
+        items = mesh.get("peers") or []
+        # A mesh name can be any length. 24 keeps the row inside 80 columns; wide and
+        # json carry the full name.
+        cells = [{"NAME": p["name"] if wide else p["name"][:24], "IP": p["ip"],
+                  "STATUS": p["status"], "PATH": p["type"],
+                  "RTT": f"{p['latency_ms']:.0f}ms" if p["latency_ms"] else "-",
+                  "HANDSHAKE": TOP.fmt_age(now - p["handshake"]) if p["handshake"] else "-",
+                  "RX": TOP.fmt_bytes(p["rx"]), "TX": TOP.fmt_bytes(p["tx"])} for p in items]
+        return items, cells, {k: v for k, v in mesh.items() if k != "peers"}
+    rows = flows(snap)
+    if kind == "problems":
+        items = [{"severity": s, "text": t} for s, t in problems(snap, rows, now)]
+        return items, [{"SEVERITY": p["severity"], "PROBLEM": p["text"]} for p in items], {}
+    want = {"arms": ("arm", "egress"), "ingress": ("arm",), "peers": ("peer",), "egress": ("egress",),
+            "bridges": ("bridge",)}.get(kind)
+    items = [r for r in rows if not want or r["kind"] in want]
+    return items, [flow_cells(r, now) for r in items], {}
+
+
+def cert_cells(certs):
+    return [{"CERT": c["cert"], "SUBJECT CN": c["cn"] or "-", "OWNER": c["owner"] or "-",
+             "EXPIRES": c["expires"] or "-",
+             "LEFT": "-" if c["days_left"] is None else f"{c['days_left']}d",
+             "STATUS": c["status"], "PATH": c["path"]} for c in certs]
+
+
+def print_table(headers, cells, gap=3):
+    rows = [[clean(c.get(h, "-")) for h in headers] for c in cells]
+    widths = [max([len(h)] + [len(r[i]) for r in rows]) for i, h in enumerate(headers)]
+    for line in [headers] + rows:
+        print((" " * gap).join(v.ljust(w) for v, w in zip(line, widths)).rstrip())
+
+
+def cmd_get(args):
+    kind = ALIASES.get(args.kind, args.kind)
+    if kind not in KINDS:
+        return fail(f"unknown kind '{args.kind}'. Kinds: {', '.join(KINDS)}", 2)
+    items, cells, extra = items_of(kind, wide=args.output == "wide")
+    if args.output == "json":
+        print(json.dumps({"kind": kind, **extra, "items": items}, indent=2, default=str))
+        return 0
+    if not items:
+        what = ("no netbird status (agent missing, or not root)"
+                if kind == "mesh" and not extra else f"no {'ingress arms' if kind == 'ingress' else kind} on this pod")
+        return fail(what, 0)
+    cols, wide = COLUMNS[kind]
+    print_table(cols + (wide if args.output == "wide" else []), cells, gap=CERT_GAP
+                if kind == "certs" and args.output != "wide" else 3)
+    return 0
+
+
+# ---------------------------------------------------------------- describe
+
+def section(title, lines):
+    print(f"{title}:")
+    for ln in lines or ["<none>"]:
+        print(f"  {clean(ln)}")
+
+
+def recent(name, running, n=10):
+    """The last n lines that are not stats lines: Flow already has those numbers, and a
+    bridge logs nothing else, so ten raw lines would bury an error from eleven minutes
+    ago. From podman while the container runs; once it stops, from its unit's journal,
+    because every pod container runs with --rm and podman forgets it."""
+    if running:
+        cmd, err = ["podman", "logs", "--tail", "300", "--", name], subprocess.STDOUT
+    else:
+        cmd = ["journalctl", "-q", "-u", f"{name}.service", "-n", "300", "--no-pager", "-o", "cat"]
+        err = subprocess.DEVNULL
+    try:   # both streams from podman: an arm logs to stderr as often as to stdout
+        p = subprocess.run(cmd, timeout=10, stdout=subprocess.PIPE, stderr=err, text=True,
+                           errors="replace", check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if p.returncode != 0:
+        return []
+    return [ln for ln in p.stdout.splitlines() if ln.strip() and not TOP.parse_stats(ln)][-n:]
+
+
+def cmd_describe(args):
+    item, code = resolve(args.name or args.id, args.id if args.name else None)
+    if not item:
+        return code
+    kind, iid = item["kind"], item["id"]
+    snap = collect("flows")
+    now = time.time()
+    rows = flows(snap)
+    row = next((r for r in rows if (r["kind"], r["id"]) == (kind, iid)
+                or (r.get("container") and r["container"] == item["container"])), {})
+    pod = (snap.get("pod") or {}).get("pod") or "(no identity)"
+    print(f"Name:   {iid}\nKind:   {kind}\nPod:    {clean(pod)}\n")
+
+    if item["entry"] is not None:
+        import yaml   # status already requires it, and says how to install it
+        text = yaml.safe_dump(redact(item["entry"]), sort_keys=False, default_flow_style=False)
+        section("Declaration", text.rstrip().splitlines())
+    else:
+        section("Declaration", {
+            "container": ["nothing declares this; see 'octo-pod status' for orphans"],
+            "infra": ["pod infrastructure: apply runs it"]}.get(
+                kind, ["built in: apply runs it when the pod needs it"]))
+
+    running = snap.get("running") or {}
+    name = item["logs"]
+    cpu, mem = (snap.get("usage") or {}).get(name, ("-", "-"))
+    container = [f"Name:    {name}", f"State:   {running.get(name, 'not running')}",
+                 f"CPU:     {cpu}", f"Memory:  {mem}"]
+    if kind == "peer":
+        container.insert(0, "a peer runs on its own box; this is its audit sink here")
+    print()
+    section("Container", container)
+
+    print()
+    if row.get("last"):
+        totals = row.get("totals") or {}
+        q = row.get("pending")
+        section("Flow", [
+            f"In:          {TOP.fmt_rate(row.get('in'))}/s",
+            f"Out:         {TOP.fmt_rate(row.get('out'))}/s",
+            f"Drops:       {'-' if row.get('drops') is None else row['drops']} in the last period",
+            f"Queue:       {'-' if q is None else q}"
+            + (f"/{row['capacity']}" if row.get("capacity") else ""),
+            f"Consumers:   {'-' if row.get('consumers') is None else row['consumers']}",
+            (f"Last stats:  {TOP.fmt_age(now - row['last'])} ago, every "
+             f"{TOP.fmt_age(row.get('period', 60))}"),
+            "Counters since the container started:"]
+            + [f"  {k:<20} {totals[k]}" for k in sorted(totals)])
+    elif kind == "peer":
+        section("Flow", ["a peer publishes from its own box, so this pod logs no stats "
+                         "for it; its audit sink records what arrived"])
+    elif name.startswith(TOP.QUIET):
+        section("Flow", ["this container logs no stats line"])
+    else:
+        section("Flow", ["no stats line in the last 30 minutes"])
+
+    print()
+    own = next((o for c, o in OWN_CERT.items() if kind == "infra" and name.startswith(c)), None)
+    owners = {f"{kind}/{iid}", own} | ({"slot"} if kind == "bridge" else set())
+    certs = [c for c in certificates(30, now) if c["owner"] in owners]
+    section("Certificate", [f"{c['cert']}  CN={c['cn'] or '-'}  not after {c['expires'] or '-'}"
+                            f"  ({'-' if c['days_left'] is None else c['days_left']} days, "
+                            f"{c['status']})" for c in certs]
+            or ["none signed by the pen for this item"])
+
+    # Its own problems, plus the ones that make every answer here wrong (not root).
+    starts = (f"{iid}:", f"orphan {name} ", "not root", "could not read")
+    found = [f"{'!!' if s == 'bad' else ' !'} {t}" for s, t in problems(snap, rows, now)
+             if t.startswith(starts) or (MENTIONS.get(name) or "\0") in t]
+    print()
+    section("Problems", found)
+
+    print()
+    lines = recent(name, name in running)
+    if name not in running and lines:
+        lines.insert(0, "(not running: these are from its unit's journal)")
+    section("Recent log lines (last 10, stats lines left out)", lines)
+
+    dig = [f"sudo octo-pod logs {kind}/{iid} -f",
+           f"sudo podman logs -f --tail 50 {name}" if name in running
+           else f"sudo journalctl -u {name} -n 50", f"sudo systemctl status {name}"]
+    if kind == "egress":
+        dig.append("sudo octo-pod egress check")
+    if kind in ("arm", "peer", "egress"):
+        dig.append("sudo octo-pod verify")
+    print()
+    section("Dig further (copy and run)", dig)
+    return 0
+
+
+# ---------------------------------------------------------------- logs, certs
+
+def journal_time(t):
+    """podman's --since in journalctl's words: 10m is -10m; an RFC 3339 time drops T and Z."""
+    if re.fullmatch(r"([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+", t):
+        return f"-{t}"
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\d)T(\d\d:\d\d(?::\d\d)?)(?:\.\d+)?Z", t)
+    return f"{m.group(1)} {m.group(2)} UTC" if m else t
+
+
+def cmd_logs(args):
+    item, code = resolve(args.name or args.id, args.id if args.name else None)
+    if not item:
+        return code
+    if args.tail < 0:
+        return fail("--tail takes a number of lines, 0 or more", 2)
+    if args.since and not re.match(r"^[0-9][0-9A-Za-z:.+-]*$", args.since):
+        return fail(f"--since '{args.since}' is not a time: use 10m, 2h or "
+                    "2026-01-31T10:00:00Z", 2)
+    name = item["logs"]
+    if item["kind"] == "peer":
+        print(f"{item['id']} is a peer: it runs on its own box, so these are the logs of its "
+              f"audit sink here, {name}.", file=sys.stderr)
+    if item["up"]:
+        argv = ["podman", "logs", "--tail", str(args.tail)]
+        argv += ["-f"] if args.follow else []
+        argv += ["--since", args.since] if args.since else []
+        argv += ["--", name]   # "--": a name can never be a flag
+    else:
+        # Every pod container runs with --rm, so podman forgets one that stopped. Its
+        # unit's journal still has what it printed, which is what a crash needs.
+        print(f"{name} is not running; these are its unit's journal lines.", file=sys.stderr)
+        argv = ["journalctl", "-u", f"{name}.service", "-n", str(args.tail), "--no-pager",
+                "-o", "cat"]
+        argv += ["-f"] if args.follow else []
+        argv += [f"--since={journal_time(args.since)}"] if args.since else []
+    sys.stdout.flush()
+    try:
+        # A successful exec replaces this process; make the tail call explicit.
+        return os.execvp(argv[0], argv)
+    except OSError as e:
+        return fail(f"cannot run {argv[0]}: {e}. Is this a pod?")
+
+
+def cmd_certs(args):
+    certs = certificates(args.days)
+    if certs:
+        print_table(COLUMNS["certs"][0], cert_cells(certs), gap=CERT_GAP)
+    else:
+        print(f"no certificates under {pen_tls()} (the pen was never built: "
+              "sudo octo-pod apply)", file=sys.stderr)
+    for c in certs:
+        if c.get("dir") and not args.check:   # --check says it once, below
+            print(advice(c), file=sys.stderr)
+    r = renewal()
+    print()
+    if not r["systemctl"]:
+        print("renewal timer: unknown here (no systemd). On the pod: "
+              "systemctl list-timers 'pen-cert-*'")
+    for u in r["timers"]:
+        if u.get("LoadState") != "loaded":
+            print(f"{u['Id']}: not installed. sudo octo-pod apply installs it.")
+        else:
+            print(f"{u['Id']}: {u.get('ActiveState', '?')}, next "
+                  f"{u.get('NextElapseUSecRealtime') or '-'}\n"
+                  f"  last ran {u.get('LastTriggerUSec') or 'never'}")
+    if r["last_run"]:
+        print(f"last renewal run: {clean(r['last_run'])}")
+    if not args.check:
+        return 0
+    due = [c for c in certs if c["status"] in DUE]
+    if not due and not any(c["expires"] for c in certs):
+        return fail("\nno certificate was read, so none can be shown to be valid.", 1)
+    if due:
+        todo = list(dict.fromkeys(advice(c) for c in due))
+        return fail(f"\n{len(due)} certificate(s) or directories expired, unreadable or "
+                    f"ending within {args.days} days:\n" + "".join(f"  {t}\n" for t in todo), 1)
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    ap = argparse.ArgumentParser(prog="octo-pod", description="Read-only views of this pod.")
+    sub = ap.add_subparsers(dest="verb", required=True)
+    g = sub.add_parser("get", help="one row per item of a kind")
+    g.add_argument("kind", nargs="?", default="flows", help=", ".join(KINDS))
+    g.add_argument("-o", "--output", choices=("table", "wide", "json"), default="table")
+    d = sub.add_parser("describe", help="everything about one item")
+    d.add_argument("id", help="an arm, peer or egress id, uplink, downlink, or a container")
+    d.add_argument("name", nargs="?", help="item name when preceded by a resource type")
+    lg = sub.add_parser("logs", help="podman logs for one item")
+    lg.add_argument("id", help="item name, or resource type followed by name")
+    lg.add_argument("name", nargs="?", help="item name when preceded by a resource type")
+    lg.add_argument("-f", "--follow", action="store_true")
+    lg.add_argument("--tail", type=int, default=100)
+    lg.add_argument("--since")
+    c = sub.add_parser("certs", help="every certificate this pod holds")
+    c.add_argument("--check", action="store_true", help="exit 1 if any is due")
+    c.add_argument("--days", type=int, default=30, help="what counts as due (default 30)")
+    args = ap.parse_args(argv)
+    # Without root, podman lists none of the pod's containers and the pen's files are
+    # closed, so every row would read "not running" and look authoritative. Say so first.
+    if os.geteuid() != 0:
+        print("not root: podman and the pen's files are hidden from this user, so this view "
+              f"is incomplete. Run: sudo octo-pod {shlex.join(argv)}", file=sys.stderr)
+    return {"get": cmd_get, "describe": cmd_describe, "logs": cmd_logs,
+            "certs": cmd_certs}[args.verb](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,44 @@
+# sapient-proto — the BSI Flex 335 v2.0 definitions, compiled once for every crate that
+# speaks SAPIENT.
+#
+# The `sapient` session arm, which holds the conversation, and any translator that turns
+# SAPIENT into other formats and back need the same types. A library crate keeps one
+# vendored copy of the definitions and one build script, so they cannot disagree about
+# the wire format. It is not part of `common`: every arm links
+# `common`, and only these two need protobuf.
+#
+# The definitions are VENDORED under proto/ and compiled at build time by protox, a
+# pure-Rust protobuf compiler, so the builder image and CI need no protobuf toolchain.
+
+[package]
+name = "sapient-proto"
+version = "0.1.0"
+publish = false
+description = "octo-pod: the vendored BSI Flex 335 v2.0 SAPIENT definitions as Rust types"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+# The standard's comments become doc comments, and rustdoc reads their indented prose as
+# Rust to compile. There is no hand-written example in this crate for a doctest to check.
+doctest = false
+
+[dependencies]
+# The generated code derives prost::Message; prost-types carries google.protobuf.Timestamp,
+# which every SapientMessage header sets.
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[features]
+descriptor = []
+
+[build-dependencies]
+prost = { workspace = true }
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[lints]
+workspace = true

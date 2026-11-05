@@ -1,0 +1,81 @@
+---
+# octo-pod — write /etc/octo-pod. The pod's identity, and nothing else.
+#
+#   ansible-playbook -i <tmp-inventory> write-identity.yml -e pod_name=<name>
+#   ...usually reached as: octo-pod init --pod <name>
+#
+# WHY THIS IS ANSIBLE AND NOT A SCRIPT. Writing six files, none of which may clobber an
+# operator's edits, is `template:` with `force: false` — and hand-rolling that in Python
+# reimplemented idempotence badly and gave up --check and --diff for nothing. The
+# identity is DECLARED STATE, so it is described rather than produced.
+#
+# WHAT IT MUST NEVER DO: touch a file that already exists. /etc/octo-pod is the one
+# thing an upgrade cannot replace, and an operator's edits to their own pod's
+# declaration outrank anything this play believes. Every task here is force: false, so
+# re-running is safe and reports "ok" rather than overwriting a pod's arms with [].
+#
+# `init` uses this play for a local identity with empty fabric addresses.
+# `join` uses octo-pod-identity with a manifest; both paths must preserve operator files.
+- name: write octo-pod identity
+  hosts: octopod
+  become: true
+  gather_facts: false
+
+  vars:
+    octo_pod_etc: "{{ lookup('env', 'OCTO_POD_ETC') | default('/etc/octo-pod', true) }}"
+
+  tasks:
+    - name: identity — the pod name is a valid handle
+      ansible.builtin.assert:
+        that:
+          - pod_name is defined
+          - pod_name is match('^[a-z0-9][a-z0-9-]*$')
+        fail_msg: >-
+          pod_name must be lowercase letters, digits and dashes, starting with a letter
+          or digit. It becomes a directory name, an inventory host, part of a certificate
+          subject, and this pod's name on a mesh if it ever joins one — those must all be
+          the same string, so it is refused here rather than at issuance.
+        quiet: true
+
+    - name: identity — directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ octo_pod_etc }}"
+        - "{{ octo_pod_etc }}/host_vars/{{ pod_name }}"
+
+    # force: false on every one. A second run must not overwrite a pod's own
+    # declaration — that is the difference between converging an identity and erasing
+    # one, and `octo-pod init` on a live pod would otherwise blank its arms.
+    - name: identity — inventory
+      ansible.builtin.template:
+        src: identity/inventory.ini.j2
+        dest: "{{ octo_pod_etc }}/inventory.ini"
+        mode: "0644"
+        force: false
+
+    - name: identity — the pod's own files
+      ansible.builtin.template:
+        src: "identity/{{ item }}.j2"
+        dest: "{{ octo_pod_etc }}/host_vars/{{ pod_name }}/{{ item }}"
+        mode: "0644"
+        force: false
+      loop:
+        - 00-site.yml
+        - 05-fabric.yml
+        - 10-pod.yml
+        - 20-peers.yml
+        - 30-arms.yml
+
+    # Reported, not silent: a pod with no slot is a complete and supported shape, and an
+    # operator who expected an upstream should learn it here rather than from a bridge
+    # that never starts.
+    - name: identity — what this pod can and cannot do
+      ansible.builtin.debug:
+        msg: >-
+          identity written for '{{ pod_name }}' at {{ octo_pod_etc }}.
+          {{ 'This pod holds an upstream slot and can release data onward.'
+             if (upstream_anchor | default('')) | length > 0
+             else 'No upstream slot: this pod captures and retains locally, and releases nothing. That is a complete pod.' }}

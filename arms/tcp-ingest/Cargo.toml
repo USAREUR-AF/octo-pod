@@ -1,0 +1,32 @@
+# tcp-ingest — octo-pod arm #2. Thin binary: TCP wire protocol + framing
+# only; session/keying/gating/stats come from octo-arm-common.
+#
+# Built for the legacy-TCP-feed class: SAPIENT (protobuf over TCP),
+# CoT-over-TCP, line protocols, and raw stream capture.
+
+[package]
+name = "tcp-ingest"
+version = "0.1.0"
+# Never goes to crates.io: these are binaries baked into container images. Saying so is
+# also what lets cargo-deny accept the workspace path dependency — crates.io forbids
+# path deps, so a crate that CLAIMS to be publishable while using one is a real defect.
+publish = false
+description = "octo-pod TCP ingest arm: labeled TCP listeners with pluggable framing (newline / u32 length-prefix / raw stream) to native mTLS Zenoh publish"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tcp-ingest"
+path = "src/main.rs"
+
+[dependencies]
+octo-arm-common = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

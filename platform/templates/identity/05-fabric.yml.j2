@@ -1,0 +1,21 @@
+# THE FABRIC THIS POD JOINS — mesh, upstream, updates. From the token, or empty.
+#
+# These name one deployment's hosts, which is why they are here and not in the platform
+# layer: that layer ships unchanged to every site, and no site should be handed the
+# addresses of a fabric it is not part of.
+#
+# EMPTY IS LEGITIMATE. A pod that captures and retains locally needs none of them, and
+# each is checked at the step that actually uses it rather than at the top of a run.
+#   netbird_mgmt_host   the mesh, when 'join --mgmt' does not name one
+#   fabric_endpoint       tls/<zenoh host>:7447 — where the bridge publishes
+#   fabric_host_pins      mesh DNS for the above; resolvable nowhere else
+#   fabric_portal_url     where topics and schemas are registered
+#   octo_repo_url       release files (LATEST + tarball) for 'octo-pod upgrade'
+#   octo_apt_repo_url   an APT repository, if one exists. Not the same surface —
+#                       an apt source pointed at the file surface breaks all of apt.
+netbird_mgmt_host: "{{ netbird_mgmt_host_in | default('') }}"
+fabric_endpoint: "{{ fabric_endpoint_in | default('') }}"
+fabric_host_pins: {{ fabric_host_pins_in | default([]) | to_yaml }}
+fabric_portal_url: "{{ fabric_portal_url_in | default('') }}"
+octo_repo_url: "{{ octo_repo_url_in | default('') }}"
+octo_apt_repo_url: "{{ octo_apt_repo_url_in | default('') }}"

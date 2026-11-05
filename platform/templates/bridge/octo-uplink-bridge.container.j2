@@ -1,0 +1,41 @@
+# /etc/containers/systemd/octo-uplink-bridge.container  MANAGED BY ANSIBLE
+{#
+   The sync leg: the uplink bridge (arms/uplink-bridge) republishes the pen namespaces in
+   bridge_allow upstream under this pod's slot anchor. Its environment names are the ones
+   arms/uplink-bridge/src/main.rs reads; they change together.
+#}
+
+[Unit]
+Description=octo-pod uplink bridge (bridge_allow to the fabric as slot {{ fabric_slot_anchor }})
+After=octo-pen-zenoh-router.service network-online.target
+Wants=octo-pen-zenoh-router.service network-online.target
+
+[Container]
+Image={{ uplink_bridge_image }}
+ContainerName=octo-uplink-bridge
+# Host networking on purpose, as under compose: the bridge reaches the pen on this host
+# and the fabric over the mesh, and resolves the fabric through this host's pins.
+Network=host
+Environment=BRIDGE_PEN_ENDPOINT=tls/{{ mesh_ip }}:{{ pen_listen_port }}
+Environment=BRIDGE_PEN_CERT={{ sub_leaf_dir }}/uplink-bridge-cert.pem
+Environment=BRIDGE_PEN_KEY={{ sub_leaf_dir }}/uplink-bridge-key.pem
+Environment=BRIDGE_PEN_ROOT_CA={{ sub_leaf_dir }}/root-cert.pem
+Environment=BRIDGE_FABRIC_ENDPOINT={{ fabric_endpoint }}
+Environment=BRIDGE_FABRIC_CERT={{ fabric_uplink_dir }}/{{ fabric_slot_anchor }}-cert.pem
+Environment=BRIDGE_FABRIC_KEY={{ fabric_uplink_dir }}/{{ fabric_slot_anchor }}-key.pem
+Environment=BRIDGE_FABRIC_ROOT_CA={{ fabric_uplink_dir }}/fabric-ca-root.pem
+Environment=BRIDGE_SLOT_PREFIX={{ fabric_slot_anchor }}
+Environment=BRIDGE_ALLOW={{ bridge_allow }}
+Environment=BRIDGE_VERIFY_NAME_PEN=false
+Environment=BRIDGE_VERIFY_NAME_FABRIC=true
+Environment=RUST_LOG=info
+Volume={{ sub_leaf_dir }}:{{ sub_leaf_dir }}:ro
+Volume={{ fabric_uplink_dir }}:{{ fabric_uplink_dir }}:ro
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

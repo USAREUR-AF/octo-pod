@@ -1,0 +1,1023 @@
+#!/usr/bin/env python3
+"""
+octo-pod top: a live view of this pod. What is moving, what is declared, who is on the mesh.
+
+    sudo octo-pod top              the live screen (q quits, ? lists the keys)
+    sudo octo-pod top --once       one snapshot of the flows, as plain text
+    sudo octo-pod top --json       the same snapshot for a machine
+
+READ-ONLY. It runs podman ps, podman stats, podman logs and netbird status, and reads the
+declaration. It never starts, stops or changes anything, so it is safe to leave
+running on a pod that is serving. Where a fix exists, the detail view prints the
+command and leaves running it to you.
+
+Where the numbers come from. Every arm, bridge and egress destination already logs a
+stats line once a period (60 s by default) with cumulative counters. This reads those
+lines out of podman's logs and takes the difference between the last two, so a rate is
+"per second over the last period", not a guess, and a pod needs no new port, metrics
+endpoint or agent for it. The first screen already has rates, because the last half
+hour of stats lines is read on start. A counter that goes DOWN means the container
+restarted; that interval shows no rate rather than a negative one.
+
+Three line shapes exist, all cumulative:
+
+    arms      stats received=.. forwarded=.. sent=.. dropped_*=.. pending=..
+    bridges   uplink stats forwarded=.. forward_errors=.. (downlink: dropped_gate=..)
+    egress    egress stats dest=<url> stats={"received":..,"sent":..,"consumers_connected":..}
+
+The declared half (what should exist, release, certificates, orphans) is
+octo-pod status's own collect(), loaded from beside this file, so the two commands
+cannot disagree about what the pod was told to do.
+"""
+import argparse
+import collections
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+
+sys.dont_write_bytecode = True  # never leave __pycache__ inside a verified release dir
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+HISTORY = "30m"          # stats read on start, so the first screen already has rates
+FAST, SLOW = 2.0, 10.0   # seconds between podman ps / logs, and status / mesh
+
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# What is left once colour is gone: every control character but tab, C1 included.
+CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
+STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z")
+PAIR = re.compile(r"(\w+)=(\S+)")
+BRIDGES = {"octo-uplink-bridge": "up", "octo-downlink-bridge": "down"}
+# Containers that never log a stats line. Not polled, so a pod with many of them does
+# not pay for logs nobody reads.
+QUIET = ("octo-registry", "octo-pen-zenoh-router", "octo-health-pub", "octo-pen-audit-sink")
+# Faults, not choices. `skipped` is left out on purpose: a translator that has no form
+# for a unit skips it by design, and counting it here would make a healthy SAPIENT
+# destination look like it is losing data.
+DROP_KEYS = ("dropped_source", "dropped_overflow", "dropped_stale", "dropped_egress",
+             "dropped_invalid", "dropped_key", "dropped_slow", "dropped_gate",
+             "forward_errors", "send_errors", "audit_errors", "dest_mismatch",
+             "refused_entries")
+STAGES = {"in": 0, "up": 1, "down": 2, "out": 3, "?": 4}
+
+
+def load_status():
+    """octo-pod status, as a module. Its file name has a dash, so it is not importable."""
+    path = os.path.join(HERE, "octo-pod-status")
+    loader = importlib.machinery.SourceFileLoader("octo_pod_status", path)
+    spec = importlib.util.spec_from_loader("octo_pod_status", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def sh(cmd, timeout=10):
+    """stdout, or "" on any failure. A view must never fail because one source did.
+    A container can log any bytes, so one that is not UTF-8 becomes U+FFFD, not a crash."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, check=False)
+        return p.stdout if p.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def clean(text):
+    """Text a container wrote, safe to print. Colour is dropped; any other escape or
+    control character is shown as \\xNN rather than obeyed, so a log line cannot set the
+    operator's clipboard (OSC 52), retitle or reset their terminal."""
+    return CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", ANSI.sub("", str(text)))
+
+
+# ---------------------------------------------------------------- parsing (pure)
+
+def parse_ts(text):
+    m = STAMP.match(text)
+    if not m:
+        return None
+    frac = (m.group(2) or ".0")[:7]   # strptime takes six digits; tracing writes more
+    try:
+        dt = datetime.strptime(m.group(1) + frac, "%Y-%m-%dT%H:%M:%S.%f")
+    except ValueError:   # month 13 has the shape of a date, not the meaning
+        return None
+    return dt.replace(tzinfo=timezone.utc).timestamp()
+
+
+def parse_stats(line):
+    """(timestamp, counters) for a stats line, else None. Counters are ints only."""
+    line = ANSI.sub("", line).strip()
+    if " stats " not in f" {line} ":
+        return None
+    ts = parse_ts(line)
+    if ts is None:
+        return None
+    counters = {}
+    blob = line.find("stats={")
+    if blob >= 0:
+        try:
+            counters = {k: v for k, v in json.loads(line[blob + 6:]).items()
+                        if isinstance(v, int) and not isinstance(v, bool)}
+        except ValueError:
+            return None
+        line = line[:blob]
+    for k, v in PAIR.findall(line):
+        if v.isascii() and v.isdigit():   # "²".isdigit() is True; int("²") raises
+            counters[k] = int(v)
+        elif k == "dest":
+            counters.setdefault("_dest", v)
+    numeric = {k: v for k, v in counters.items() if not k.startswith("_")}
+    return (ts, counters) if numeric else None
+
+
+class Series:
+    """The stats lines one container has logged, oldest first."""
+
+    def __init__(self, cap=64):
+        self.samples = collections.deque(maxlen=cap)
+
+    def add(self, ts, counters):
+        if not self.samples or ts > self.samples[-1][0]:
+            self.samples.append((ts, counters))
+
+    def last(self):
+        return self.samples[-1] if self.samples else (None, {})
+
+    def period(self):
+        if len(self.samples) < 2:
+            return 60.0
+        gaps = sorted(b[0] - a[0] for a, b in zip(self.samples, list(self.samples)[1:]))
+        return max(gaps[len(gaps) // 2], 1.0)
+
+    @staticmethod
+    def _rate(a, b, keys):
+        (t0, c0), (t1, c1) = a, b
+        if t1 <= t0 or not any(k in c1 for k in keys):
+            return None
+        d = sum(c1.get(k, 0) for k in keys) - sum(c0.get(k, 0) for k in keys)
+        return None if d < 0 else d / (t1 - t0)   # down means a restart, not a rate
+
+    def rate(self, *keys):
+        if len(self.samples) < 2:
+            return None
+        return self._rate(self.samples[-2], self.samples[-1], keys)
+
+    def delta(self, keys):
+        if len(self.samples) < 2:
+            return None
+        (_, c0), (_, c1) = self.samples[-2], self.samples[-1]
+        if not any(k in c1 for k in keys):
+            return None
+        d = sum(c1.get(k, 0) for k in keys) - sum(c0.get(k, 0) for k in keys)
+        return None if d < 0 else d
+
+    def trend(self, *keys):
+        s = list(self.samples)
+        return [self._rate(a, b, keys) for a, b in zip(s, s[1:])]
+
+
+def out_keys(counters, stage):
+    """What 'leaving' means for this container. An arm forwards to the pen; an egress
+    destination and an arm that relays to a peer send on a socket; a bridge forwards."""
+    if stage == "out" or counters.get("sent"):
+        return ("sent",)
+    return ("forwarded",)
+
+
+def flow_of(series, stage):
+    ts, c = series.last()
+    out = out_keys(c, stage)
+    in_rate = series.rate("received") if "received" in c else None
+    if stage == "out" and not c.get("received") and c.get("sent"):
+        in_rate = None   # this destination does not count what it takes from the pen
+    return {
+        "in": in_rate,
+        "out": series.rate(*out),
+        "drops": series.delta(DROP_KEYS),
+        "pending": c.get("pending"),
+        "capacity": c.get("outbox_capacity"),
+        "consumers": c.get("consumers_connected"),
+        "last": ts,
+        "period": series.period(),
+        "trend": series.trend(*out),
+        "totals": {k: v for k, v in c.items() if not k.startswith("_")},
+    }
+
+
+def short_state(state):
+    """'Up 27 hours (healthy)' -> 'up 27h'. Anything unrecognised is passed through."""
+    s = (state or "").strip()
+    m = re.match(r"(?i)up (\d+|about an?|less than an?) (second|minute|hour|day|week|month)",
+                 s)
+    if m:
+        n = m.group(1)
+        n = n if n.isdigit() else ("0" if n.lower().startswith("less") else "1")
+        return f"up {n}{ {'month': 'mo'}.get(m.group(2).lower(), m.group(2)[0].lower()) }"
+    m = re.match(r"(?i)exited \((\d+)\)", s)
+    if m:
+        return f"exited({m.group(1)})"
+    return s.lower() if s.lower().startswith(("up", "created", "paused")) else s
+
+
+# ---------------------------------------------------------------- model (pure)
+
+def flow_rows(snap):
+    """One row per thing that moves data: declared arms, peers and egress destinations,
+    the two bridges, and anything else running that logs stats. Ordered the way data
+    moves: in, up to the fabric, down from it, out."""
+    status_mod = snap.get("status_mod")
+    prefixes = getattr(status_mod, "ARM_PREFIXES", ("octo-udp-ingest-",))
+    running, series = snap["running"], snap["series"]
+    rows, claimed = [], set()
+    # A bridge the pod needs is a row even when it is down: the uplink whenever the pod
+    # holds a slot, the downlink when it also has a destination (apply's conditions).
+    # Leaving the row out would hide the one thing that is broken.
+    slot = bool((snap.get("pod") or {}).get("slot"))
+    needed = {"up": slot, "down": slot and any(
+        r["type"] == "egress" and r["state"] != "disabled" for r in snap.get("rows") or [])}
+
+    for r in snap.get("rows") or []:
+        container = None
+        if r["type"] == "arm":
+            container = next((p + r["id"] for p in prefixes if p + r["id"] in running), None)
+        elif r["type"] == "egress":
+            container = f"octo-egress-{r['id']}"
+        if container:
+            claimed.add(container)
+        stage = "out" if r["type"] == "egress" else "in"
+        row = {"stage": stage, "id": r["id"], "kind": r["type"], "container": container,
+               "state": short_state(r["state"]), "where": r["transport"],
+               "released": r["released"], "sink": r["sink"], "cert": r["cert"]}
+        if container in series:
+            row.update(flow_of(series[container], stage))
+        rows.append(row)
+
+    for name, stage in BRIDGES.items():
+        if name in running or name in series or needed[stage]:
+            claimed.add(name)
+            row = {"stage": stage, "id": f"{stage}link", "kind": "bridge", "container": name,
+                   "state": short_state(running.get(name, "NOT RUNNING")),
+                   "where": snap.get("endpoint") or "fabric" if stage == "up"
+                   else "fabric -> egress"}
+            if name in series:
+                row.update(flow_of(series[name], stage))
+            rows.append(row)
+
+    for name in sorted(series):
+        if name in claimed:
+            continue
+        stage = "out" if name.startswith("octo-egress-") else "?"
+        row = {"stage": stage, "id": name.removeprefix("octo-"), "kind": "undeclared",
+               "container": name, "state": short_state(running.get(name, "gone")),
+               "where": series[name].last()[1].get("_dest", "")}
+        row.update(flow_of(series[name], stage))
+        rows.append(row)
+
+    usage = snap.get("usage") or {}
+    for r in rows:
+        if r.get("container") in usage:
+            r["cpu"], r["mem"] = usage[r["container"]]
+    rows.sort(key=lambda r: STAGES.get(r["stage"], 9))
+    return rows
+
+
+def problems(snap, rows, now):
+    """(severity, text) for everything an operator should look at. 'bad' is broken;
+    'warn' is worth a look and may be fine."""
+    out = []
+    if not snap.get("root"):
+        out.append(("bad", "not root: podman shows no pod containers. Run it with sudo"))
+    if snap.get("no_identity"):
+        out.append(("warn", "no pod identity yet: octo-pod join <token>"))
+    pod = snap.get("pod") or {}
+    if pod and not str(pod.get("router", "")).lower().startswith("up"):
+        out.append(("bad", "pen router is not running: nothing is captured"))
+    if pod.get("slot") and not pod.get("bridge_container"):
+        out.append(("bad", "slot held but the uplink bridge is not running"))
+    for name, state in pod.get("orphans") or []:
+        out.append(("bad", f"orphan {name} ({state}): running, nothing declares it"))
+    for r in rows:
+        rid = r["id"]
+        if r.get("state", "").upper() == "NOT RUNNING":
+            if r["kind"] != "bridge":
+                out.append(("bad", f"{rid}: declared, not running"))
+            elif rid == "downlink":   # the uplink has its own line above
+                out.append(("bad", "egress declared but the downlink bridge is not running"))
+            continue
+        if r.get("sink") == "DOWN":
+            out.append(("bad", f"{rid}: its audit sink is not subscribed"))
+        if r.get("drops"):
+            out.append(("warn", f"{rid}: {r['drops']} dropped or failed in the last period"))
+        last = r.get("last")
+        if last and now - last > 3 * r.get("period", 60) + 30:
+            out.append(("warn", f"{rid}: no stats line for {fmt_age(now - last)}"))
+        if r.get("consumers") == 0 and str(r.get("where", "")).startswith("tcp-server"):
+            out.append(("warn", f"{rid}: no consumer connected"))
+        totals = r.get("totals") or {}
+        if r.get("pending") and r.get("capacity") and r["pending"] >= 0.8 * r["capacity"]:
+            out.append(("warn", f"{rid}: outbox {r['pending']}/{r['capacity']}, near full"))
+        if totals.get("pen_outages"):
+            out.append(("warn", f"{rid}: lost the pen {totals['pen_outages']} time(s)"))
+        cert = r.get("cert") or ""
+        if re.match(r"\d{4}-\d\d-\d\d$", cert):
+            left = (datetime.strptime(cert, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    .timestamp() - now) / 86400
+            if left < 0:
+                out.append(("bad", f"{rid}: certificate expired {cert}"))
+            elif left < 30:
+                out.append(("warn", f"{rid}: certificate expires {cert}"))
+    mesh = snap.get("mesh")
+    if mesh:
+        if not mesh["management"]:
+            out.append(("bad", "mesh: management not connected"))
+        if not mesh["signal"]:
+            out.append(("warn", "mesh: signal not connected"))
+    out.sort(key=lambda p: p[0] != "bad")
+    return out
+
+
+def parse_usage(text):
+    """podman stats: name -> (cpu, memory), as podman prints them ('1.25%', '12.3MB')."""
+    out = {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            out[parts[0]] = (parts[1].strip(), parts[2].split("/")[0].strip())
+    return out
+
+
+def parse_mesh(text):
+    try:
+        d = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    peers = []
+    for p in (d.get("peers") or {}).get("details") or []:
+        hs = p.get("lastWireguardHandshake", "")
+        peers.append({
+            "name": (p.get("fqdn") or "?").split(".")[0],
+            "ip": p.get("netbirdIp", ""),
+            "status": p.get("status", "?"),
+            "type": p.get("connectionType", "-"),
+            "latency_ms": (p.get("latency") or 0) / 1e6,
+            "handshake": None if hs.startswith("0001") else parse_ts(hs),
+            "rx": p.get("transferReceived", 0),
+            "tx": p.get("transferSent", 0),
+        })
+    peers.sort(key=lambda p: (p["status"] != "Connected", p["name"]))
+    return {
+        "ip": d.get("netbirdIp", ""),
+        "management": bool((d.get("management") or {}).get("connected")),
+        "signal": bool((d.get("signal") or {}).get("connected")),
+        "connected": sum(1 for p in peers if p["status"] == "Connected"),
+        "total": len(peers),
+        "peers": peers,
+    }
+
+
+# ---------------------------------------------------------------- formatting (pure)
+
+def fmt_rate(r):
+    if r is None:
+        return "-"
+    if r == 0:
+        return "0"
+    if r < 0.1:
+        return f"{r:.2f}"
+    if r < 10:
+        return f"{r:.1f}"
+    return f"{r:.0f}" if r < 1000 else f"{r / 1000:.1f}k"
+
+
+def fmt_age(s):
+    s = max(0, int(s))
+    if s < 90:
+        return f"{s}s"
+    if s < 5400:
+        return f"{s // 60}m"
+    return f"{s // 3600}h" if s < 172800 else f"{s // 86400}d"
+
+
+def fmt_bytes(n):
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.0f}T"
+
+
+def spark(values, width):
+    """Unicode blocks, newest on the right. A gap (restart, no data) is a space."""
+    blocks = " ▁▂▃▄▅▆▇█"
+    vals = values[-width:]
+    top = max((v for v in vals if v), default=0)
+    if not top:
+        return "".join(" " if v is None else "▁" for v in vals)
+    return "".join(" " if v is None else blocks[max(1, round(v / top * 8))] for v in vals)
+
+
+def stage_rate(rows, stage, key):
+    vals = [r.get(key) for r in rows if r["stage"] == stage and r.get(key) is not None]
+    return sum(vals) if vals else None
+
+
+def pipeline(rows):
+    """[(label, rate or None, count)] for the one-line picture of the pod."""
+    n = collections.Counter(r["stage"] for r in rows)
+    return [("arms", stage_rate(rows, "in", "out"), n["in"]),
+            ("uplink", stage_rate(rows, "up", "out"), n["up"]),
+            ("downlink", stage_rate(rows, "down", "out"), n["down"]),
+            ("egress", stage_rate(rows, "out", "out"), n["out"])]
+
+
+# ---------------------------------------------------------------- collection
+
+class Collector:
+    """Polls podman, netbird and the declaration on a background thread, so the screen
+    never waits on a slow `podman logs`."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.series = {}
+        self.since = {}
+        self.snap = {"running": {}, "series": {}, "rows": [], "pod": None, "mesh": None,
+                     "root": os.geteuid() == 0, "status_mod": None, "updated": 0}
+        try:
+            self.status = load_status()
+        except Exception:   # noqa: BLE001  a broken status module must not blank the view
+            self.status = None
+        self.snap["status_mod"] = self.status
+        self._stop = threading.Event()
+        self._slow_at = 0.0
+
+    def poll_once(self):
+        running = {}
+        for line in sh(["podman", "ps", "--format", "{{.Names}}\t{{.Status}}"]).splitlines():
+            if "\t" in line:
+                name, state = line.split("\t", 1)
+                running[name] = state
+        for name in running:
+            if not name.startswith("octo-") or name.startswith(QUIET):
+                continue
+            since = self.since.get(name, HISTORY)
+            text = sh(["podman", "logs", "--since", since, name], timeout=15)
+            s = self.series.setdefault(name, Series())
+            for line in text.splitlines():
+                parsed = parse_stats(line)
+                if parsed:
+                    s.add(*parsed)
+            if s.samples:
+                t = datetime.fromtimestamp(s.samples[-1][0] - 1, timezone.utc)
+                self.since[name] = t.strftime("%Y-%m-%dT%H:%M:%SZ")
+        snap = {"running": running,
+                "series": {k: v for k, v in self.series.items() if v.samples}}
+        now = time.time()
+        if now >= self._slow_at:
+            self._slow_at = now + SLOW
+            snap.update(self._slow())
+        with self.lock:
+            self.snap.update(snap)
+            self.snap["updated"] = now
+
+    def _slow(self):
+        out = {"pod": None, "rows": [], "no_identity": False, "endpoint": ""}
+        if self.status and os.path.isdir(self.status.ETC):
+            try:
+                info, rows = self.status.collect()
+            except Exception:   # noqa: BLE001
+                info, rows = None, []
+            if info is None:
+                out["no_identity"] = True
+            else:
+                out.update(pod=info, rows=rows, endpoint=info.get("endpoint", ""))
+        else:
+            out["no_identity"] = True
+        out["usage"] = parse_usage(sh(["podman", "stats", "--no-stream", "--format",
+                                       "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"], timeout=8))
+        nb = sh(["netbird", "status", "--json"], timeout=6)
+        out["mesh"] = parse_mesh(nb) if nb else None
+        return out
+
+    def snapshot(self):
+        with self.lock:
+            snap = dict(self.snap)
+        snap["series"] = dict(snap["series"])
+        return snap
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                self.poll_once()
+            except Exception as e:   # noqa: BLE001  keep polling; show what broke
+                with self.lock:
+                    self.snap["error"] = f"{type(e).__name__}: {e}"
+            self._stop.wait(FAST)
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+
+def version():
+    try:
+        with open(os.path.join(os.path.dirname(HERE), "VERSION")) as f:
+            return f.read().strip()
+    except OSError:
+        return "?"
+
+
+# ---------------------------------------------------------------- plain output
+
+def snapshot_doc(snap):
+    rows = flow_rows(snap)
+    now = time.time()
+    clean = [{k: v for k, v in r.items() if k != "trend"} for r in rows]
+    return {
+        "pod": (snap.get("pod") or {}).get("pod"),
+        "version": version(),
+        "flows": clean,
+        "problems": [{"severity": s, "text": t} for s, t in problems(snap, rows, now)],
+        "mesh": snap.get("mesh"),
+    }
+
+
+def print_once(snap):
+    rows = flow_rows(snap)
+    now = time.time()
+    pod = (snap.get("pod") or {}).get("pod") or "(no identity)"
+    print(f"pod {pod}  octo-pod {version()}")
+    print("  " + "  ->  ".join(f"{label} {fmt_rate(rate)}/s" if count else f"{label} -"
+                               for label, rate, count in pipeline(rows)))
+    print(f"\n  {'STAGE':<5} {'ID':<24} {'STATE':<12} {'IN/s':>7} {'OUT/s':>7} {'DROP':>5} "
+          f"{'LAST':>5}  WHERE")
+    for r in rows:
+        last = fmt_age(now - r["last"]) if r.get("last") else "-"
+        drops = "-" if r.get("drops") is None else str(r["drops"])
+        print(f"  {r['stage']:<5} {clean(r['id'])[:24]:<24} {clean(r['state'])[:12]:<12} "
+              f"{fmt_rate(r.get('in')):>7} {fmt_rate(r.get('out')):>7} {drops:>5} "
+              f"{last:>5}  {clean(r.get('where', ''))}")
+    found = problems(snap, rows, now)
+    if found:
+        print()
+        for sev, text in found:
+            print(f"  {'!!' if sev == 'bad' else ' !'} {text}")
+    print()
+
+
+# ---------------------------------------------------------------- the screen
+
+HELP = [
+    ("1  :flows", "what is moving, per arm, bridge and destination"),
+    ("2  :pubs", "what is declared: transport, topic, release, certificate"),
+    ("3  :mesh", "netbird: management, signal, every peer"),
+    ("4  :problems", "everything worth a look, worst first"),
+    ("enter / d", "detail for the selected row, with the commands to dig further"),
+    ("l", "logs of the selected row's container (f follows, g/G top/bottom)"),
+    ("/", "filter rows; esc clears"),
+    ("j k / arrows", "move; PgUp PgDn scroll"),
+    ("esc", "back"),
+    ("q", "quit"),
+]
+
+
+class Screen:
+    VIEWS = ("flows", "pubs", "mesh", "problems")
+
+    def __init__(self, stdscr, collector, curses):
+        self.s, self.c, self.cu = stdscr, collector, curses
+        self.view, self.mode = "flows", None   # mode: None, detail, logs, help, filter
+        self.sel = {v: 0 for v in self.VIEWS}
+        self.top = {v: 0 for v in self.VIEWS}
+        self.filter, self.typing = "", None
+        self.cmd = None
+        self.logs, self.log_name, self.log_at, self.log_top, self.follow = [], None, 0, 0, True
+        self.detail = None
+        self.items = []
+        self._colors()
+
+    def _colors(self):
+        cu = self.cu
+        self.col = collections.defaultdict(int)
+        if not cu.has_colors():
+            return
+        cu.start_color()
+        try:
+            cu.use_default_colors()
+            bg = -1
+        except cu.error:
+            bg = cu.COLOR_BLACK
+        for i, (name, fg) in enumerate((("ok", cu.COLOR_GREEN), ("warn", cu.COLOR_YELLOW),
+                                         ("bad", cu.COLOR_RED), ("head", cu.COLOR_CYAN),
+                                         ("dim", cu.COLOR_WHITE)), 1):
+            cu.init_pair(i, fg, bg)
+            self.col[name] = cu.color_pair(i)
+        self.col["dim"] |= cu.A_DIM
+        self.col["sel"] = cu.A_REVERSE
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.s.getmaxyx()
+        if 0 <= y < h and x < w:
+            try:
+                self.s.addnstr(y, x, text, max(0, w - x - (1 if y == h - 1 else 0)), attr)
+            except self.cu.error:
+                # A resize can invalidate the bounds between getmaxyx and drawing.
+                pass
+
+    # -- rows per view ---------------------------------------------------------
+
+    def rows_for(self, snap, now):
+        flows = flow_rows(snap)
+        if self.view == "flows":
+            items = flows
+        elif self.view == "pubs":
+            items = [r for r in flows if r["kind"] in ("arm", "peer", "egress")]
+        elif self.view == "mesh":
+            items = (snap.get("mesh") or {}).get("peers") or []
+        else:
+            items = [{"id": t, "sev": s} for s, t in problems(snap, flows, now)]
+        if self.filter:
+            f = self.filter.lower()
+            items = [r for r in items if f in json.dumps(r, default=str).lower()]
+        return flows, items
+
+    # -- drawing ---------------------------------------------------------------
+
+    def draw(self):
+        snap = self.c.snapshot()
+        now = time.time()
+        self.s.erase()
+        h, w = self.s.getmaxyx()
+        flows, self.items = self.rows_for(snap, now)
+        found = problems(snap, flows, now)
+        self.header(snap, flows, found, w)
+        if self.mode == "help":
+            self.draw_help()
+        elif self.mode == "detail":
+            self.draw_lines(self.detail_lines(snap, now))
+        elif self.mode == "logs":
+            self.draw_logs(h)
+        else:
+            {"flows": self.draw_flows, "pubs": self.draw_pubs, "mesh": self.draw_mesh,
+             "problems": self.draw_problems}[self.view](snap, now, h, w)
+        self.footer(snap, h, w)
+        self.s.refresh()
+
+    def header(self, snap, flows, found, w):
+        pod = (snap.get("pod") or {}).get("pod") or "(no identity)"
+        mesh = snap.get("mesh")
+        mtxt = (f"mesh {mesh['ip']}  {mesh['connected']}/{mesh['total']} peers"
+                if mesh else "mesh -")
+        self.put(0, 0, f" octo-pod top  {pod}  v{version()}  {mtxt}", self.col["head"]
+                 | self.cu.A_BOLD)
+        tabs = "  ".join(f"[{i}] {v}" for i, v in enumerate(self.VIEWS, 1))
+        self.put(0, max(0, w - len(tabs) - 1), tabs, self.col["dim"])
+        x = 1
+        for i, (label, rate, count) in enumerate(pipeline(flows)):
+            if i:
+                self.put(1, x, " ━▶ ", self.col["dim"])
+                x += 4
+            if not count:
+                text, attr = f"{label} -", self.col["dim"]
+            else:
+                text = f"{label} {fmt_rate(rate)}/s"
+                attr = self.col["ok"] if rate else self.col["warn"]
+            self.put(1, x, text, attr | self.cu.A_BOLD)
+            x += len(text)
+        bad = sum(1 for s, _ in found if s == "bad")
+        warn = len(found) - bad
+        if found:
+            sev, text = found[0]
+            more = f"  (+{len(found) - 1}, press 4)" if len(found) > 1 else ""
+            self.put(2, 1, f"{'!!' if sev == 'bad' else ' !'} {text}{more}", self.col[sev])
+        else:
+            self.put(2, 1, "all clear", self.col["ok"])
+        self.put(2, max(0, w - 16), f"{bad} bad {warn} warn",
+                 self.col["bad" if bad else "warn" if warn else "ok"])
+
+    def footer(self, snap, h, w):
+        if self.typing is not None:
+            self.put(h - 1, 0, f"{self.typing[0]}{self.typing[1]}", self.cu.A_BOLD)
+            return
+        age = time.time() - snap.get("updated", 0) if snap.get("updated") else None
+        err = snap.get("error")
+        left = (f" read-only · updated {fmt_age(age)} ago" if age is not None
+                else " read-only · collecting…")
+        if self.filter:
+            left += f" · filter '{self.filter}'"
+        if err:
+            left += f" · {err}"
+        self.put(h - 1, 0, left, self.col["bad" if err else "dim"])
+        hint = "? help  q quit "
+        self.put(h - 1, max(0, w - len(hint)), hint, self.col["dim"])
+
+    def table(self, cols, rows, attrs, h, w, start=4):
+        """cols: [(title, width, align)]; a width of 0 takes what is left."""
+        fixed = sum(c[1] + 1 for c in cols if c[1])
+        cols = [(t, c or max(8, w - fixed - 2), a) for t, c, a in cols]
+        line = " ".join(f"{t:{a}{c}}"[:c] for t, c, a in cols)
+        self.put(start, 1, line, self.col["head"] | self.cu.A_BOLD)
+        view_h = max(1, h - start - 2)
+        n = len(rows)
+        sel = min(self.sel[self.view], max(0, n - 1))
+        self.sel[self.view] = sel
+        top = self.top[self.view]
+        top = min(max(top, sel - view_h + 1), sel)
+        self.top[self.view] = top
+        for i, row in enumerate(rows[top:top + view_h]):
+            text = " ".join(f"{v!s:{a}{c}}"[:c] for (_, c, a), v in zip(cols, row))
+            attr = attrs[top + i]
+            if top + i == sel:
+                attr |= self.col["sel"]
+            self.put(start + 1 + i, 1, text, attr)
+        if not rows:
+            self.put(start + 2, 3, "nothing here" + (" (filter hides it)" if self.filter else ""),
+                     self.col["dim"])
+
+    def draw_flows(self, snap, now, h, w):
+        cols = [("STAGE", 5, "<"), ("ID", 22, "<"), ("STATE", 10, "<"), ("IN/s", 7, ">"),
+                ("OUT/s", 7, ">"), ("DROP", 5, ">"), ("QUEUE", 8, ">"), ("CONN", 4, ">"),
+                ("LAST", 5, ">"), ("CPU", 6, ">"), ("MEM", 8, ">"), ("TREND", 16, "<"),
+                ("WHERE", 0, "<")]
+        if w < 150:
+            cols = [c for c in cols if c[0] not in ("CPU", "MEM")]
+        if w < 120:
+            cols = [c for c in cols if c[0] not in ("QUEUE", "CONN")]
+        if w < 90:
+            cols = [c for c in cols if c[0] not in ("TREND", "WHERE")]
+        names = [c[0] for c in cols]
+        rows, attrs = [], []
+        for r in self.items:
+            q = (f"{r['pending']}/{r['capacity']}" if r.get("capacity")
+                 else "-" if r.get("pending") is None else str(r["pending"]))
+            cells = {
+                "STAGE": {"in": "▶ in", "up": "▲ up", "down": "▼ dn", "out": "◀ out"}
+                .get(r["stage"], "?"),
+                "ID": r["id"], "STATE": r["state"],
+                "IN/s": fmt_rate(r.get("in")), "OUT/s": fmt_rate(r.get("out")),
+                "DROP": "-" if r.get("drops") is None else r["drops"],
+                "QUEUE": q, "CONN": "-" if r.get("consumers") is None else r["consumers"],
+                "LAST": fmt_age(now - r["last"]) if r.get("last") else "-",
+                "CPU": r.get("cpu", "-"), "MEM": r.get("mem", "-"),
+                "TREND": spark(r.get("trend") or [], 16), "WHERE": r.get("where", ""),
+            }
+            rows.append([cells[n] for n in names])
+            attrs.append(self.row_attr(r, now))
+        self.table(cols, rows, attrs, h, w)
+
+    def row_attr(self, r, now):
+        state = r.get("state", "").lower()
+        if state == "not running" or state.startswith("exited") or r.get("sink") == "DOWN":
+            return self.col["bad"]
+        if r.get("drops") or (r.get("last") and now - r["last"] > 3 * r.get("period", 60) + 30):
+            return self.col["warn"]
+        if r.get("out"):
+            return self.col["ok"]
+        return self.col["dim"] if state == "disabled" else 0
+
+    def draw_pubs(self, snap, now, h, w):
+        cols = [("TYPE", 6, "<"), ("ID", 22, "<"), ("STATE", 10, "<"), ("SINK", 4, "<"),
+                ("RELEASED", 8, "<"), ("CERT", 10, "<"), ("TRANSPORT / DEST", 0, "<")]
+        rows = [[r["kind"], r["id"], r["state"], r.get("sink", "-") or "-",
+                 "yes" if r.get("released") else "no", r.get("cert", "-"), r.get("where", "")]
+                for r in self.items]
+        self.table(cols, rows, [self.row_attr(r, now) for r in self.items], h, w)
+
+    def draw_mesh(self, snap, now, h, w):
+        mesh = snap.get("mesh")
+        if not mesh:
+            self.put(5, 3, "no netbird status (agent missing, or not root)", self.col["dim"])
+            return
+        ok = self.col["ok"]
+        self.put(4, 1, f"management {'connected' if mesh['management'] else 'DOWN'}",
+                 ok if mesh["management"] else self.col["bad"])
+        self.put(4, 26, f"signal {'connected' if mesh['signal'] else 'DOWN'}",
+                 ok if mesh["signal"] else self.col["warn"])
+        self.put(4, 46, f"this pod {mesh['ip']}", self.col["head"])
+        cols = [("PEER", 30, "<"), ("IP", 15, "<"), ("STATUS", 10, "<"), ("PATH", 8, "<"),
+                ("RTT", 7, ">"), ("HANDSHAKE", 9, ">"), ("RX", 7, ">"), ("TX", 7, ">")]
+        rows, attrs = [], []
+        for p in self.items:
+            rows.append([p["name"], p["ip"], p["status"], p["type"],
+                         f"{p['latency_ms']:.0f}ms" if p["latency_ms"] else "-",
+                         fmt_age(now - p["handshake"]) if p["handshake"] else "-",
+                         fmt_bytes(p["rx"]), fmt_bytes(p["tx"])])
+            attrs.append(ok if p["status"] == "Connected" else self.col["dim"])
+        self.table(cols, rows, attrs, h, w, start=6)
+
+    def draw_problems(self, snap, now, h, w):
+        rows = [["!!" if p["sev"] == "bad" else " !", p["id"]] for p in self.items]
+        self.table([("", 2, "<"), ("WHAT", 0, "<")], rows,
+                   [self.col[p["sev"]] for p in self.items], h, w)
+
+    def draw_help(self):
+        self.put(4, 2, "keys", self.col["head"] | self.cu.A_BOLD)
+        for i, (k, text) in enumerate(HELP):
+            self.put(5 + i, 4, f"{k:<14} {text}")
+        self.put(6 + len(HELP), 4, "read-only: nothing here changes the pod.", self.col["dim"])
+
+    def draw_lines(self, lines):
+        h, _ = self.s.getmaxyx()
+        for i, (text, attr) in enumerate(lines[: h - 5]):
+            self.put(4 + i, 2, text, attr)
+
+    def detail_lines(self, snap, now):
+        r = self.detail or {}
+        out = [(f"{r.get('kind', '')} {r.get('id', '')}", self.col["head"] | self.cu.A_BOLD)]
+        for k in ("container", "state", "where", "released", "sink", "cert", "cpu", "mem"):
+            if r.get(k) not in (None, ""):
+                out.append((f"  {k:<10} {r[k]}", 0))
+        if r.get("last"):
+            every = fmt_age(r.get("period", 60))
+            out.append((f"  {'stats':<10} {fmt_age(now - r['last'])} ago, every {every}", 0))
+        totals = r.get("totals") or {}
+        if totals:
+            out.append(("", 0))
+            out.append(("counters since the container started", self.col["head"]))
+            keys = sorted(totals)
+            for i in range(0, len(keys), 3):
+                out.append(("  " + "".join(f"{k:<20}{totals[k]:<10}" for k in keys[i:i + 3]),
+                            self.col["dim"]))
+        if r.get("trend"):
+            out.append(("", 0))
+            out.append((f"  out/s  {spark(r['trend'], 48)}  now {fmt_rate(r.get('out'))}",
+                        self.col["ok"]))
+        out.append(("", 0))
+        out.append(("dig further (copy and run)", self.col["head"]))
+        c = r.get("container")
+        if c:
+            out.append((f"  sudo podman logs -f --tail 50 {c}", 0))
+            out.append((f"  sudo systemctl status {c}", 0))
+        if r.get("kind") == "egress":
+            out.append(("  sudo octo-pod egress check", 0))
+        if r.get("kind") in ("arm", "peer", "egress"):
+            out.append(("  sudo octo-pod verify", 0))
+        if r.get("kind") == "undeclared":
+            out.append(("  nothing declares this; see 'octo-pod status' for orphans", 0))
+        return out
+
+    def draw_logs(self, h):
+        if time.time() - self.log_at > FAST and self.log_name:
+            text = sh(["podman", "logs", "--tail", "500", self.log_name], timeout=10)
+            self.logs = [ANSI.sub("", ln) for ln in text.splitlines()]
+            self.log_at = time.time()
+        self.put(3, 1, f"logs {self.log_name}  ({'following' if self.follow else 'paused'}, "
+                       f"f toggles)", self.col["head"])
+        view_h = max(1, h - 6)
+        if self.follow:
+            self.log_top = max(0, len(self.logs) - view_h)
+        for i, ln in enumerate(self.logs[self.log_top:self.log_top + view_h]):
+            low = ln.lower()
+            attr = (self.col["bad"] if " error " in f" {low} " or "panic" in low
+                    else self.col["warn"] if " warn " in f" {low} " else 0)
+            self.put(4 + i, 1, ln, attr)
+        if not self.logs:
+            self.put(5, 3, "no output (or not root)", self.col["dim"])
+
+    # -- keys ------------------------------------------------------------------
+
+    def selected(self):
+        i = self.sel[self.view]
+        return self.items[i] if 0 <= i < len(self.items) else None
+
+    def key(self, k):
+        """False to quit."""
+        cu = self.cu
+        if self.typing is not None:
+            return self.key_typing(k)
+        if k in (ord("q"), ord("Q")) and self.mode is None:
+            return False
+        if k == 27 or (k == ord("q") and self.mode):
+            if self.mode:
+                self.mode = None
+            elif self.filter:
+                self.filter = ""
+            return True
+        if self.mode == "logs":
+            return self.key_logs(k)
+        if k in (ord("1"), ord("2"), ord("3"), ord("4")):
+            self.view, self.mode = self.VIEWS[k - ord("1")], None
+        elif k == ord("?"):
+            self.mode = None if self.mode == "help" else "help"
+        elif k == ord("/"):
+            self.typing = ["/", self.filter]
+        elif k == ord(":"):
+            self.typing = [":", ""]
+        elif k in (cu.KEY_DOWN, ord("j")):
+            self.sel[self.view] += 1
+        elif k in (cu.KEY_UP, ord("k")):
+            self.sel[self.view] = max(0, self.sel[self.view] - 1)
+        elif k == cu.KEY_NPAGE:
+            self.sel[self.view] += 10
+        elif k == cu.KEY_PPAGE:
+            self.sel[self.view] = max(0, self.sel[self.view] - 10)
+        elif k in (10, 13, cu.KEY_ENTER, ord("d")) and self.view in ("flows", "pubs"):
+            if self.selected():
+                self.detail, self.mode = self.selected(), "detail"
+        elif k == ord("l") and self.view in ("flows", "pubs"):
+            r = self.selected()
+            if r and r.get("container"):
+                self.log_name, self.log_at, self.follow, self.mode = r["container"], 0, True, "logs"
+        return True
+
+    def key_typing(self, k):
+        prefix, text = self.typing
+        if k == 27:
+            self.typing = None
+            if prefix == "/":
+                self.filter = ""
+        elif k in (10, 13, self.cu.KEY_ENTER):
+            self.typing = None
+            if prefix == "/":
+                self.filter = text
+            else:
+                word = text.strip().lstrip(":")
+                if word in ("q", "quit"):
+                    return False
+                match = [v for v in self.VIEWS if v.startswith(word)] if word else []
+                if match:
+                    self.view, self.mode = match[0], None
+        elif k in (8, 127, self.cu.KEY_BACKSPACE):
+            self.typing[1] = text[:-1]
+        elif 32 <= k < 127:
+            self.typing[1] = text + chr(k)
+        return True
+
+    def key_logs(self, k):
+        cu = self.cu
+        if k == ord("f"):
+            self.follow = not self.follow
+        elif k in (cu.KEY_UP, ord("k")):
+            self.follow, self.log_top = False, max(0, self.log_top - 1)
+        elif k in (cu.KEY_DOWN, ord("j")):
+            self.follow, self.log_top = False, self.log_top + 1
+        elif k == cu.KEY_PPAGE:
+            self.follow, self.log_top = False, max(0, self.log_top - 20)
+        elif k == cu.KEY_NPAGE:
+            self.follow, self.log_top = False, self.log_top + 20
+        elif k == ord("g"):
+            self.follow, self.log_top = False, 0
+        elif k == ord("G"):
+            self.follow = True
+        return True
+
+
+def interactive(collector):
+    import curses
+
+    def main(stdscr):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            # Some terminals cannot hide the cursor; the UI still works.
+            pass
+        stdscr.timeout(250)
+        screen = Screen(stdscr, collector, curses)
+        while True:
+            screen.draw()
+            k = stdscr.getch()
+            if k == -1 or k == curses.KEY_RESIZE:
+                continue
+            if not screen.key(k):
+                return
+
+    curses.wrapper(main)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="octo-pod top", description="A live, read-only view of this pod.")
+    ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    ap.add_argument("--json", action="store_true", help="one snapshot as JSON")
+    args = ap.parse_args()
+
+    collector = Collector()
+    if args.once or args.json or not sys.stdout.isatty():
+        collector.poll_once()
+        snap = collector.snapshot()
+        if args.json:
+            print(json.dumps(snapshot_doc(snap), indent=2, default=str))
+        else:
+            print_once(snap)
+        return 0
+    collector.start()
+    try:
+        interactive(collector)
+    except KeyboardInterrupt:
+        # Ctrl-C is a normal exit; finally still stops the collector.
+        pass
+    finally:
+        collector.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

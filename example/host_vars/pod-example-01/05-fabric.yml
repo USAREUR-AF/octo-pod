@@ -1,0 +1,59 @@
+# THE FABRIC THIS POD JOINS — mesh, upstream, updates. From the token.
+#
+# Every value here names a host belonging to ONE deployment. That is the whole reason
+# this file exists: the platform layer in ../platform/ ships unchanged to every site, so
+# an address written there is handed to every site, including the ones that are not part
+# of this fabric. Addresses live with the identity instead, where they reach one pod.
+#
+# `octo-pod join` fills in what it can (it knows --mgmt) and leaves the rest empty. A
+# real token carries all four.
+#
+# EMPTY IS A LEGITIMATE STATE. A pod that captures and retains locally needs none of
+# these; it needs the mesh only to be reachable, and not even that to record data. Each
+# value is checked at the step that uses it, so a missing one fails there — loudly —
+# rather than at the top of a run that would otherwise have done useful work.
+
+# The mesh management server, used when `join --mgmt <url>` did not name one. Host only;
+# bootstrap builds the URL back up.
+netbird_mgmt_host: "netbird.example.net"
+
+# Where the bridge publishes: the upstream Zenoh router, dialled by NAME. Nothing here
+# takes effect until a slot is installed and a publisher is released — see 10-pod.yml.
+fabric_endpoint: "tls/zenoh.example.net:7447"
+
+# Mesh DNS, and load-bearing. These names resolve nowhere else: no public DNS server
+# knows them, so without these lines the bridge cannot find the fabric at all. It fails
+# by starting normally and counting sends that go nowhere, which is why the playbook
+# refuses to start the bridge when this list is empty.
+#
+# One line per address. The `names` string may hold several names for one host, space
+# separated, exactly as /etc/hosts wants them.
+fabric_host_pins:
+  - { ip: "100.127.0.10", names: "netbird.example.net" }
+  - { ip: "100.127.0.11", names: "zenoh.example.net portal.example.net" }
+
+# Where publish-to-portal.yml registers topics and data dictionaries. A different control
+# plane from the bridge, and a different credential; the pod itself never calls it.
+fabric_portal_url: "https://portal.example.net"
+
+# Where releases come from, read by `octo-pod upgrade`.
+#
+# PUBLIC ON PURPOSE, and it is the one value here that is not mesh-only. A pod has to be
+# able to fetch the software BEFORE it has joined anything, or the first install becomes
+# a box that needs the mesh in order to get the thing that puts it on the mesh. So
+# reachability is not the control: every release is signed, `upgrade` verifies that
+# signature, and a pod without cosign refuses rather than trusting the download.
+#
+# Where `octo-pod upgrade` fetches releases: any HTTPS location that serves a
+# release's files as the release workflow's mirror step lays them out (LATEST at the
+# root, one directory per version). Empty: upgrades come only from install-to-pod.sh.
+octo_repo_url: "https://get.example.net/octo-pod"
+
+# An APT REPOSITORY, if one exists — a different surface from the release files above.
+# apt wants dists/<suite>/ metadata; the release surface is a directory of tarballs, so
+# pointing apt at it 404s and a broken source fails EVERY apt operation on the box.
+#
+# EMPTY ON PURPOSE. Nothing publishes a repository today: a release attaches a .deb to
+# GitHub, and that .deb is installed by file (`dpkg -i ./octo-pod_<v>_all.deb`).
+# Leave this blank until an apt repo genuinely exists.
+octo_apt_repo_url: ""

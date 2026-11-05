@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+# octo-pod-upgrade — replace the software. Never the identity.
+#
+#   octo-pod upgrade                take the newest release
+#   octo-pod upgrade --check        say what would happen, change nothing
+#   octo-pod upgrade --to 1.3.0     a named version, newer than this one
+#   octo-pod upgrade --to 1.2.0 --allow-downgrade
+#                                   an older one, on purpose
+#   octo-pod upgrade --rollback     back to the version this pod came from
+#   octo-pod upgrade --list         what is installed, and what is kept to go back to
+#   octo-pod upgrade --images       fetch the signed container bundle, for bootstrap
+#   octo-pod upgrade --expect-sha256 <64-hex>
+#                                   also require this digest of what is fetched (the
+#                                   tarball, the .deb, or with --images the bundle).
+#                                   An extra check: the signature is still required.
+#   OCTO_POD_CERT_IDENTITY=<regexp> octo-pod upgrade
+#                                   trust a signer other than the release workflow
+#                                   this pod's release names. Printed whenever used.
+#
+# THE OPERATOR NEVER TYPES git, apt OR tar. How the software arrived is an install
+# detail; what they do about a new one is a single word that is the same everywhere.
+# This exists because the alternative was `git pull` on a border box: not atomic, not
+# reversible, needing repo credentials per site, and producing a merge conflict at the
+# worst possible moment for someone who has never used git.
+#
+# WHAT IT CANNOT TOUCH: /etc/octo-pod. Arms, peers, the ingest LAN and the release gates
+# are the pod's own, and an upgrade replaces the platform layer around them. That split
+# is the reason this is safe to run on a pod nobody can drive to.
+set -uo pipefail
+
+SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO="$(cd "$SELF/.." && pwd)"
+ETC="${OCTO_POD_ETC:-/etc/octo-pod}"
+
+# The path that gets swapped. REPO resolves THROUGH the version symlink (readlink -f
+# above), which is what we want for the running process — a swap underneath it cannot
+# change the code already executing — but it is not the thing to move.
+ROOT="${OCTO_POD_ROOT:-/opt/octo-pod}"
+STATE="${OCTO_POD_STATE:-/var/lib/octo-pod}"
+KEEP="${OCTO_POD_KEEP:-3}"
+
+die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+say()  { printf '%s\n' "$*"; }
+run()  { printf '$ %s\n' "$*" >&2; "$@"; }
+# FOR PRINTING WHAT A SERVER SENT. A refusal quotes the value it refused, and that value
+# came from the mirror: escape sequences in it would drive root's terminal (retitle it,
+# rewrite what is on screen). Printable ASCII only, and not a page of it.
+shown() { printf '%s' "$1" | LC_ALL=C tr -cd '[:print:]' | head -c 80; }
+
+version_here() {
+  [ -f "$REPO/VERSION" ] && tr -d '[:space:]' < "$REPO/VERSION" && return
+  git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo unknown
+}
+
+# Three installs, three upgrade paths, one command. Order matters: a clone is a clone
+# even when /opt/octo-pod happens to be a symlink beside it.
+install_kind() {
+  if [ -d "$REPO/.git" ]; then echo git
+  elif command -v dpkg >/dev/null 2>&1 && dpkg -S "$REPO/bin/octo-pod" >/dev/null 2>&1; then echo package
+  elif [ -L "$ROOT" ]; then echo release
+  else echo unmanaged
+  fi
+}
+
+# Where releases come from: the identity layer, so the update path is mesh-only by
+# construction. "Can this box be updated" is then the same question as "is this box
+# still an authorised mesh member" — revoking the peer revokes the update path.
+repo_url() {
+  python3 - "$ETC" <<'PY' 2>/dev/null
+import glob, sys, yaml
+for f in sorted(glob.glob(sys.argv[1] + "/host_vars/*/05-fabric.yml")):
+    print(((yaml.safe_load(open(f)) or {}).get("octo_repo_url") or "").rstrip("/"))
+    break
+PY
+}
+
+fetch() {  # fetch <url> <dest>
+  curl -fsSL --connect-timeout 10 --max-time 300 "$1" -o "$2"
+}
+
+# --------------------------------------------------------------------- release
+releases_dir() { dirname "$ROOT"; }
+# A version string becomes a filesystem path AND a URL, so it is validated before it is
+# either. Not currently reachable past verification, but `rm -rf "$target"` on a value
+# taken from an unsigned LATEST is not a thing to leave to downstream checks.
+#
+# Two forms and nothing else: a release, X.Y.Z, and a prerelease, X.Y.Z~<word><N>
+# (0.4.0~lab2, 0.4.1~rc1). The word is data; nothing here knows what "lab" means. '~' is
+# safe in both places the string lands: inert in a quoted path, unreserved in a URL.
+# >>> versions
+valid_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(~[a-z]+[0-9]+)?$ ]]; }
+
+# WHICH WAY IS UP. Debian's order, because dpkg installs the package and the two must
+# never disagree: '~' sorts BEFORE the release, so 0.4.0~lab2 < 0.4.0 < 0.4.1~rc1. A
+# string test cannot see that, which is how a LATEST below the running version used to be
+# offered as an upgrade. Prints lt, eq or gt; prints nothing and fails unless both sides
+# are versions and the answer is positive. "Not lower and not equal" is not "newer": a
+# dpkg that fails to run would otherwise read as permission to install anything.
+version_cmp() {  # version_cmp <a> <b>
+  if ! valid_version "$1" || ! valid_version "$2"; then return 1; fi
+  if command -v dpkg >/dev/null 2>&1; then
+    if dpkg --compare-versions "$1" lt "$2"; then echo lt
+    elif dpkg --compare-versions "$1" eq "$2"; then echo eq
+    elif dpkg --compare-versions "$1" gt "$2"; then echo gt
+    else return 1
+    fi
+  else
+    version_cmp_bash "$1" "$2"
+  fi
+}
+
+# The same order with no dpkg on the box, which a release tarball allows. It covers only
+# the two forms above, and platform/tests/test_upgrade.py holds it to dpkg's answers.
+# A subshell, so the C locale (byte order for the word) leaves with it: bash 5.3's
+# `local LC_ALL` intermittently failed the command substitution around it.
+version_cmp_bash() (  # version_cmp_bash <a> <b>, both valid
+  LC_ALL=C
+  local re='^([0-9]+)\.([0-9]+)\.([0-9]+)(~([a-z]+)([0-9]+))?$' a b i c
+  [[ "$1" =~ ${re} ]]
+  a=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}")
+  [[ "$2" =~ ${re} ]]
+  b=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}")
+  for i in 0 1 2; do
+    c="$(version_num_cmp "${a[i]}" "${b[i]}")" || return 1
+    case "${c}" in
+      lt|gt) echo "${c}"; return 0 ;;
+      eq) ;;
+      *) return 1 ;;
+    esac
+  done
+  # A prerelease is below its release. Two prereleases: the word, then the number.
+  if [[ -z "${a[3]}" && -z "${b[3]}" ]]; then echo eq
+  elif [[ -z "${a[3]}" ]]; then echo gt
+  elif [[ -z "${b[3]}" ]]; then echo lt
+  elif [[ "${a[3]}" < "${b[3]}" ]]; then echo lt
+  elif [[ "${a[3]}" > "${b[3]}" ]]; then echo gt
+  else version_num_cmp "${a[4]}" "${b[4]}"
+  fi
+)
+
+# Digits as dpkg reads them: leading zeros ignored, any length, so no shell arithmetic to
+# overflow or to read 08 as octal. Runs inside version_cmp_bash, in its C locale.
+version_num_cmp() {  # version_num_cmp <digits> <digits>
+  local x="${1#"${1%%[!0]*}"}" y="${2#"${2%%[!0]*}"}"
+  if (( ${#x} != ${#y} )); then
+    if (( ${#x} < ${#y} )); then echo lt; else echo gt; fi
+  elif [[ "${x}" < "${y}" ]]; then echo lt
+  elif [[ "${x}" > "${y}" ]]; then echo gt
+  else echo eq
+  fi
+}
+
+# Newest first in that order, for --list and for what pruning keeps. Anything that is not
+# a version goes last rather than being guessed at.
+newest_first() {  # one version per line on stdin
+  local v i c order=()
+  while IFS= read -r v; do
+    [[ -n "${v}" ]] || continue
+    i=${#order[@]}
+    while (( i > 0 )); do
+      if valid_version "${order[i-1]}"; then
+        c="$(version_cmp "${v}" "${order[i-1]}")" || break
+        [[ "${c}" == gt ]] || break
+      fi
+      order[i]="${order[i-1]}"
+      i=$(( i - 1 ))
+    done
+    order[i]="${v}"
+  done
+  (( ${#order[@]} == 0 )) || printf '%s\n' "${order[@]}"
+}
+# <<< versions
+release_path() { echo "$(releases_dir)/octo-pod-$1"; }
+
+kept_versions() {
+  local d
+  for d in "$(releases_dir)"/octo-pod-*/; do
+    [ -f "${d}VERSION" ] || continue
+    tr -d '[:space:]' < "${d}VERSION"
+    echo
+  done 2>/dev/null | sort -u
+}
+
+prune_releases() {  # keep the current, the previous, and KEEP most recent
+  local cur="$1" prev="$2" v keepset
+  keepset=$(printf '%s\n%s\n' "$cur" "$prev"; kept_versions | newest_first | head -n "$KEEP")
+  for v in $(kept_versions); do
+    grep -qx "$v" <<<"$keepset" && continue
+    say "  removing old release $v"
+    rm -rf "$(release_path "$v")"
+  done
+}
+
+swap_to() {  # swap_to <version> — the only thing that changes what runs
+  local v="$1" target
+  target="$(release_path "$v")"
+  [ -d "$target" ] || die "release $v is not installed. 'octo-pod upgrade --list' shows what is."
+  # Sanity before commit: an unpacked tree that is missing either of these is not a pod
+  # install, and linking to it would leave the box with no working CLI at all.
+  [ -x "$target/bin/octo-pod" ] || die "$target has no bin/octo-pod — refusing to swap"
+  [ -f "$target/platform/configure-octo-pod.yml" ] || die "$target has no platform/ — refusing to swap"
+  mkdir -p "$STATE" || die "cannot create $STATE, not swapping"
+  printf '%s\n' "$(version_here)" > "$STATE/upgrade-previous" \
+    || die "cannot record the running version in $STATE/upgrade-previous, not swapping"
+  # A NEW LINK RENAMED OVER THE OLD ONE, never ln -sfn. That is unlink then symlink: a
+  # crash between the two leaves no $ROOT at all, and the next upgrade then cannot tell
+  # how this box was installed. rename(2) leaves the old link or the new one, nothing in
+  # between. Python's os.replace because mv spells "do not follow the link" -T on GNU and
+  # -h on BSD, and a refusal here must carry the real reason, not a usage error.
+  rm -f "$ROOT.new"
+  ln -s "$target" "$ROOT.new" || die "cannot create $ROOT.new, not swapping. Still on $(version_here)."
+  python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "$ROOT.new" "$ROOT" \
+    || { rm -f "$ROOT.new"; die "cannot replace $ROOT, not swapped. Still on $(version_here)."; }
+  # What the link says now, not what the commands above returned: the one fact the
+  # banner below reports.
+  [ "$(readlink "$ROOT")" = "$target" ] || die "$ROOT does not point at $target after the swap"
+  say "  $ROOT -> $target"
+}
+
+# WHAT MAKES A RELEASE TRUSTWORTHY.
+#
+# The release artifacts are public by design — they are served from a plain cloud
+# bucket, reachable before a pod has joined anything, because that is the only way to
+# solve the chicken-and-egg of shipping software to a box that is not on the mesh yet.
+# Nothing about *where* they come from is therefore evidence of *what* they are.
+#
+# The evidence is the signature. SHA256SUMS is signed by the release pipeline's
+# keyless sigstore identity, so verifying that ONE signature makes every hash in the
+# file trustworthy, and a plain hash check then establishes the artifact. It is the same
+# chain, identity and verify command an operator runs by hand.
+#
+# WHO MAY SIGN: the release workflow of the repository that built the release this pod
+# runs, as that release recorded itself in RELEASE, running for a release tag. The
+# repository alone is not enough. Any workflow in it, on any branch, can get a keyless
+# certificate, and a pattern that stops at the repository accepts every one of them. The
+# certificate names the workflow file and the ref, so the pattern names both:
+# release.yml, on refs/tags/octo-pod-v*. A fork's pods trust the fork's releases with no
+# change here.
+#
+# OCTO_POD_CERT_IDENTITY replaces that pattern outright, for a pod moving to another
+# repository's releases or one whose release names none. It is the operator's decision,
+# so it is printed whenever it decides a verification.
+# >>> signer
+release_repo() {  # the repository named in the installed release, if it is well formed
+  local r
+  r="$(sed -n 's/^repository=//p' "$ROOT/RELEASE" 2>/dev/null | head -1)"
+  [[ "$r" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$ ]] && printf '%s' "$r"
+}
+# The repository name lands inside a regexp, where its '.' would match any character.
+regex_quote() { printf '%s' "$1" | sed 's/[][\\.*^$+?(){}|]/\\&/g'; }
+CERT_IDENTITY="${OCTO_POD_CERT_IDENTITY:-}"
+CERT_OVERRIDE="${CERT_IDENTITY:+1}"
+if [ -z "$CERT_IDENTITY" ] && signer_repo="$(release_repo)"; then
+  CERT_IDENTITY='^https://github\.com/'"$(regex_quote "${signer_repo}")"'/\.github/workflows/release\.yml@refs/tags/octo-pod-v'
+fi
+# <<< signer
+OIDC_ISSUER="https://token.actions.githubusercontent.com"
+
+verify_manifest() {  # verify_manifest <dir> — the signature over SHA256SUMS
+  local d="$1"
+  # ALWAYS, whatever else was supplied. --expect-sha256 used to stand in for this, which
+  # made it the weakest link rather than an extra one: any 64 hex characters went past
+  # the signature, and on the --images path nothing compared them to anything. A digest
+  # from outside the channel is a second check on the artifact (verify_artifact), never a
+  # replacement for knowing who built it. The blanket "skip the check" flag before it was
+  # worse still: LATEST, SHA256SUMS and the artifact all came from one server, so the
+  # hash check passed vacuously and a hostile mirror got root at the next apply.
+  command -v cosign >/dev/null 2>&1 || die \
+"cosign is not installed, so this release cannot be verified.
+
+  Install it (a single binary):  https://github.com/sigstore/cosign/releases
+  'octo-pod bootstrap' installs it for you on a connected box.
+
+  There is deliberately no way to skip verification. --expect-sha256 adds a check on
+  top of the signature and does not replace it. The artifacts are served from a public
+  bucket by design, so 'it downloaded' proves nothing at all."
+
+  [ -n "$CERT_IDENTITY" ] || die \
+"this pod's release names no repository whose workflow signs releases (it was built
+outside a release workflow), so a new release can't be verified. Name the signer:
+
+    sudo OCTO_POD_CERT_IDENTITY='^https://github\.com/<owner>/<repo>/\.github/workflows/release\.yml@refs/tags/octo-pod-v' octo-pod upgrade
+
+  The release that installs records its own repository, so the next upgrade needs no
+  override."
+
+  if [[ -n "${CERT_OVERRIDE}" ]]; then
+    say "  signer from OCTO_POD_CERT_IDENTITY, not from this pod's release: ${CERT_IDENTITY}"
+  fi
+  say "  verifying signature"
+  # cosign's own words go in the refusal. "Not signed by" and "could not fetch sigstore's
+  # trust root" end the same way, and only the second is fixed by a network route: a pod
+  # with an empty /root/.sigstore and no way out can verify nothing.
+  local said
+  said="$(cosign verify-blob \
+    --bundle "$d/SHA256SUMS.cosign-bundle" \
+    --certificate-identity-regexp "$CERT_IDENTITY" \
+    --certificate-oidc-issuer "$OIDC_ISSUER" \
+    "$d/SHA256SUMS" 2>&1)" \
+    || die "cosign could not verify SHA256SUMS against ${CERT_IDENTITY}, refusing this release.
+  cosign said:
+$(printf '%s\n' "${said}" | tail -n 5 | LC_ALL=C tr -cd '[:print:]\n' | cut -c 1-200 | sed 's/^/    /')
+
+  A tuf, Rekor or connection error means this pod could not fetch sigstore's trust root,
+  not that the release is forged: it needs HTTPS to tuf-repo-cdn.sigstore.dev, or a cache
+  warmed by one online cosign run as root. Anything else means this release is not from
+  that signer."
+}
+
+sha256_of() { { sha256sum "${1}" 2>/dev/null || shasum -a 256 "${1}"; } | awk '{print $1}'; }
+
+# THE ARTIFACT, once the manifest is trusted: its hash must be the one line the signed
+# manifest gives for its name, and then, when the operator supplied a digest, that too.
+# Both, every time, and before anything is unpacked or installed. The out-of-band digest
+# is compared with the ARTIFACT, never with the manifest the same server handed us.
+verify_artifact() {  # verify_artifact <dir> <file name>
+  local d="${1}" name="${2}" listed got
+  listed="$(awk -v n="${name}" '$2 == n || $2 == "*" n { print tolower($1) }' "${d}/SHA256SUMS")"
+  [[ "${listed}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "${name} is not listed in the signed manifest exactly once, refusing it"
+  got="$(sha256_of "${d}/${name}")"
+  say "  verifying checksum against the signed manifest"
+  [[ "${got}" == "${listed}" ]] || die "checksum mismatch for ${name}, not using it"
+  [[ -n "${EXPECT_SHA}" ]] || return 0
+  [[ "${got}" == "${EXPECT_SHA}" ]] || die \
+    "digest mismatch for ${name}
+  expected  ${EXPECT_SHA}
+  got       ${got}
+  This is not the release you were told to install. Not using it."
+  say "  digest matches the one you supplied"
+}
+
+install_release() {  # install_release <version> <base-url>
+  local v="$1" base="$2" tmp tar target vbase
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  tar="$tmp/octo-pod-$v.tar.gz"
+  # EVERY VERSION KEEPS ITS OWN MANIFEST. SHA256SUMS lists only the release that
+  # produced it, so one shared copy at the mirror root can only ever describe the
+  # newest — and `upgrade --to <anything older>` then fails "not listed in the signed
+  # manifest" against a tarball sitting right there. LATEST stays at the root because
+  # it is the one thing that must be singular.
+  vbase="$base/$v"
+
+  say "  fetching $v"
+  fetch "$vbase/SHA256SUMS" "$tmp/SHA256SUMS" \
+    || die "no SHA256SUMS published at $vbase — refusing to install unverifiable software"
+  fetch "$vbase/SHA256SUMS.cosign-bundle" "$tmp/SHA256SUMS.cosign-bundle" \
+    || die "SHA256SUMS at ${vbase} carries no signature, refusing it"
+  verify_manifest "$tmp"
+
+  fetch "$vbase/octo-pod-$v.tar.gz" "$tar" || die "cannot fetch $vbase/octo-pod-$v.tar.gz"
+  verify_artifact "${tmp}" "octo-pod-${v}.tar.gz"
+
+  target="$(release_path "$v")"
+  rm -rf "$target.partial"
+  mkdir -p "$target.partial"
+  tar -xzf "$tar" -C "$target.partial" || die "cannot unpack $v"
+  [ "$(tr -d '[:space:]' < "$target.partial/VERSION" 2>/dev/null)" = "$v" ] \
+    || die "$v unpacked with a different VERSION inside — refusing it"
+  rm -rf "$target"
+  mv "$target.partial" "$target"
+  say "  installed $v at $target"
+}
+
+# NEVER BACKWARDS BY ACCIDENT. Returns when $WANT should replace $CUR, having said which
+# way it goes; otherwise says why and exits. A LATEST at or below what runs is nothing to
+# do, whatever the server says: a backport tag cut after this release must not walk the
+# fleet back, and "Already on" must not depend on two strings matching. Older is reached
+# only by asking for it: --rollback, or --to with --allow-downgrade.
+choose_target() {
+  local order
+  order="$(version_cmp "${WANT}" "${CUR}")" || order=unknown
+  say "current    ${CUR}"
+  case "${order}" in
+    gt) say "available  ${WANT}"; return 0 ;;
+    eq) say ""; say "Already on ${CUR}. Nothing to do."; exit 0 ;;
+    *) ;;
+  esac
+  if [[ -z "${WANT_BY_NAME}" && "${order}" == lt ]]; then
+    say ""
+    say "LATEST at ${BASE} is ${WANT}, which is older than ${CUR}. Nothing to do."
+    exit 0
+  fi
+  if [[ -z "${ALLOW_DOWNGRADE}" ]]; then
+    [[ "${order}" == lt ]] || die "cannot order ${WANT} against the running '${CUR}', so this will not
+  decide for you that it is newer. To take ${WANT} anyway:
+    sudo octo-pod upgrade --to ${WANT} --allow-downgrade"
+    die "${WANT} is older than the ${CUR} this pod runs, and upgrade does not go backwards
+  unless asked.
+
+  Back to the version this pod came from:  sudo octo-pod upgrade --rollback
+  To ${WANT} on purpose:  sudo octo-pod upgrade --to ${WANT} --allow-downgrade"
+  fi
+  say "going to   ${WANT}  (not newer; --allow-downgrade)"
+}
+
+# ------------------------------------------------------------------------ main
+ACTION=""
+CHECK=""
+WANT=""
+WANT_BY_NAME=""
+ALLOW_DOWNGRADE=""
+EXPECT_SHA=""
+# ONE MODE PER RUN. These used to overwrite each other, last one winning, so
+# '--check --rollback' really rolled back and '--rollback --check' quietly previewed an
+# upgrade instead. Two modes is a question this cannot answer for the operator.
+mode() {
+  [ -z "$ACTION" ] || [ "$ACTION" = "$1" ] \
+    || die "--$ACTION and --$1 are two different jobs. Pick one of --rollback, --images, --list, --describe."
+  ACTION="$1"
+}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)      CHECK=1;         shift ;;
+    --rollback)   mode rollback;   shift ;;
+    --images)     mode images;     shift ;;   # the container bundle, not the software
+    --list)       mode list;       shift ;;
+    --describe)   mode describe;   shift ;;   # one line, for `octo-pod version`
+    --to)
+      WANT="${2:-}"
+      valid_version "$WANT" || die "--to needs a version, X.Y.Z or X.Y.Z~<word><N>, got '${WANT}'"
+      WANT_BY_NAME=1
+      shift 2 ;;
+    # Going back is a decision, so it is a word of its own rather than something --to
+    # does quietly. --rollback needs no such word: it goes where this pod came from.
+    --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
+    # A digest from outside the channel, checked on top of the signature, never instead
+    # of it: what is fetched must match both this and the signed manifest.
+    --expect-sha256)
+      EXPECT_SHA="$(printf '%s' "${2:-}" | tr 'A-F' 'a-f')"
+      [[ "$EXPECT_SHA" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 needs a 64-character hex digest"
+      shift 2 ;;
+    -h|--help)    sed -n '2,19p' "$0"; exit 0 ;;
+    *)            die "unknown option: $1" ;;
+  esac
+done
+# --check previews an upgrade and nothing else: no other mode reads it, so taking it
+# with one would do that mode for real under a flag that promises nothing changes.
+# 'octo-pod fetch-images --check' lands here as '--images --check'.
+if [ -n "$CHECK" ]; then
+  [ -z "$ACTION" ] || die "--check previews a software upgrade and does not apply to --$ACTION. Nothing was changed."
+  ACTION=check
+fi
+ACTION="${ACTION:-upgrade}"
+if [[ -n "${ALLOW_DOWNGRADE}" && -z "${WANT_BY_NAME}" ]]; then
+  die "--allow-downgrade goes with --to <version>; it names where to go back to"
+fi
+
+KIND="$(install_kind)"
+CUR="$(version_here)"
+
+if [ "$ACTION" = describe ]; then
+  printf '%s install at %s\n' "$KIND" "$REPO"
+  exit 0
+fi
+
+if [ "$ACTION" = list ]; then
+  say "installed  $CUR   ($KIND, $REPO)"
+  case "$KIND" in
+    release)
+      say "kept       $(kept_versions | newest_first | tr '\n' ' ')"
+      [ -f "$STATE/upgrade-previous" ] && say "previous   $(cat "$STATE/upgrade-previous")"
+      ;;
+    package) command -v apt-cache >/dev/null && run apt-cache madison octo-pod ;;
+  esac
+  exit 0
+fi
+
+# A checkout belongs to whoever is developing the software, and pulling code into one is
+# a deliberate act with a tool built for it. Saying so is more useful than doing it.
+if [ "$KIND" = git ]; then
+  cat >&2 <<GIT
+
+This is a git checkout — a developer install, at $REPO.
+
+  octo-pod upgrade does not pull code into a checkout. Use git, deliberately, and read
+  what changed:  git -C $REPO pull
+
+  A pod that someone operates should be installed from a package or a release tarball
+  (tools/build-release.sh builds both). There, upgrading is this command and nothing
+  else, which is the point: the person running a pod in the field should not have to
+  learn a version control system to accept a fix.
+
+GIT
+  exit 2
+fi
+
+# Root is needed to write under /opt and to drive apt, and for nothing else. An
+# OCTO_POD_ROOT pointed elsewhere is a test run — the same escape hatch OCTO_POD_ETC
+# gives the other tools, and the reason their behaviour is testable at all.
+case "$ROOT" in
+  /opt/*|/usr/*) [ "$(id -u)" = 0 ] || die "run with sudo" ;;
+esac
+
+# ---------------------------------------------------------------- images
+# THE CONTAINER BUNDLE, over the SAME verified channel as the software. Deliberately a
+# mode of this command rather than a second downloader: the fetch, the cosign check over
+# SHA256SUMS and the refusal to install anything unverifiable are written once, here. A
+# bundle that arrived by a path with weaker checks would be worth less than no bundle.
+#
+# Why a pod wants this even with a working internet connection: installing FROM the
+# bundle means the pod never holds a registry credential. A PAT on an edge box sits
+# base64-encoded in the runtime auth file (containers/auth.json), so one recovered pod exposes every private
+# image in the org. A digest is public and proves the bytes; a captured pod yields what
+# it was already running and nothing more.
+if [ "$ACTION" = images ]; then
+  BASE="$(repo_url)"
+  [ -n "$BASE" ] || die "octo_repo_url is not set. It says where releases come from, and
+  the image bundle is published beside them. Set it in
+  /etc/octo-pod/host_vars/<pod>/05-fabric.yml."
+  itmp="$(mktemp -d)"; trap 'rm -rf "$itmp"' EXIT
+
+  fetch "$BASE/LATEST" "$itmp/LATEST" || die "cannot reach $BASE"
+  WANT="$(tr -d '[:space:]' < "$itmp/LATEST")"
+  valid_version "$WANT" || die "LATEST at $BASE is '$(shown "$WANT")', which is not a version (X.Y.Z or X.Y.Z~<word><N>)."
+  # The same rule as the software: a LATEST below what runs is reported, never taken,
+  # and one that can't be ordered against it is refused. The bundle's registry image is
+  # what the next airgap bootstrap runs, so "not known to be older" is not "newer".
+  order="$(version_cmp "${WANT}" "${CUR}")" \
+    || die "cannot order ${WANT} against the running '${CUR}', so this will not decide for
+  you that it is newer. No bundle was fetched; what is staged is unchanged."
+  if [[ "${order}" == lt ]]; then
+    say "LATEST at ${BASE} is ${WANT}, which is older than ${CUR}. Nothing to do."
+    exit 0
+  fi
+
+  say "  fetching the image bundle for $WANT"
+  fetch "$BASE/$WANT/SHA256SUMS" "$itmp/SHA256SUMS" \
+    || die "no SHA256SUMS published at $BASE — refusing an unverifiable bundle"
+  fetch "$BASE/$WANT/SHA256SUMS.cosign-bundle" "$itmp/SHA256SUMS.cosign-bundle" \
+    || die "SHA256SUMS at $BASE carries no signature — refusing it"
+  verify_manifest "$itmp"
+
+  bundle="octo-pod-images-$WANT.tar.gz"
+  grep -q " $bundle\$" "$itmp/SHA256SUMS" \
+    || die "$bundle is not listed in the signed manifest — either this release publishes
+  no image bundle, or one was added after signing. Refusing it either way."
+  fetch "$BASE/$WANT/$bundle" "$itmp/$bundle" || die "cannot fetch $BASE/$WANT/$bundle"
+  # Signed manifest, then the operator's digest: both before anything is unpacked. The
+  # bundle's registry image is what an airgap bootstrap later runs on this pod.
+  verify_artifact "${itmp}" "${bundle}"
+
+  # Into the directory bootstrap already reads, so seeding stays the existing
+  # --tags images path rather than a second implementation of the same thing.
+  istage="${OCTO_STAGE_DIR:-/opt/octo-stage}"
+  #
+  # Unpacked beside the old stage and swapped in only once it is whole: a bundle that is
+  # signed but will not unpack, or a disk that fills halfway, must leave the previous
+  # stage where bootstrap can still use it.
+  part="${istage:?}/images.partial"
+  mkdir -p "$istage" || die "cannot create $istage"
+  rm -rf "$part" || die "cannot clear partial stage $part"
+  mkdir -p "$part" || die "cannot create $part"
+  tar -xzf "$itmp/$bundle" -C "$part" \
+    || { rm -rf "$part"; die "cannot unpack the image bundle. What was staged before is unchanged."; }
+  [ -d "$part/images" ] \
+    || { rm -rf "$part"; die "$bundle holds no images/ directory. What was staged before is unchanged."; }
+  # The old stage is set aside, not deleted, until the new one is in its place.
+  old="${istage:?}/images.previous"
+  rm -rf "$old" || die "cannot clear previous stage $old"
+  if [ -e "$istage/images" ]; then
+    mv "$istage/images" "$old" \
+      || { rm -rf "$part"; die "cannot set aside $istage/images. What was staged before is unchanged."; }
+  fi
+  if ! mv "$part/images" "$istage/images"; then
+    if [ -e "$old" ]; then
+      mv "$old" "$istage/images" || die "cannot restore stage; previous images remain at $old"
+    fi
+    rm -rf "$part"
+    die "cannot move the new bundle into $istage/images. What was staged before is unchanged."
+  fi
+  rm -rf "$old" "$part"
+  say "  unpacked to $istage/images"
+  say ""
+  say "Seed the on-pod registry from it, and point this pod at that registry:"
+  say "  sudo octo-pod bootstrap -e bootstrap_mode=airgap -e image_mirror=localhost:5000"
+  say ""
+  say "image_mirror belongs in host_vars/<pod>/05-fabric.yml once decided — a pod that"
+  say "pulls from its own registry should not depend on remembering a flag."
+  exit 0
+fi
+
+case "$KIND" in
+  # ---------------------------------------------------------------- apt
+  # A .deb installed BY FILE, from the same signed surface as the tarball — there is no
+  # apt repository, and pointing apt at the release surface would 404 on every update
+  # while breaking all of apt. Same fetch, same SHA256SUMS, same signature as the
+  # release path; only the install step differs.
+  package)
+    BASE="$(repo_url)"
+    [ -n "$BASE" ] || die "octo_repo_url is not set. It says where releases come from, and
+  it belongs to this pod's identity: $ETC/host_vars/<pod>/05-fabric.yml."
+
+    if [ "$ACTION" = rollback ]; then
+      [ -f "$STATE/upgrade-previous" ] || die "no recorded previous version"
+      WANT="$(cat "$STATE/upgrade-previous")"
+      valid_version "$WANT" || die "recorded previous version '$WANT' is not a version"
+      say "returning to $WANT"
+    elif [ -z "$WANT" ]; then
+      tmp="$(mktemp -d)"
+      fetch "$BASE/LATEST" "$tmp/LATEST" || die "cannot reach $BASE"
+      WANT="$(tr -d '[:space:]' < "$tmp/LATEST")"
+      rm -rf "$tmp"
+      valid_version "$WANT" \
+        || die "LATEST at $BASE is '$(shown "$WANT")', which is not a version (X.Y.Z or X.Y.Z~<word><N>). Refusing it."
+    fi
+
+    if [[ "${ACTION}" == rollback ]]; then
+      say "current    ${CUR}"
+    else
+      choose_target
+      if [[ "${ACTION}" == check ]]; then
+        say ""
+        say "Nothing has changed. To take it:  sudo octo-pod upgrade${WANT_BY_NAME:+ --to ${WANT}}${ALLOW_DOWNGRADE:+ --allow-downgrade}"
+        exit 0
+      fi
+    fi
+
+    deb_tmp="$(mktemp -d)"
+    deb="$deb_tmp/octo-pod_${WANT}_all.deb"
+    say "  fetching $WANT"
+    fetch "$BASE/$WANT/SHA256SUMS" "$deb_tmp/SHA256SUMS" \
+      || die "no SHA256SUMS published at $BASE — refusing to install unverifiable software"
+    fetch "$BASE/$WANT/SHA256SUMS.cosign-bundle" "$deb_tmp/SHA256SUMS.cosign-bundle" \
+      || die "SHA256SUMS at ${BASE} carries no signature, refusing it"
+    verify_manifest "$deb_tmp"
+    fetch "$BASE/$WANT/octo-pod_${WANT}_all.deb" "$deb" \
+      || die "cannot fetch $BASE/$WANT/octo-pod_${WANT}_all.deb"
+    verify_artifact "${deb_tmp}" "octo-pod_${WANT}_all.deb"
+
+    mkdir -p "$STATE"; printf '%s\n' "$CUR" > "$STATE/upgrade-previous"
+    # $deb is an absolute path under mktemp -d, so this installs THAT FILE. It is not a
+    # repository lookup — there is no octo-pod apt repository, and if this were ever a
+    # bare package name apt would go looking for one and fail. Unlike the two-step
+    # dpkg -i + apt-get -f the docs give a human, this resolves dependencies in one
+    # step, which is what you want unattended; --allow-downgrades is what makes
+    # `upgrade --rollback` able to go backwards.
+    run apt-get install -y --allow-downgrades "$deb" || die "dpkg refused the package"
+    rm -rf "$deb_tmp"
+    ;;
+
+  # ------------------------------------------------------- release directory
+  release)
+    BASE="$(repo_url)"
+    [ -n "$BASE" ] || die "octo_repo_url is not set. It says where releases come from, and
+  it belongs to this pod's identity: $ETC/host_vars/<pod>/05-fabric.yml.
+  It arrives with the pod's token."
+
+    if [ "$ACTION" = rollback ]; then
+      [ -f "$STATE/upgrade-previous" ] || die "no recorded previous version"
+      WANT="$(cat "$STATE/upgrade-previous")"
+      valid_version "$WANT" || die "recorded previous version '$WANT' is not a version"
+      [ "$WANT" = "$CUR" ] && die "already on $CUR"
+      say "returning to $WANT"
+      swap_to "$WANT"
+    else
+      if [ -z "$WANT" ]; then
+        tmp="$(mktemp -d)"
+        fetch "$BASE/LATEST" "$tmp/LATEST" || die "cannot reach $BASE"
+        WANT="$(tr -d '[:space:]' < "$tmp/LATEST")"
+        rm -rf "$tmp"
+        valid_version "$WANT" \
+          || die "LATEST at $BASE is '$(shown "$WANT")', which is not a version (X.Y.Z or X.Y.Z~<word><N>). Refusing it."
+      fi
+      choose_target
+      if [ "$ACTION" = check ]; then
+        say ""
+        say "Nothing has changed. To take it:  sudo octo-pod upgrade${WANT_BY_NAME:+ --to ${WANT}}${ALLOW_DOWNGRADE:+ --allow-downgrade}"
+        exit 0
+      fi
+      [ -d "$(release_path "$WANT")" ] || install_release "$WANT" "$BASE"
+      swap_to "$WANT"
+      prune_releases "$WANT" "$CUR"
+    fi
+    ;;
+
+  unmanaged)
+    die "cannot tell how this was installed: $REPO is neither a checkout, a package,
+  nor a release directory linked from $ROOT. Reinstall from a release
+  (tools/build-release.sh) so that upgrades have somewhere to go."
+    ;;
+esac
+
+cat <<NEXT
+
+Now on $(cat "$ROOT/VERSION" 2>/dev/null || echo "$WANT").
+
+THE POD HAS NOT CHANGED YET. New platform code takes effect when you converge:
+
+  sudo octo-pod check      # read what it would change
+  sudo octo-pod apply
+
+If that goes wrong:  sudo octo-pod upgrade --rollback
+NEXT

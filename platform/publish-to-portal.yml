@@ -1,0 +1,244 @@
+---
+# Publish our publishers' topics + data dictionaries to the fabric portal.
+#
+#   ansible-playbook -i inventory.ini publish-to-portal.yml --check --diff
+#   ansible-playbook -i inventory.ini publish-to-portal.yml
+#
+# Targets the fabric portal host, NOT the pod — a different control plane, a different
+# credential. configure-octo-pod.yml builds the pod and never touches this; this never touches the pod.
+#
+# Driven entirely by `schema:` blocks on entries in 20-peers.yml / 30-arms.yml. Registration is
+# exact-match with no wildcards, so a Pattern B publisher (one topic per entity) needs one
+# row per entity and the `topics:` list grows with the fleet.
+#
+# Idempotent: topics are created only if absent; a duplicate descriptor upload returns
+# HTTP 409 "exists", which is accepted rather than treated as a failure.
+- name: fabric portal — topics + schemas
+  hosts: fabric_portal
+  gather_facts: false
+
+  vars:
+    # WHERE the portal is belongs to the identity layer (host_vars/<pod>/05-fabric.yml),
+    # not to this file. The platform layer ships unchanged to every deployment, so an
+    # address written here is handed to every site along with the software.
+    portal_url: "{{ fabric_portal_url | default('') }}"
+    build_dir: /tmp/portal-schema-build
+    # Every publisher that declares a schema. Peers and arms both qualify.
+    schema_publishers: >-
+      {{ ((peers | default([], true)) + (arms | default([], true)))
+         | selectattr('schema', 'defined') | list }}
+
+  tasks:
+    - name: preflight — the portal is known
+      ansible.builtin.assert:
+        that: portal_url | length > 0
+        fail_msg: >-
+          fabric_portal_url is not set. It names this deployment's portal, so it comes with
+          the pod's token, in host_vars/<pod>/05-fabric.yml — the platform layer does not
+          carry it.
+        quiet: true
+
+    - name: preflight — anchor is known
+      ansible.builtin.assert:
+        that: [fabric_slot_anchor is defined, fabric_slot_anchor | length == 32]
+        fail_msg: "fabric_slot_anchor must be set — it prefixes every key we publish."
+        quiet: true
+
+    # The gate at upload compares the UNQUALIFIED message name. Every protobuf format on
+    # this fabric is bare (protobuf:Entity, protobuf:SapientMessage); a fully-qualified
+    # name returns HTTP 422 format_mismatch.
+    - name: preflight — message names are unqualified
+      ansible.builtin.assert:
+        that: "'.' not in item.schema.message"
+        fail_msg: >-
+          {{ item.id }}: schema.message '{{ item.schema.message }}' is fully-qualified.
+          The portal matches the bare name — use '{{ item.schema.message.split(".") | last }}'.
+        quiet: true
+      loop: "{{ schema_publishers }}"
+      loop_control: { label: "{{ item.id }}" }
+
+    # Runs before the first no_log task. Without it, a plain SSH failure surfaces as
+    # "<error censored due to no log>", which sends you looking for a playbook bug.
+    - name: preflight — host is reachable
+      ansible.builtin.wait_for_connection:
+        timeout: 15
+      vars:
+        ansible_become: false
+
+    - name: operator API key (from the running portal; never stored on disk)  # noqa: command-instead-of-module risky-shell-pipe
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        docker inspect goat-zenoh-portal
+        --format '{{ "{{" }}range .Config.Env{{ "}}" }}{{ "{{" }}println .{{ "}}" }}{{ "{{" }}end{{ "}}" }}'
+        | grep '^PORTAL_OPERATOR_API_KEY=' | cut -d= -f2-
+      args: { executable: /bin/bash }
+      become: true
+      register: _opkey
+      changed_when: false
+      no_log: true
+      check_mode: false
+
+    - name: preflight — key resolved
+      ansible.builtin.assert:
+        that: _opkey.stdout | length > 0
+        fail_msg: "could not read PORTAL_OPERATOR_API_KEY from the goat-zenoh-portal container"
+        quiet: true
+
+    # ── descriptor set ──────────────────────────────────────────────────────
+    # Multi-file protos import each other by path, so the include root must contain a
+    # directory named exactly `import_root`. --include_imports is mandatory: without it
+    # the descriptor has dangling references to google/protobuf/* and decodes nothing.
+    - name: schema — fetch proto source
+      ansible.builtin.git:
+        repo: "{{ item.schema.proto_git }}"
+        dest: "{{ build_dir }}/{{ item.id }}/src"
+        depth: 1
+        version: "{{ item.schema.proto_ref | default('HEAD') }}"
+      loop: "{{ schema_publishers }}"
+      loop_control: { label: "{{ item.id }}" }
+
+    - name: schema — arrange the include root
+      ansible.builtin.shell: |
+        set -e
+        d={{ build_dir }}/{{ item.id }}
+        rm -rf "$d/root" && mkdir -p "$d/root/{{ item.schema.import_root }}"
+        cp -r "$d/src/." "$d/root/{{ item.schema.import_root }}/"
+        rm -rf "$d/root/{{ item.schema.import_root }}/.git"
+      loop: "{{ schema_publishers }}"
+      loop_control: { label: "{{ item.id }}" }
+      changed_when: false
+
+    - name: schema — compile descriptor set
+      ansible.builtin.shell: >-
+        docker run --rm -v {{ build_dir }}/{{ item.id }}/root:/w -w /w python:3.12.13-slim
+        sh -c 'pip install --quiet --disable-pip-version-check grpcio-tools==1.83.0 protobuf==7.35.1 &&
+        python -m grpc_tools.protoc -I. --include_imports --include_source_info
+        --descriptor_set_out=/w/schema.fds {{ item.schema.entry }} &&
+        chmod 0644 /w/schema.fds'
+      become: true
+      loop: "{{ schema_publishers }}"
+      loop_control: { label: "{{ item.id }} -> {{ item.schema.entry | basename }}" }
+      changed_when: false
+
+    # The portal's write-time gate rejects a format naming a message that is not
+    # top-level in the descriptor. Catch that here rather than as an HTTP 422.
+    - name: schema — descriptor contains the declared message at top level
+      ansible.builtin.shell: |
+        set -e
+        cat > {{ build_dir }}/{{ item.id }}/root/_assert.py <<'PYEOF'
+        import sys
+        from google.protobuf import descriptor_pb2
+        want = sys.argv[1]
+        fds = descriptor_pb2.FileDescriptorSet()
+        fds.ParseFromString(open("/w/schema.fds", "rb").read())
+        names = sorted({m.name for f in fds.file for m in f.message_type})
+        if want not in names:
+            print("NOT FOUND: %s\navailable: %s" % (want, names), file=sys.stderr)
+            sys.exit(1)
+        print("ok: %s (of %d top-level messages)" % (want, len(names)))
+        PYEOF
+        docker run --rm -v {{ build_dir }}/{{ item.id }}/root:/w -w /w python:3.12.13-slim \
+          sh -c 'pip install --quiet --disable-pip-version-check protobuf==7.35.1 && python /w/_assert.py "{{ item.schema.message }}"'
+      become: true
+      loop: "{{ schema_publishers }}"
+      loop_control: { label: "{{ item.id }}/{{ item.schema.message }}" }
+      changed_when: false
+
+    - name: schema — sha256 of each descriptor
+      ansible.builtin.stat:
+        path: "{{ build_dir }}/{{ item.id }}/root/schema.fds"
+        checksum_algorithm: sha256
+      register: _fds
+      loop: "{{ schema_publishers }}"
+      loop_control: { label: "{{ item.id }}" }
+
+    # ── portal ──────────────────────────────────────────────────────────────
+    - name: portal — existing topics
+      ansible.builtin.uri:
+        url: "{{ portal_url }}/api/orgs/{{ fabric_slot_anchor }}/topics"
+        headers: { Authorization: "Bearer {{ _opkey.stdout }}" }
+        validate_certs: false
+        return_content: true
+      register: _existing
+      changed_when: false
+      check_mode: false
+
+    - name: portal — register missing topics (format raw; createTopic is ungated)
+      ansible.builtin.uri:
+        url: "{{ portal_url }}/api/orgs/{{ fabric_slot_anchor }}/topics"
+        method: POST
+        headers: { Authorization: "Bearer {{ _opkey.stdout }}" }
+        body_format: json
+        validate_certs: false
+        status_code: [201, 409]
+        body:
+          key_pattern: "{{ fabric_slot_anchor }}/{{ item.1 }}"
+          format: raw
+          description: "{{ item.0.description | default(item.0.id) }} — registered by publish-to-portal.yml"
+      loop: "{{ schema_publishers | subelements('schema.topics') }}"
+      loop_control: { label: "{{ item.0.id }} :: {{ item.1 | regex_replace('^.*/', '') }}" }
+      when: >-
+        (fabric_slot_anchor ~ '/' ~ item.1)
+        not in (_existing.json.topics | default([]) | map(attribute='key_pattern') | list)
+
+    - name: portal — topics after registration
+      ansible.builtin.uri:
+        url: "{{ portal_url }}/api/orgs/{{ fabric_slot_anchor }}/topics"
+        headers: { Authorization: "Bearer {{ _opkey.stdout }}" }
+        validate_certs: false
+        return_content: true
+      register: _topics
+      changed_when: false
+      check_mode: false
+
+    - name: portal — set format to the declared protobuf message
+      ansible.builtin.uri:
+        url: >-
+          {{ portal_url }}/api/orgs/{{ fabric_slot_anchor }}/topics/{{
+          (_topics.json.topics | selectattr('key_pattern','equalto', fabric_slot_anchor ~ '/' ~ item.1)
+           | map(attribute='id') | first) }}
+        method: PATCH
+        headers: { Authorization: "Bearer {{ _opkey.stdout }}" }
+        body_format: json
+        validate_certs: false
+        body: { format: "protobuf:{{ item.0.schema.message }}" }
+      loop: "{{ schema_publishers | subelements('schema.topics') }}"
+      loop_control: { label: "{{ item.0.id }} :: protobuf:{{ item.0.schema.message }}" }
+      when: _topics.json.topics | selectattr('key_pattern','equalto', fabric_slot_anchor ~ '/' ~ item.1) | list | length > 0
+
+    # The portal is authoritative on whether it already holds this descriptor: a
+    # duplicate returns 409 {"code":"exists"}. Accepting that is more robust than
+    # pre-computing a digest comparison, and it makes re-runs a genuine no-op.
+    # noqa command-instead-of-module — deliberate, do not "fix" to uri. The uri module's
+    # form-multipart reads the file from the ANSIBLE CONTROLLER, not the remote host, so
+    # it silently uploads nothing here. curl runs where the descriptor actually is.
+    - name: portal — upload descriptor (409 = already present)  # noqa: command-instead-of-module risky-shell-pipe
+      ansible.builtin.shell: >-
+        curl -sSk -o /dev/null -w '%{http_code}' -X POST
+        -H "Authorization: Bearer {{ _opkey.stdout }}"
+        -F "file=@{{ build_dir }}/{{ item.0.id }}/root/schema.fds"
+        -F version=v1 -F compatibility=none -F format=protobuf-fds
+        "{{ portal_url }}/api/orgs/{{ fabric_slot_anchor }}/topics/{{
+          (_topics.json.topics | selectattr('key_pattern','equalto', fabric_slot_anchor ~ '/' ~ item.1)
+           | map(attribute='id') | first) }}/schemas"
+      loop: "{{ schema_publishers | subelements('schema.topics') }}"
+      loop_control: { label: "{{ item.0.id }} :: {{ item.1 | regex_replace('^.*/', '') }}" }
+      register: _upload
+      changed_when: _upload.stdout == "201"
+      failed_when: _upload.stdout not in ["201", "409"]
+      no_log: true
+
+    - name: portal — upload summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.0.id }} :: {{ item.item.1 | regex_replace('^.*/', '') }} —
+          {{ 'uploaded' if item.stdout == '201' else 'already present (409)' }}
+      loop: "{{ _upload.results }}"
+      loop_control: { label: "{{ item.item.0.id }}" }
+
+    - name: result
+      ansible.builtin.debug:
+        msg: >-
+          {{ fabric_slot_anchor }} — {{ schema_publishers | map(attribute='id') | list | join(', ') }}:
+          {{ schema_publishers | subelements('schema.topics') | list | length }} topic(s) declared.
+          Verify with stethoscope on the anchor: registration + schema-body should pass.

@@ -1,0 +1,50 @@
+# octo-pod arms — one Cargo workspace, one shared library, thin binaries.
+#
+# The modularity contract: everything an arm shares (mTLS session idiom,
+# provenance keying, allowlist, stats) lives in `common`; each arm crate is
+# a thin binary owning ONLY its wire protocol. Adding an arm = new member
+# crate + compose entry.
+#
+# Pinned zenoh version follows the GOAT fabric's pin:
+# =1.9.0, never float: a minor bump has changed wire behaviour before.
+
+[workspace]
+resolver = "2"
+members = ["common", "udp-ingest", "tcp-ingest", "tcp-connect", "health-pub", "egress", "sapient-proto", "sapient", "sapient-receiver", "uplink-bridge"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/usareur-af/octo-pod"
+
+[workspace.dependencies]
+octo-arm-common = { path = "common" }
+sapient-proto = { path = "sapient-proto" }
+octo-egress = { path = "egress" }
+zenoh = { version = "=1.9.0", features = ["unstable"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# sapient-proto: the SAPIENT wire format. protox compiles the vendored definitions in a
+# build script, so neither the builder image nor CI needs a protobuf toolchain to produce
+# bytes that would be identical either way.
+prost = "0.14"
+prost-types = "0.14"
+prost-build = "0.14"
+protox = "0.10"
+# The node identity a session arm registers under. Already resolved in-tree via zenoh;
+# the v4 feature is what mints one.
+uuid = { version = "1", features = ["v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16

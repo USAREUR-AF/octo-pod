@@ -1,0 +1,59 @@
+# /etc/containers/systemd/octo-egress-{{ d.id }}.container  MANAGED BY ANSIBLE
+{#
+   One unit per zenoh-egress destination declared in 40-egress.yml: the mirror of
+   octo-egress.container.j2 for a partner that already runs their own Zenoh mesh. The unit
+   runs whether or not the destination is released. Unreleased, its pen-reading certificate
+   matches no subject in the pen ACL, so its subscription is refused and it sends nothing;
+   releasing it is an ACL change, not a restart of this unit.
+
+   Caller supplies `d`, the destination's entry (kind: zenoh-egress).
+#}
+
+[Unit]
+Description=octo-pod zenoh-egress {{ d.id }} ({{ d.description | default('egress destination') }})
+After=octo-pen-zenoh-router.service network-online.target
+Wants=octo-pen-zenoh-router.service network-online.target
+
+[Container]
+Image={{ egress_image }}
+ContainerName=octo-egress-{{ d.id }}
+# Host networking: the arm dials the pen on this host AND the partner's own router,
+# wherever that is reachable from.
+Network=host
+Exec=/usr/local/bin/zenoh-egress-arm
+# The binary closes both sessions and its audit record on SIGINT; podman's default
+# SIGTERM would end it without either.
+PodmanArgs=--stop-signal=SIGINT
+Environment=ZENOH_EGRESS_ID={{ d.id }}
+Environment=ZENOH_EGRESS_KEYS={{ d['keys'] | join(',') }}
+# The granted prefix, declared twice (prefix + allow_prefix) — same defense-in-depth
+# idiom as EGRESS_ALLOW_DEST on a socket destination: the arm refuses to start unless
+# they agree.
+Environment=ZENOH_EGRESS_PREFIX={{ d.prefix }}
+Environment=ZENOH_EGRESS_ALLOW_PREFIX={{ d.allow_prefix }}
+# Our own pen — this arm's pod-CA identity, read-only on its granted downlink keys.
+Environment=ZENOH_EGRESS_PEN_ENDPOINT=tls/{{ mesh_ip }}:{{ pen_listen_port }}
+Environment=ZENOH_EGRESS_PEN_CERT=/etc/octo/tls/egress-cert.pem
+Environment=ZENOH_EGRESS_PEN_KEY=/etc/octo/tls/egress-key.pem
+Environment=ZENOH_EGRESS_PEN_ROOT_CA=/etc/octo/tls/ca-root.pem
+# The partner's own router — dialled under the certificate THEY issued, never ours.
+Environment=ZENOH_EGRESS_PARTNER_ENDPOINT={{ d.dest | regex_replace('^zenoh://', 'tls/') }}
+Environment=ZENOH_EGRESS_PARTNER_CERT=/etc/octo-partner/tls/partner-cert.pem
+Environment=ZENOH_EGRESS_PARTNER_KEY=/etc/octo-partner/tls/partner-key.pem
+Environment=ZENOH_EGRESS_PARTNER_ROOT_CA=/etc/octo-partner/tls/partner-ca.pem
+Environment=ZENOH_EGRESS_VERIFY_NAME_PARTNER={{ d.verify_name_partner | default(true) | lower }}
+Environment=ZENOH_EGRESS_AUDIT_DIR=/var/lib/octo-egress
+Environment=RUST_LOG={{ d.log_level | default('info') }}
+# Two TLS directories, two identities: our own pen-reading cert, and the partner's own
+# issued material. One destination's keys are not readable by another destination's arm.
+Volume=/etc/octo-egress-{{ d.id }}/tls:/etc/octo/tls:ro
+Volume=/etc/octo-egress-{{ d.id }}/partner-tls:/etc/octo-partner/tls:ro
+Volume={{ egress_audit_dir }}/{{ d.id }}:/var/lib/octo-egress
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

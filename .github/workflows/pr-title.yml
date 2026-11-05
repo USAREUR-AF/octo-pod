@@ -1,0 +1,48 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+# Supersede an in-flight run for the same ref, but never on main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  conventional-commits:
+    name: Conventional Commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          # type(scope): subject, or type: subject; at most 100 characters.
+          PATTERN='^(feat|fix|chore|docs|refactor|test|perf|ci|build|revert|adr)(\([a-z0-9._/-]+\))?!?: [^[:space:]].{0,98}$'
+          if [[ "${TITLE}" =~ ${PATTERN} ]]; then
+            echo "PR title OK: ${TITLE}"
+            exit 0
+          fi
+          cat <<MSG
+          ::error::The PR title doesn't follow Conventional Commits.
+
+          Got:      "${TITLE}"
+          Expected: "<type>(<scope>): <subject>" or "<type>: <subject>"
+
+          Types: feat, fix, chore, docs, refactor, test, perf, ci, build, revert, adr.
+          Scope: one, lowercase (a-z 0-9 . / _ -), no commas.
+
+          Examples:
+            feat(egress): serve a destination that dials the pod
+            fix(firewall): admit the mesh's relay ports on the WAN leg
+            docs(readme): say where the slot bundle comes from
+
+          See CONTRIBUTING.md, "Commits and Pull Request Titles".
+          MSG
+          exit 1

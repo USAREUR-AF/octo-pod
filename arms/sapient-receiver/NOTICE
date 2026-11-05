@@ -1,0 +1,14 @@
+SAPIENT BSI Flex 335 v2.0 Test Harness
+Crown-owned copyright, 2021-2024
+Licensed under the Apache License, Version 2.0.
+
+The rules in src/validate.rs are adapted from SapientServices/Data/Validation
+in https://github.com/dstl/BSI-Flex-335-v2-Test-Harness at commit
+6a2999d70d761d224914ddd8fa3f663af5005be0.
+
+Modifications: Rust descriptor-based validation, protobuf-JSON decoding,
+field-path diagnostics, TCP registration policy and regression tests.
+This is an attributed derivative, not a clean-room implementation.
+
+Unmodified reference vectors and their source license/notice are under
+tests/vectors/. The repository's Apache-2.0 license also applies to local changes.

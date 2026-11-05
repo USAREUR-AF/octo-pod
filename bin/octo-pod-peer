@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+octo-pod peer: what a zenoh-native peer may reach, read and take away.
+
+    octo-pod add-peer   c2 --from 10.1.2.30              declare it (see octo-pod-declare)
+    octo-pod peer allow-from  c2 --from 10.1.2.30,10.1.2.31
+    octo-pod peer allow-from  c2 --clear                  mesh-only again
+    octo-pod peer allow-read  c2 --key <anchor>/sensors/sensor2/** [--key ...]
+    octo-pod peer revoke-read c2 [--key <anchor>/sensors/sensor2/**]
+    octo-pod peer bundle      c2 [--out c2-bundle.tar.gz]
+    octo-pod peer check
+
+A peer already speaks Zenoh and holds a certificate this pod's CA minted (add-peer).
+By default it may WRITE its own namespace, raw/<id>/**, and nothing else, and it reaches
+the pen over the mesh only. Two things widen that, each explicit and each per peer:
+
+  allow-from   the pen's port opens on the LAN to exactly these IPv4 addresses, for this
+               peer. The firewall renders it; the certificate still decides what it may do.
+
+  allow-read   fabric keys released DOWN to this peer, through the same gate egress
+               destinations use: each key is added to downlink_allow (so the downlink
+               bridge republishes fabric key K on the pen as downlink/K) and the peer's
+               own release.from_fabric opens. Only then does this peer's CN, and nobody
+               else's, get a read on downlink/K. The peer subscribes to downlink/K, not K.
+
+revoke-read closes them again, and never drops a key from downlink_allow that another
+released destination or peer still reads. bundle packages what apply minted for the
+peer — certificate, key, our CA and instructions that describe exactly what the pen
+grants — so it can be handed over out of band.
+
+DESIGN, as for egress: this edits the DECLARATION and nothing else (bundle only reads).
+`octo-pod check` then `apply` render the grant, the firewall opening and the bundle.
+Every rule here is also enforced by the playbook's declaration gate and by the pen's ACL;
+here it is a fast, friendly refusal before anything is written.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import ipaddress
+import os
+import pathlib
+import re
+import sys
+import tarfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+
+
+def _egress():
+    """The egress CLI as a library: one key-scope rule, one gate editor, one slot check.
+    Loaded per call so it reads the same OCTO_* environment this process was given."""
+    loader = importlib.machinery.SourceFileLoader("octo_pod_egress", str(HERE / "octo-pod-egress"))
+    spec = importlib.util.spec_from_loader("octo_pod_egress", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+EG = _egress()
+die, load, find_block, edit_pod, allow_list = EG.die, EG.load, EG.find_block, EG.edit_pod, EG.allow_list
+PEN_STATE = EG.PEN_STATE
+
+
+def peers_of(d):
+    return {p.get("id"): p for p in (load(d / "20-peers.yml").get("peers") or [])}
+
+
+def the_peer(d, ident):
+    peers = peers_of(d)
+    if ident not in peers:
+        die(f"{ident} is not a declared peer. Known: {', '.join(sorted(k for k in peers if k)) or 'none'}. "
+            f"Declare one with: sudo octo-pod add-peer {ident}")
+    return peers[ident]
+
+
+def ipv4_sources(text):
+    out = []
+    for item in (x.strip() for x in str(text or "").split(",") if x.strip()):
+        try:
+            ip = ipaddress.IPv4Address(item)
+        except ValueError:
+            die(f"--from {item!r} is not a literal IPv4 address")
+        if ip.is_unspecified:
+            die("--from 0.0.0.0 would open the pen to anyone on the LAN")
+        out.append(str(ip))
+    if not out:
+        die("--from needs at least one IPv4 address (or --clear to make the peer mesh-only)")
+    return out
+
+
+# --- editing one peer's entry in 20-peers.yml, keeping its comments ------------------
+
+def _block(path, ident):
+    text = path.read_text()
+    span = find_block(text, ident)
+    if span is None:
+        die(f"{ident} has no entry in {path.name}")
+    return text, span
+
+
+def _drop(block, key):
+    """Remove a top-level field of the entry (and a list under it, if it is one)."""
+    return re.sub(rf"^    {key}:[^\n]*\n(?:      - [^\n]*\n)*", "", block, flags=re.M)
+
+
+def _after_namespace(block, lines):
+    """Insert field lines right after the namespace line, where a reader looks for them."""
+    m = re.search(r"^    namespace:[^\n]*\n", block, re.M)
+    if not m:
+        die("the peer's entry has no namespace line; fix 20-peers.yml by hand first")
+    return block[: m.end()] + lines + block[m.end():]
+
+
+def _set_from_fabric(block, value):
+    v = "true" if value else "false"
+    if re.search(r"^      from_fabric:", block, re.M):
+        return re.sub(r"^      from_fabric:[^\n]*", f"      from_fabric: {v}", block, count=1, flags=re.M)
+    if re.search(r"^    release:\s*$", block, re.M):
+        return re.sub(r"^    release:\s*\n", f"    release:\n      from_fabric: {v}\n", block, count=1, flags=re.M)
+    return block.rstrip("\n") + f"\n    release:\n      from_fabric: {v}\n"
+
+
+def edit_peer(d, ident, fn):
+    path = d / "20-peers.yml"
+    text, (start, end) = _block(path, ident)
+    block = text[start:end]
+    if not block.endswith("\n"):
+        block += "\n"
+    path.write_text(text[:start] + fn(block) + text[end:])
+    try:
+        back = peers_of(d)
+    except Exception as exc:  # noqa: BLE001 - any parse failure is the finding
+        die(f"wrote invalid YAML to {path}: {exc}")
+    if ident not in back:
+        die(f"{path} lost {ident} after the write; inspect it")
+    return back[ident]
+
+
+# --- verbs -----------------------------------------------------------------------------
+
+def cmd_allow_from(args, d):
+    the_peer(d, args.id)
+    if args.clear:
+        after = edit_peer(d, args.id, lambda b: _drop(b, "allow_sources"))
+        if after.get("allow_sources"):
+            die("allow_sources is still set after the edit; inspect 20-peers.yml")
+        print(f"{args.id} is mesh-only again: the pen's LAN opening for it goes at the next apply")
+    else:
+        ips = ipv4_sources(args.src)
+        line = f'    allow_sources: "{", ".join(ips)}"   # dials the pen over the LAN from these only\n'
+        after = edit_peer(d, args.id, lambda b: _after_namespace(_drop(b, "allow_sources"), line))
+        if str(after.get("allow_sources")) != ", ".join(ips):
+            die("allow_sources did not land as written; inspect 20-peers.yml")
+        lan_ip = str(load(d / "00-site.yml").get("lan_ip", "") or "")
+        print(f"{args.id} may dial the pen over the LAN from {', '.join(ips)}")
+        if not lan_ip:
+            print("note: this pod has no lan_ip in 00-site.yml, so its bundle cannot name the "
+                  "address to dial. Set it with: sudo octo-pod set-lan --iface <if> --addr <ip>/<prefix>")
+    print("\nNothing on the pod has changed yet. Next:\n  octo-pod check\n  sudo octo-pod apply")
+    return 0
+
+
+def cmd_allow_read(args, d):
+    peer = the_peer(d, args.id)
+    if not args.key:
+        die("give at least one --key: a fabric key to release to this peer, starting with its "
+            "publisher's anchor (or release/<lane>/), e.g. <anchor>/sensors/sensor2/**")
+    bad = [p for p in (EG.key_problem(k) for k in args.key) if p]
+    if bad:
+        die("refusing these keys:\n  - " + "\n  - ".join(bad))
+    pod_file = d / "10-pod.yml"
+    pod = load(pod_file)
+
+    # The slot, exactly as `octo-pod egress release --slot` takes it: authenticated before
+    # anything is edited, so a bad bundle changes nothing.
+    slot = trusted = None
+    if args.slot:
+        slot = EG.slot_material(args.slot)
+        try:
+            trusted = EG.slotlib.trust(slot, expected=args.ca_fingerprint,
+                                       pinned_ca=str(pod.get(EG.slotlib.PIN_CA, "") or ""),
+                                       pinned_roots=str(pod.get(EG.slotlib.PIN_ROOTS, "") or ""),
+                                       ask=EG.slotlib.terminal_ask())
+        except EG.slotlib.SlotError as exc:
+            die(str(exc))
+    elif args.ca_fingerprint:
+        die("--ca-fingerprint checks the key that signs a bundle: pass it with --slot")
+
+    keys = list(peer.get("read_keys") or [])
+    keys += [k for k in args.key if k not in keys]
+    lines = "    read_keys:\n" + "".join(f'      - "{k}"\n' for k in keys)
+    after = edit_peer(d, args.id, lambda b: _set_from_fabric(_after_namespace(_drop(b, "read_keys"), lines), True))
+    if list(after.get("read_keys") or []) != keys or not EG.released(after):
+        die("read_keys or release.from_fabric did not land as written; inspect 20-peers.yml")
+
+    allow = allow_list(pod)
+    allow += [k for k in keys if k not in allow]
+    edit_pod(pod_file, "downlink_allow", ",".join(allow))
+    apply = "  sudo octo-pod apply"
+    if slot:
+        edit_pod(pod_file, "fabric_slot_anchor", slot.anchor)
+        print(f"set fabric_slot_anchor to {slot.anchor} in 10-pod.yml")
+        for line in EG.slotlib.record(pod_file, trusted):
+            print(line)
+        for warning in trusted.warnings:
+            print(f"WARNING: {warning}")
+        EG.set_fabric(d, trusted.endpoint, args.router_ip)
+        apply = (f"  sudo octo-pod apply \\\n    -e fabric_slot_cert_src={slot.cert} \\\n"
+                 f"    -e fabric_slot_key_src={slot.key} \\\n    -e fabric_ca_root_src={slot.ca}")
+    elif not str(pod.get("fabric_slot_anchor", "") or ""):
+        print("note: this pod holds no slot, so the downlink bridge cannot read the fabric and "
+              "nothing will come down. Re-run with --slot <the bundle GOAT issued for this pod> "
+              "--ca-fingerprint <fp>.")
+    print(f"""released to {args.id}: {', '.join(keys)}
+downlink_allow now holds {len(allow)} key(s). Nothing has been applied.
+
+  octo-pod check
+{apply}
+
+apply grants {peer.get('cert_cn')} a read on {', '.join('downlink/' + k for k in keys)}
+and nothing else, and regenerates its bundle. The peer subscribes to those downlink/ keys.
+Hand the new instructions over with:
+  sudo octo-pod peer bundle {args.id}""")
+    return 0
+
+
+def cmd_revoke_read(args, d):
+    peer = the_peer(d, args.id)
+    had = list(peer.get("read_keys") or [])
+    if not had:
+        print(f"{args.id} reads nothing; nothing to revoke")
+        return 0
+    gone = list(args.key) if args.key else had
+    unknown = [k for k in gone if k not in had]
+    if unknown:
+        die(f"{args.id} does not read {unknown}; it reads {had}")
+    keep = [k for k in had if k not in gone]
+
+    def change(b):
+        b = _drop(b, "read_keys")
+        if keep:
+            return _after_namespace(b, "    read_keys:\n" + "".join(f'      - "{k}"\n' for k in keep))
+        return _set_from_fabric(b, False)
+    after = edit_peer(d, args.id, change)
+    if list(after.get("read_keys") or []) != keep:
+        die("read_keys did not land as written; inspect 20-peers.yml")
+
+    # Drop from the gate only what no other released reader still needs.
+    pod_file = d / "10-pod.yml"
+    still = EG.still_needed(d, "peer", args.id) | set(keep)
+    allow = [k for k in allow_list(load(pod_file)) if k in still or k not in gone]
+    edit_pod(pod_file, "downlink_allow", ",".join(allow))
+    kept = [k for k in gone if k in allow]
+    print(f"revoked from {args.id}: {', '.join(gone)}")
+    if kept:
+        print(f"kept in downlink_allow, still read by another destination or peer: {', '.join(kept)}")
+    print(f"downlink_allow now holds {len(allow)} key(s)\n\nNext: sudo octo-pod apply, which "
+          "withdraws the read grant and regenerates the bundle.")
+    return 0
+
+
+def cmd_bundle(args, d):
+    peer = the_peer(d, args.id)
+    cn = peer.get("cert_cn") or f"octo-peer-{args.id}"
+    src = PEN_STATE / "bundles" / args.id
+    files = [src / "README.md", src / "tls" / f"{cn}-cert.pem", src / "tls" / f"{cn}-key.pem",
+             src / "tls" / "ca-roots.pem"]
+    missing = [str(f) for f in files if not f.is_file()]
+    if missing:
+        die(f"{args.id}'s bundle is not minted yet (missing {', '.join(missing)}). "
+            "Run: sudo octo-pod apply")
+    # The README must describe what the pen enforces NOW. A declaration edited after the
+    # last apply (allow-read, allow-from) means the instructions describe the old grant.
+    decl = d / "20-peers.yml"
+    if decl.stat().st_mtime > (src / "README.md").stat().st_mtime:
+        die(f"20-peers.yml changed after {args.id}'s bundle was rendered, so its instructions "
+            "would describe the old grant. Run: sudo octo-pod apply, then this again.")
+    out = pathlib.Path(args.out or f"{args.id}-octo-pod-bundle.tar.gz").resolve()
+    old = os.umask(0o077)   # the archive holds a private key
+    try:
+        with tarfile.open(out, "w:gz") as tar:
+            for f in files:
+                tar.add(f, arcname=f"{args.id}/{f.relative_to(src)}")
+    finally:
+        os.umask(old)
+    os.chmod(out, 0o600)
+    digest = hashlib.sha256(out.read_bytes()).hexdigest()
+    reads = [f"downlink/{k}" for k in (peer.get("read_keys") or [])] if EG.released(peer) else []
+    print(f"""wrote {out} (mode 0600)
+  sha256 {digest}
+
+  {args.id} may write   {peer.get('namespace')}
+  {args.id} may read    {', '.join(reads) or 'nothing'}
+  {args.id} dials in    {'over the LAN from ' + str(peer['allow_sources']) if peer.get('allow_sources') else 'over the mesh'}
+
+It holds {args.id}'s private key. Hand it over out of band, give them the sha256 separately
+so they can check it, and delete your copy once they confirm receipt.""")
+    return 0
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.stderr.write(
+            "\nERROR: run with sudo. Declarations live in /etc/octo-pod, which is root-owned.\n"
+            f"  sudo octo-pod peer {' '.join(sys.argv[1:]) or '<verb> ...'}\n\n")
+        return 2
+    ap = argparse.ArgumentParser(prog="octo-pod peer")
+    ap.add_argument("verb", choices=["allow-from", "allow-read", "revoke-read", "bundle", "check"])
+    ap.add_argument("id", nargs="?")
+    ap.add_argument("--from", dest="src", help="allow-from: IPv4 addresses that may dial the pen over the LAN")
+    ap.add_argument("--clear", action="store_true", help="allow-from: make the peer mesh-only again")
+    ap.add_argument("--key", action="append", default=[],
+                    help="allow-read / revoke-read: a fabric key, starting with its publisher's "
+                         "anchor (or release/<lane>/); repeat for more")
+    ap.add_argument("--out", help="bundle: where to write the archive (default ./<id>-octo-pod-bundle.tar.gz)")
+    ap.add_argument("--slot", help="allow-read: the bundle GOAT issued for this pod, when it holds no slot yet")
+    ap.add_argument("--router-ip", help="allow-read --slot: the router's mesh address, pinned when no pin exists")
+    ap.add_argument("--ca-fingerprint", help="allow-read --slot: the fingerprint of the key that signs the bundle")
+    args = ap.parse_args()
+    d = EG.pod_dir()
+    if args.verb == "check":
+        return EG.cmd_check(d)
+    if not args.id:
+        die(f"usage: octo-pod peer {args.verb} <peer-id>")
+    if args.verb == "allow-from" and not (args.src or args.clear):
+        die("usage: octo-pod peer allow-from <id> --from <ip>[,<ip>] | --clear")
+    if args.verb == "allow-from" and args.src and args.clear:
+        die("give --from or --clear, not both")
+    return {"allow-from": cmd_allow_from, "allow-read": cmd_allow_read,
+            "revoke-read": cmd_revoke_read, "bundle": cmd_bundle}[args.verb](args, d)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

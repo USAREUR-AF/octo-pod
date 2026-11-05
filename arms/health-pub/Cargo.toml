@@ -1,0 +1,24 @@
+[package]
+name = "octo-health-pub"
+version = "0.1.0"
+# Never goes to crates.io: it is built into a container image and pulled by digest.
+# Without this, cargo-deny treats it as publishable and rejects octo-arm-common as a
+# wildcard dependency, because crates.io disallows path deps in published crates. Every
+# other crate in this workspace already says so; this one was added without it.
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+octo-arm-common = { workspace = true }
+zenoh = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

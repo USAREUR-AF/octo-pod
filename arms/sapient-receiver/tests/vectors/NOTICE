@@ -1,0 +1,11 @@
+SAPIENT BSI Flex 335 v2.0 Test Harness
+Crown-owned copyright, 2021-2024. Licensed under Apache-2.0.
+Source: https://github.com/dstl/BSI-Flex-335-v2-Test-Harness
+Commit: 6a2999d70d761d224914ddd8fa3f663af5005be0
+
+The true/ and false/ JSON files are unmodified reference vectors from
+SapientServicesValidator.UnitTests/{True,False}. manifest.json records SHA-256
+hashes. The Rust validator is an attributed port of SapientServices/Data/Validation,
+not a clean-room implementation. Local adaptation and tests are described in
+../../README.md. The corpus verifies reference-vector verdicts, not all possible
+messages or a production SAPIENT controller's behavior.

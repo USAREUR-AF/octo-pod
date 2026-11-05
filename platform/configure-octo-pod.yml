@@ -1,0 +1,2532 @@
+---
+# octo-pod — declarative box build.
+# Run whole:   ansible-playbook -i inventory.ini configure-octo-pod.yml
+# Run a part:  ansible-playbook -i inventory.ini configure-octo-pod.yml --tags pen,arm,isolation
+# Verify:      ansible-playbook -i inventory.ini verify-octo-pod.yml
+# Secrets (fabric slot, box become pass) come from --extra-vars / a vault — see README.
+#
+# The pod was hand-built first; this playbook was written to MATCH it and first ran
+# clean on 2026-08-12. Treat a diff as a change you meant to make.
+#
+# Always --check --diff first. Two caveats about what check mode can and cannot tell you:
+#   · `command`/`shell` tasks SKIP entirely, so anything they do is unverified
+#   · `copy` with inline content does not validate the parent dir, so a task can
+#     report a clean create and then fail for real
+# A green check proves the diffs are right. It does not prove the play completes.
+#
+# Highest-risk task is the one owning the ingest NIC — that is how a LAN publisher
+# reaches us, and its handler reapplies the connection.
+- name: octo-pod box
+  hosts: octopod
+  become: true
+  gather_facts: true
+
+  tasks:
+    # =================================================================== baseline
+    - name: baseline — packages present
+      ansible.builtin.package:
+        name: [openssl, netcat-openbsd, nftables, logrotate, python3-venv]
+        state: present
+      retries: 20
+      delay: 15
+      register: _pkgs
+      until: _pkgs is succeeded          # unattended-upgrades holds the dpkg lock on a fresh box
+      tags: [baseline]
+
+    # NO MIRROR DECLARED? LOOK, RATHER THAN REMEMBER. `-e image_mirror=localhost:5000`
+    # applies to the bootstrap run that was given it, and bootstrap happens before the pod
+    # has an identity, so there is nowhere yet to write it down. The operator is then
+    # expected to repeat it with `set-mesh --mirror`, and that step was missed twice by the
+    # same person in one afternoon, both times surfacing as `apply` refusing at the first
+    # private image. A step people keep missing is a design defect, not a documentation one.
+    #
+    # The alternative was to have bootstrap stash what it was told. This is better, and the
+    # difference is the project's own rule: converge on what IS, not on what an earlier run
+    # remembered. A stash is edge-triggered memory that goes stale and can disagree with the
+    # box; a probe cannot, because it asks the registry.
+    #
+    # SAFE BECAUSE EVERYTHING IS DIGEST-PINNED. localhost:5000/x@sha256:abc and
+    # ghcr.io/x@sha256:abc are the same bytes by construction: the digest IS the identity,
+    # so a mirror cannot serve different content. This would be a bad idea for tags.
+    #
+    # A HINT, NOT THE ENFORCEMENT. The per-image asserts further down still run and still
+    # refuse, with their own messages, if anything is actually missing. This only spares
+    # the pod from reaching for a registry it holds no credential for while a complete copy
+    # of the same bytes sits on the box.
+    - name: images — no mirror declared, so is one running here?
+      ansible.builtin.uri:
+        url: >-
+          http://localhost:5000/v2/{{ zenoh_image_upstream
+            | regex_replace('^[a-z0-9-]+[.:][a-z0-9.:-]*/', '') | regex_replace('@.*$', '') }}/manifests/{{
+            zenoh_image_upstream | regex_replace('^.*@', '') }}
+        headers:
+          Accept: "application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+        status_code: [200, 401, 404]
+        timeout: 3
+      register: _local_registry
+      failed_when: false
+      changed_when: false
+      when: (image_mirror | default('')) | length == 0
+      tags: [always]
+
+    - name: images — use it
+      ansible.builtin.set_fact:
+        image_mirror: "localhost:5000"
+      when:
+        - (image_mirror | default('')) | length == 0
+        - (_local_registry.status | default(0)) == 200
+      tags: [always]
+
+    # Reported, never silent. Which registry a pod pulls from is not a detail, and an
+    # operator who never states it should still be told what was chosen for them.
+    - name: images — say so
+      ansible.builtin.debug:
+        msg: >-
+          No image_mirror is declared, and a registry on this pod is serving the exact
+          digests this version pins, so it is being used. The pod needs no registry
+          credential and reaches nothing outside itself for images.
+
+          To make that explicit rather than inferred: octo-pod set-mesh --mirror localhost:5000
+      when:
+        - image_mirror | default('') == 'localhost:5000'
+        - (_local_registry.status | default(0)) == 200
+      tags: [always]
+
+    # THE CONTAINER RUNTIME GID HAS NO NAME ON THE HOST, which is normal for a distroless
+    # image and costs two kinds of noise: ansible prints "failed to look up group with gid
+    # 65532" on every task that sets it, and `ls -l` shows the owner as UNKNOWN. Neither is
+    # a fault, and both read as one, which is the problem. On a recorded install the
+    # warning was the thing an operator asked about.
+    #
+    # Guarded on the gid being unclaimed. If something else already owns it, that name is
+    # the right one and adding a second group for the same gid is an error rather than an
+    # improvement, so this leaves it alone and the warning with it.
+    - name: baseline — is the container runtime gid already named?
+      ansible.builtin.command: "getent group {{ audit_runtime_uid }}"
+      register: _rt_gid
+      changed_when: false
+      failed_when: false
+      tags: [always]
+
+    - name: baseline — give the container runtime gid a name
+      ansible.builtin.group:
+        name: octo-nonroot
+        gid: "{{ audit_runtime_uid }}"
+        system: true
+        state: present
+      when: _rt_gid.rc != 0
+      tags: [always]
+
+    # 2026-08-10: logrotate was NOT installed, so /var/log/syslog had grown to
+    # 2.2 GB — a Zenoh publisher that failed to start logged 4 lines per dropped
+    # sample, indefinitely. Rotation was also time-only (weekly), which gives a
+    # runaway logger a full week to run. maxsize adds a size trigger.
+    # lineinfile (not replace) so it is idempotent on a box where this was already
+    # applied by hand — `replace` would append a second maxsize on every run.
+    - name: baseline — log rotation keeps N generations
+      ansible.builtin.lineinfile:
+        path: /etc/logrotate.d/rsyslog
+        regexp: '^\s*rotate\s+\d+'
+        line: "\trotate {{ logrotate_keep }}"
+      failed_when: false                 # absent on a host without rsyslog
+      tags: [baseline]
+
+    - name: baseline — log rotation has a SIZE trigger, not just weekly
+      ansible.builtin.lineinfile:
+        path: /etc/logrotate.d/rsyslog
+        regexp: '^\s*maxsize\s+'
+        line: "\tmaxsize {{ logrotate_maxsize }}"
+        insertafter: '^\s*rotate\s+\d+'
+      failed_when: false                 # absent on a host without rsyslog
+      tags: [baseline]
+
+    # journald was VOLATILE, so every log from before a reboot was lost — which is
+    # why the 2026-08-10 restart could not be diagnosed at all. Persist it, and cap
+    # it, since the default is 10% of the filesystem (~93 GB on this box).
+    - name: baseline — journald drop-in dir
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: "0755"
+      tags: [baseline]
+
+    - name: baseline — journald persistent + capped
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/10-octopod.conf
+        content: |
+          # Managed by Ansible — octo-pod baseline
+          [Journal]
+          Storage=persistent
+          SystemMaxUse={{ journald_max_use | default('2G') }}
+          SystemMaxFileSize={{ journald_max_file | default('200M') }}
+        mode: "0644"
+      notify: restart journald
+      tags: [baseline]
+
+    - name: baseline — journal dir exists (Storage=persistent needs it)
+      ansible.builtin.file:
+        path: /var/log/journal
+        state: directory
+        mode: "2755"
+        owner: root
+        group: systemd-journal
+      notify: restart journald
+      tags: [baseline]
+
+    - name: baseline — force apt/curl to IPv4 (uplink often lacks working v6)
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99force-ipv4
+        content: "Acquire::ForceIPv4 \"true\";\n"
+        mode: "0644"
+      tags: [baseline]
+
+    # =================================================================== network
+    # 2026-08-10: lan_ip was declared but NOTHING applied it. It had been set by hand
+    # with `ip addr add`, which persists nothing, so a reboot dropped it — the NIC took a
+    # DHCP lease from the wrong subnet, the publisher had nobody to dial, and the feed
+    # died silently for a day.
+    #
+    # network_managed: false on a pod whose NIC is already owned by something else
+    # (a box where NetworkManager already wrote its own netplan file). Two files configuring one
+    # interface is worse than either alone.
+    # A pod with no ingest leg declared yet is a legitimate state — `join` converges
+    # before anyone has run `set-lan`, and a pod that only takes mesh publishers never
+    # needs one. Rendering this from blanks produced `:` as the interface name and
+    # "/24" as the address; `netplan generate` then failed and took the whole join with
+    # it. Guard on the values, not on the flag.
+    - name: network — ingest LAN address (reboot-safe, netplan)
+      ansible.builtin.template:
+        src: host/netplan.yaml.j2
+        dest: /etc/netplan/50-octo-pod.yaml
+        mode: "0600"                       # netplan warns loudly on world-readable config
+      when:
+        - network_managed | default(true)
+        - lan_iface | default('') | length > 0
+        - lan_ip | default('') | length > 0
+      notify: apply netplan
+      tags: [network]
+
+    # Validates the whole /etc/netplan set without touching the running config. Catches a
+    # bad render before the handler can strand us.
+    - name: network — netplan config is valid
+      ansible.builtin.command: netplan generate
+      changed_when: false
+      when:
+        - network_managed | default(true)
+        - lan_iface | default('') | length > 0
+        - lan_ip | default('') | length > 0
+      tags: [network]
+
+    # Only needed when a publisher sits outside {{ lan_ip }}/{{ lan_prefix | default(16) }}.
+    # An on-link publisher needs nothing here — see partner_subnet in 00-site.yml.
+    - name: network — scoped route to a partner subnet via the ingest LAN
+      ansible.builtin.command: "ip route replace {{ partner_subnet }} dev {{ lan_iface }}"
+      register: r_partner_route
+      changed_when: false
+      when: partner_subnet | default('') | length > 0
+      tags: [network]
+
+    # mesh_ip is a FACT, not a declaration: NetBird assigns it at enrolment, and it is
+    # not stable across a re-enrolment. Pinning it in host_vars is how two configs broke
+    # when a peer moved. It is load-bearing — the pen certificate's SAN and every arm's
+    # default bind address — so derive it here and fail loudly if it cannot be found,
+    # rather than render an empty string into a certificate.
+    # awk does the extraction, not a Jinja filter chain: regex_search returns None when
+    # the interface is absent, and `None | first` raises rather than yielding an empty
+    # string — turning "not enrolled yet" into an unreadable template error.
+    - name: network — this pod's mesh address
+      ansible.builtin.shell: |
+        set -o pipefail
+        ip -4 -o addr show dev {{ mesh_iface | default('wt0') }} 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'
+      args: { executable: /bin/bash }
+      register: _mesh_addr
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [always]
+
+    # NOT ONLY THE MESH. Despite the name, this value answers one question — what
+    # address does a publisher reach this pod on — and it becomes the router's endpoint,
+    # every arm's connect endpoint, and an arm's default bind address. On a mesh pod
+    # that is wt0. On a pod whose sensors sit on the same LAN and which joins nothing,
+    # it is the LAN address, and looking only at wt0 made that pod impossible to build:
+    # `octo-pod init` creates exactly that shape, and `apply` then refused it and told
+    # the operator to run `join`, which is the one thing they had decided not to do.
+    - name: network — the address publishers reach this pod on (fallback)
+      ansible.builtin.shell: |
+        set -o pipefail
+        # Via the DEFAULT ROUTE'S INTERFACE, so no address is named here. `ip route get
+        # <addr>` would be shorter and would put someone else's IP in the platform
+        # layer, which ships unchanged to every site — and the test that guards that
+        # caught it, correctly.
+        dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+        [ -n "$dev" ] || exit 0
+        ip -4 -o addr show dev "$dev" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'
+      args: { executable: /bin/bash }
+      register: _route_addr
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [always]
+
+    # In order of how much someone MEANT it: a declared value, then the mesh, then the
+    # declared ingest LAN, then the address this box actually routes from. The last is a
+    # guess, so it is last — but a working guess beats refusing to build a pod whose
+    # shape the product documents as supported.
+    - name: network — resolve mesh_ip (declared, else mesh, else LAN, else routed-from)
+      ansible.builtin.set_fact:
+        mesh_ip: "{{ (mesh_ip | default('') | trim)
+                     or (_mesh_addr.stdout | default('') | trim)
+                     or (lan_ip | default('') | trim)
+                     or (_route_addr.stdout | default('') | trim) }}"
+      tags: [always]
+
+    - name: network — the address publishers reach this pod on is known
+      ansible.builtin.assert:
+        that: mesh_ip | length > 0
+        fail_msg: >-
+          Cannot determine an address for this pod. It has no '{{ mesh_iface | default('wt0') }}'
+          interface, no lan_ip declared, and no default route to derive one from — so
+          there is no address to put in the router's certificate or to tell a publisher
+          to connect to. Either join a mesh, or declare the leg your sensors are on:
+          'octo-pod set-lan --iface <if> --addr <ip>/<prefix>'.
+        quiet: true
+      tags: [always]
+
+    # EVERY LEG THE POD ANSWERS ON, not only the one it prefers today. The router's
+    # certificate named a single address, and the mint is creates:-guarded — so a pod
+    # that later joins a mesh keeps a certificate naming only its LAN address, while now
+    # using its mesh one. Nothing re-mints it, and a publisher on the new leg meets a
+    # certificate that does not mention where it connected.
+    #
+    # Cheap to be right: a SAN can hold every address, and a pod reachable on two legs
+    # genuinely is reachable on two legs.
+    - name: network — every address this pod answers on
+      ansible.builtin.set_fact:
+        pod_san_ips: "{{ [mesh_ip, (_mesh_addr.stdout | default('') | trim),
+                          (lan_ip | default('') | trim),
+                          (_route_addr.stdout | default('') | trim)]
+                         | select('truthy') | unique | list }}"
+      tags: [always]
+
+    # An existing certificate is NOT re-minted (creates:), which is right — re-minting on
+    # every run would churn every publisher's trust. But a certificate that does not name
+    # the address in use is a handshake failure waiting for the next connection, so say
+    # so rather than let it be discovered as "the arm cannot connect any more".
+    - name: network — does the router certificate still name this pod's address?
+      ansible.builtin.command: "openssl x509 -noout -ext subjectAltName -in {{ pen_state_dir }}/zenoh/tls/pod-cert.pem"
+      register: _pod_san
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: network — the certificate predates an address this pod now uses
+      ansible.builtin.debug:
+        msg: >-
+          The router certificate does not name {{ mesh_ip }}. It was minted when this pod
+          answered on a different address, and it is not re-minted automatically because
+          that would churn the trust every publisher already holds. Publishers verifying
+          the name will fail against this leg. To re-issue it with every current address:
+          rm {{ pen_state_dir }}/zenoh/tls/pod-cert.pem {{ pen_state_dir }}/zenoh/tls/pod-key.pem
+          && octo-pod apply
+      when:
+        - _pod_san.rc | default(1) == 0
+        - mesh_ip not in (_pod_san.stdout | default(''))
+      tags: [always]
+
+    - name: network — which address was chosen, and why it matters
+      ansible.builtin.debug:
+        msg: >-
+          publishers reach this pod at {{ mesh_ip }}
+          ({{ 'declared' if (lan_ip | default('') | trim) == mesh_ip and (_mesh_addr.stdout | default('') | trim) == ''
+              else ('the mesh' if (_mesh_addr.stdout | default('') | trim) == mesh_ip
+                    else 'derived from this box default route') }}).
+          It goes in the router certificate, so a publisher that reaches this pod by a
+          different address will fail the handshake rather than connect quietly.
+      tags: [always]
+
+    - name: network — fabric mesh DNS pins in /etc/hosts (load-bearing)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        # %-15s keeps the names column-aligned, matching how the file is already
+        # written — otherwise every run rewrites both lines for whitespace alone.
+        line: "{{ '%-15s' | format(item.ip) }}{{ item.names }}"
+        # anchored, because one pinned name is routinely a SUBSTRING of another —
+        # 'netbird.<fabric>' inside 'zenoh.<mesh>.netbird.<fabric>'. Unanchored, the two
+        # pins overwrite each other and the bridge loses its upstream resolution.
+        regexp: "^[0-9.]+\\s+{{ item.names.split()[0] | regex_escape }}(\\s|$)"
+        state: present
+      loop: "{{ fabric_host_pins }}"
+      tags: [network]
+
+    # =============================================================== self-heal
+    - name: self-heal — script
+      ansible.builtin.template:
+        src: host/netbird-selfheal.sh.j2
+        dest: /usr/local/sbin/netbird-selfheal.sh
+        mode: "0755"
+      when: selfheal_enabled
+      tags: [self_heal]
+
+    - name: self-heal — cron
+      ansible.builtin.copy:
+        dest: /etc/cron.d/netbird-selfheal
+        content: |
+          # netbird self-heal — keeps the fabric mesh alive so we don't lose remote access to this box
+          * * * * * root /usr/local/sbin/netbird-selfheal.sh >/dev/null 2>&1
+        mode: "0644"
+      when: selfheal_enabled
+      tags: [self_heal]
+
+    # netbird is how this box is reachable at all, and cron is what runs the self-heal
+    # script. A silent failure here means the pod is one hiccup from being unrecoverable
+    # remotely, so this no longer swallows errors.
+    - name: self-heal — services enabled
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop: [cron, netbird]
+      when: selfheal_enabled
+      tags: [self_heal]
+
+    # ============================================================ cert expiry
+    # `verify --tags certs` checks the same thing, but only when someone runs it, and
+    # nobody runs verify on a pod that appears to be working. Nothing renews the pen
+    # router's leaf automatically — the CA lives on the mgmt host and re-issue is an
+    # operator action — so an unnoticed expiry stops the pen accepting arms and presents
+    # as a broken router rather than an expired certificate.
+    #
+    # A failed timer unit is the only always-present signal on this box: there is no
+    # node_exporter here, so Prometheus cannot see it. `systemctl --failed` can.
+    - name: cert-expiry — daily check script
+      ansible.builtin.template:
+        src: pen/cert-expiry-check.sh.j2
+        dest: /usr/local/sbin/pen-cert-expiry-check
+        mode: "0755"
+      tags: [certs]
+
+    # REPAIR, not report — the two are deliberately separate units. The check above is
+    # the alarm and only ever warns; this renews. A pod's leaves are signed by a CA that
+    # lives on the pod, so the box can do this itself, and a box at a border site has
+    # nobody who could do it for them. Without this, every pod stops accepting arms
+    # ~825 days after provisioning, on a date you could put in a diary.
+    - name: cert-renew — renewal script (the pen signs its own leaves)
+      ansible.builtin.template:
+        src: pen/cert-renew.sh.j2
+        dest: /usr/local/sbin/pen-cert-renew
+        mode: "0755"
+      tags: [certs]
+
+    - name: cert-expiry — service + daily timer
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.name }}"
+        mode: "0644"
+        content: "{{ item.body }}"
+      loop:
+        - name: pen-cert-expiry.service
+          body: |
+            [Unit]
+            Description=Check the pen router certificate has not silently expired
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/pen-cert-expiry-check
+        - name: pen-cert-expiry.timer
+          body: |
+            [Unit]
+            Description=Daily pen router certificate expiry check
+            [Timer]
+            OnCalendar=daily
+            Persistent=true
+            RandomizedDelaySec=1h
+            [Install]
+            WantedBy=timers.target
+        - name: pen-cert-renew.service
+          body: |
+            [Unit]
+            Description=Renew the pen's own leaf certificates from the local CA
+            After=network-online.target
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/pen-cert-renew
+        - name: pen-cert-renew.timer
+          body: |
+            [Unit]
+            Description=Daily pen certificate renewal
+            [Timer]
+            OnCalendar=daily
+            # Persistent so a pod that was powered off through its renewal window runs
+            # it on the next boot rather than waiting another day — which matters most
+            # on exactly the boxes that are off for weeks between exercises.
+            Persistent=true
+            RandomizedDelaySec=2h
+            [Install]
+            WantedBy=timers.target
+      loop_control: { label: "{{ item.name }}" }
+      notify: reload systemd
+      tags: [certs]
+
+    - name: cert-expiry — timers enabled
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop: [pen-cert-expiry.timer, pen-cert-renew.timer]
+      tags: [certs]
+
+    # Run it once at converge time. A pod provisioned from an image built long ago can
+    # be past its renewal window the moment it is switched on, and waiting a day to
+    # discover that is a day of an arm being refused.
+    - name: cert-renew — run once now
+      ansible.builtin.command: /usr/local/sbin/pen-cert-renew
+      register: _cert_renew
+      changed_when: "'RENEWED' in _cert_renew.stdout"
+      tags: [certs]
+
+    # =============================================================== watchdog
+    # The control loop this pod was missing. `apply` is level-triggered and correct, but
+    # it only runs when a human runs it, so everything between two applies was unwatched.
+    # This watches continuously and repairs RUNTIME FAULTS ONLY — never a declaration.
+    - name: watchdog — script
+      ansible.builtin.template:
+        src: host/octo-watchdog.sh.j2
+        dest: /usr/local/sbin/octo-watchdog
+        mode: "0755"
+      tags: [watchdog]
+
+    - name: watchdog — service + timer
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.name }}"
+        mode: "0644"
+        content: "{{ item.body }}"
+      loop:
+        - name: octo-watchdog.service
+          body: |
+            [Unit]
+            Description=Repair octo-pod runtime faults (never applies configuration)
+            After=network-online.target
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/octo-watchdog
+        - name: octo-watchdog.timer
+          body: |
+            [Unit]
+            Description=octo-pod runtime fault watchdog
+            [Timer]
+            # A minute, matching the mesh self-heal already on this box. A sink is
+            # repaired on the second consecutive bad check, so worst case is ~2 minutes
+            # of missing audit — data, which is replaceable, rather than the pod.
+            OnBootSec=2min
+            OnUnitActiveSec=60s
+            [Install]
+            WantedBy=timers.target
+      loop_control: { label: "{{ item.name }}" }
+      notify: reload systemd
+      tags: [watchdog]
+
+    - name: watchdog — timer enabled
+      ansible.builtin.systemd:
+        name: octo-watchdog.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      tags: [watchdog]
+
+    # ================================================ the pod's own health
+    # THE PRIVILEGED HALF, ON THE HOST. Computing health means asking docker what is
+    # running, and a container holding the docker socket can escape to root — far too much
+    # authority for a thing whose job is to report. So the host computes and writes; the
+    # container only reads and publishes.
+    #
+    # PRE-CREATED, and this is not tidiness. Docker bind-mounting a path that does not
+    # exist creates a DIRECTORY there. The container would then open a directory, fail in
+    # a way that names neither docker nor the missing file, and the operator would go
+    # looking in the publisher. Touch it first and the failure cannot happen.
+    # The directory first. `copy:` creates the FILE and never the directory above it, and
+    # /var/lib/octo-pod does not exist on a pod that has never declared an arm: the arm
+    # tasks create it, and they run later in this play and are skipped entirely when
+    # nothing is declared. So the first `apply` on a fresh pod died here.
+    #
+    # This is the same defect as writing /etc/docker/daemon.json before docker existed,
+    # fixed in the same play earlier the same day. Writing a file is two facts, not one:
+    # where it goes, and that the where exists.
+    - name: health — the directory the file lives in
+      ansible.builtin.file:
+        path: "{{ arm_repo_dir }}"
+        state: directory
+        mode: "0755"
+      when: health_pub_enabled | default(false) | bool
+      tags: [health, onboard]
+
+    - name: health — the file the publisher reads
+      ansible.builtin.copy:
+        dest: "{{ arm_repo_dir }}/health.json"
+        content: "{}\n"
+        mode: "0644"
+        force: false
+      when: health_pub_enabled | default(false) | bool
+      tags: [health, onboard]
+
+    - name: health — the writer, run on a timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/octo-health-write.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Write this pod's health for the publisher to read
+          [Service]
+          Type=oneshot
+          # WRITTEN ATOMICALLY. A reader that catches a half-written file gets invalid
+          # JSON and reports the pod as unable to describe itself, which is a false alarm
+          # about a pod that is fine. Rename is atomic within a filesystem, so the reader
+          # sees either the old file or the new one and never a partial one.
+          ExecStart=/bin/sh -c '/usr/bin/octo-pod status --json > {{ arm_repo_dir }}/.health.json.new && mv {{ arm_repo_dir }}/.health.json.new {{ arm_repo_dir }}/health.json'
+      when: health_pub_enabled | default(false) | bool
+      tags: [health, onboard]
+
+    - name: health — writer timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/octo-health-write.timer
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Refresh this pod's health file
+          [Timer]
+          OnBootSec=60
+          # Matched to the publish interval: the publisher reads whatever is on disk, so a
+          # slower writer means it republishes a reading it has already sent. The payload
+          # carries the reading's age so a stale one is visible rather than implied fresh.
+          OnUnitActiveSec={{ health_pub_interval | default(60) }}
+          AccuracySec=5
+          [Install]
+          WantedBy=timers.target
+      when: health_pub_enabled | default(false) | bool
+      tags: [health, onboard]
+
+    - name: health — writer timer enabled
+      ansible.builtin.systemd:
+        name: octo-health-write.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: health_pub_enabled | default(false) | bool
+      tags: [health, onboard]
+
+    # Run it once now, so the file is populated before the publisher first reads it
+    # rather than a minute later. Otherwise a fresh pod publishes "{}" for its first
+    # interval, which reads as a pod that cannot describe itself.
+    #
+    # changed_when: false because taking a measurement is not a configuration change.
+    # Starting a oneshot unit always reports `changed`, which made every converge report
+    # changed=1 forever, so `apply` could never say "nothing moved". That is the one
+    # signal an operator reads to know a re-run was a no-op, and a task that always
+    # trips it costs the signal for every other task in the play.
+    - name: health — populate it once now
+      ansible.builtin.systemd:
+        name: octo-health-write.service
+        state: started
+      when: health_pub_enabled | default(false) | bool
+      changed_when: false
+      failed_when: false
+      tags: [health, onboard]
+
+
+    # =============================================================== isolation (SAFE)
+    - name: isolation — forward-drop for ingest NICs (they never route to your LANs)
+      ansible.builtin.template:
+        src: host/net-isolation.nft.j2
+        dest: /etc/nftables-net-isolation.nft
+        mode: "0644"
+      notify: apply net-isolation
+      tags: [isolation]
+
+    - name: isolation — persist via systemd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/net-isolation.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=octo-pod ingest-network isolation (forward drop)
+          After=network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/sbin/nft -f /etc/nftables-net-isolation.nft
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=multi-user.target
+      notify: [reload systemd, enable net-isolation]
+      tags: [isolation]
+
+    # =============================================================== the pen
+    - name: pen — dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ pen_state_dir }}"
+        - "{{ pen_state_dir }}/zenoh/rocksdb"
+        - "{{ pen_state_dir }}/ca"
+        - "{{ pen_state_dir }}/compose"
+      tags: [pen, onboard]
+
+    # 0711, not 0700: this is the bind-mount point for the nonroot sinks and arms, whose
+    # access is checked against this inode. Traverse without listing; files carry their own modes.
+    - name: pen — tls dir traversable by the nonroot container runtime
+      ansible.builtin.file:
+        path: "{{ pen_state_dir }}/zenoh/tls"
+        state: directory
+        mode: "0711"
+      tags: [pen, onboard]
+
+    - name: pen — local CA key (idempotent)
+      ansible.builtin.command: "openssl ecparam -name prime256v1 -genkey -noout -out {{ pen_state_dir }}/ca/ca-key.pem"
+      args: { creates: "{{ pen_state_dir }}/ca/ca-key.pem" }
+      tags: [pen, onboard]
+
+    - name: pen — CA root cert
+      ansible.builtin.command: >
+        openssl req -x509 -new -key {{ pen_state_dir }}/ca/ca-key.pem -sha256 -days 3650
+        -subj "/CN={{ pen_ca_cn }}" -out {{ pen_state_dir }}/zenoh/tls/ca-roots.pem
+      args: { creates: "{{ pen_state_dir }}/zenoh/tls/ca-roots.pem" }
+      tags: [pen, onboard]
+
+    # Fail on a bad declaration here, not when a container crash-loops an hour later.
+    # host_vars binds by DIRECTORY NAME. Rename host_vars/<pod>/ without renaming the
+    # inventory host and ansible finds no identity: no publishers, no error, and a run
+    # that cheerfully removes every ACL grant and sink. Catch it before that happens.
+    - name: publishers — this host has an identity
+      ansible.builtin.assert:
+        that:
+          - pen_id is defined
+          - (peers is defined) or (arms is defined)
+        fail_msg: >-
+          No identity for '{{ inventory_hostname }}'. host_vars binds by directory name,
+          so it must be host_vars/{{ inventory_hostname }}/ — check that directory exists
+          and matches the inventory hostname exactly.
+        quiet: true
+      tags: [always]
+
+    # A LISTENING arm owns a port on this box, so two of them may not share one. A
+    # DIAL-OUT arm (kind: tcp-connect) owns no local port — the port belongs to the
+    # sensor it dials — so it carries `target: host:port` and is validated on that
+    # instead. Folding it into the port checks made a legitimate declaration fail on an
+    # attribute it has no reason to have.
+    - name: publishers — validate declarations
+      vars:
+        _listener_arms: >-
+          {{ ((arms | default([], true)) | rejectattr('kind', 'defined') | list)
+             + ((arms | default([], true)) | selectattr('kind', 'defined')
+                | rejectattr('kind', 'equalto', 'tcp-connect') | list) }}
+        _dial_arms: >-
+          {{ (arms | default([], true)) | selectattr('kind', 'defined')
+             | selectattr('kind', 'equalto', 'tcp-connect') | list }}
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (arms | default([], true)) | map(attribute='id') | list | unique | length
+            == (arms | default([], true)) | length
+          - _listener_arms | map(attribute='port') | list | unique | length
+            == _listener_arms | length
+          - _listener_arms | map(attribute='port') | select('equalto', pen_listen_port | int) | list | length == 0
+          # A dial-out arm with no target renders an empty dial string, and the arm
+          # retries a connection to nowhere forever without ever saying what is wrong.
+          - _dial_arms | rejectattr('target', 'defined') | list | length == 0
+          - _dial_arms | selectattr('target', 'defined')
+            | rejectattr('target', 'match', '^[A-Za-z0-9._-]+:\d{1,5}$') | list | length == 0
+          - (arms | default([], true)) | rejectattr('feed', 'match', '^[A-Za-z0-9_-]+$') | list | length == 0
+          - (arms | default([], true)) | selectattr('allow_sources', 'equalto', '') | list | length == 0
+          - ((peers | default([], true)) + (arms | default([], true)))
+            | map(attribute='id') | list | unique | length
+            == ((peers | default([], true)) + (arms | default([], true))) | length
+          # `enabled` gates provisioning, so a missing one must never be read as false.
+          - ((peers | default([], true)) + (arms | default([], true)))
+            | selectattr('enabled', 'defined') | list | length
+            == ((peers | default([], true)) + (arms | default([], true))) | length
+          # An enabled arm's allow_sources is load-bearing: it is the access control AND
+          # the provenance stamped into the key. A placeholder here drops every datagram.
+          - (arms | default([], true)) | selectattr('enabled') | rejectattr('allow_sources', 'match',
+            '^\d{1,3}(\.\d{1,3}){3}( *, *\d{1,3}(\.\d{1,3}){3})*$') | list | length == 0
+        fail_msg: >-
+          Bad publisher declaration in 20-peers.yml / 30-arms.yml. Every publisher needs an explicit
+          `enabled`. Each listening arm needs a unique id and port (not {{ pen_listen_port }});
+          a dial-out arm (kind: tcp-connect) needs `target: host:port` instead of a port.
+          Every arm needs a feed matching [A-Za-z0-9_-], and — if enabled — an
+          allow_sources of real IPv4 addresses. Ids must be unique across peers+arms.
+      # `always`, not a tag list: a gate you can skip with --skip-tags is not a gate.
+      tags: [always]
+
+    - name: publishers — declared but not provisioned
+      ansible.builtin.debug:
+        msg: >-
+          {{ ((peers | default([], true)) + (arms | default([], true)))
+             | rejectattr('enabled') | map(attribute='id') | list }}
+          declared with enabled:false — no cert, ACL, sink or listener until flipped.
+      when: ((peers | default([], true)) + (arms | default([], true))) | rejectattr('enabled') | list | length > 0
+      tags: [always]
+
+    # THE DOWNWARD DECLARATIONS, checked as hard as the upward ones and for the same
+    # reason: a bad entry fails the run here instead of crash-looping a unit an hour later.
+    # `octo-pod egress` refuses the same things before writing, and the egress arm refuses
+    # them again at start (exit 2); this is the gate between the two that cannot be skipped.
+    # "downlink" is reserved: it names the downlink audit sink's unit.
+    #
+    # A key is any fabric key the slot can read, scoped: its first chunk names a publisher
+    # or `release` (no wildcard), `release/` keys name their lane, and nothing starts in
+    # ops, attest, system, downlink or @ (the egress crate's gate.rs holds the same rule).
+    - name: egress — validate declarations
+      vars:
+        _egress: "{{ egress | default([], true) }}"
+        # Two shapes share this file: a socket destination (udp/tcp/tcp-server — this pod's
+        # own pod-CA cert, consumer holds none) and a zenoh-egress one (kind: zenoh-egress —
+        # dials a PARTNER'S own router under a certificate THEY issued, the mirror of a peer
+        # in 20-peers.yml run in reverse). Each gets the checks its shape actually needs.
+        _socket_egress: "{{ _egress | rejectattr('kind', 'defined')
+                             + (_egress | selectattr('kind', 'defined') | rejectattr('kind', 'equalto', 'zenoh-egress')) }}"
+        _zenoh_egress: "{{ _egress | selectattr('kind', 'defined') | selectattr('kind', 'equalto', 'zenoh-egress') | list }}"
+        _serve: "{{ _socket_egress | selectattr('dest', 'defined') | selectattr('dest', 'match', '^tcp-server://') | list }}"
+        # Fabric keys come down for two kinds of reader: egress destinations and peers with
+        # read_keys. Both are held to the same scope rule below, as they share one gate.
+        _keys: >-
+          {{ (egress | default([], true) | selectattr('keys', 'defined') | map(attribute='keys') | flatten)
+             + (peers | default([], true) | selectattr('read_keys', 'defined') | map(attribute='read_keys') | flatten) }}
+        _peers: "{{ peers | default([], true) }}"
+        _sap: "{{ egress | default([], true) | selectattr('dest', 'defined') | selectattr('dest', 'match', '^sapient://') | map(attribute='sapient') | map('default', {}, true) | list }}"
+        _sap_types: [OTHER, RADAR, LIDAR, CAMERA, SEISMIC, ACOUSTIC, PROXIMITY_SENSOR, PASSIVE_RF, HUMAN, CHEMICAL, BIOLOGICAL, RADIATION, KINETIC, JAMMER, CYBER, LDEW, RFDEW, MOBILE_NODE, POINTABLE_NODE, FUSION_NODE]
+        _ids: >-
+          {{ ((peers | default([], true)) + (arms | default([], true)) + (egress | default([], true)))
+             | map(attribute='id') | list }}
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _ids | unique | length == _ids | length
+          - "'downlink' not in _ids"
+          - _egress | selectattr('enabled', 'defined') | list | length == _egress | length
+          - _egress | rejectattr('id', 'match', '^[a-z0-9][a-z0-9-]*$') | list | length == 0
+          - _egress | rejectattr('cert_cn', 'defined') | list | length == 0
+          - _socket_egress | rejectattr('dest', 'match', '^(udp|tcp|tcp-server|sapient)://(\d{1,3}(\.\d{1,3}){3}|\[[0-9A-Fa-f:.]+\]):\d{1,5}$') | list | length == 0
+          - _egress | rejectattr('dest', 'match', '^[a-z-]+://(0\.0\.0\.0|\[::\]):') | list | length == _egress | length
+          - _egress | rejectattr('keys', 'defined') | list | length == 0
+          - _keys | reject('match', '^(?!(ops|attest|system|downlink)(/|$))(?!@)[^/*$]+(/.+)?$') | list | length == 0
+          - _keys | select('match', '^release(/|$)') | reject('match', '^release/[^/*$]+(/.+)?$') | list | length == 0
+          # A listener answers only declared consumers, within the same limits the arm holds.
+          - _serve | rejectattr('allow_sources', 'defined') | list | length == 0
+          - _serve | rejectattr('allow_sources', 'match', '^\d{1,3}(\.\d{1,3}){3}( *, *\d{1,3}(\.\d{1,3}){3})*$') | list | length == 0
+          - _serve | selectattr('max_clients', 'defined') | rejectattr('max_clients', 'ge', 1) | list | length == 0
+          - _serve | selectattr('max_clients', 'defined') | rejectattr('max_clients', 'le', 64) | list | length == 0
+          - _serve | selectattr('replay', 'defined') | rejectattr('replay', 'ge', 0) | list | length == 0
+          - _serve | selectattr('replay', 'defined') | rejectattr('replay', 'le', 1024) | list | length == 0
+          # A SAPIENT session registers with values the standard defines, or the controller
+          # refuses it. The sapient arm checks the same at start.
+          - _sap | map(attribute='node_type') | map('default', 'OTHER') | map('upper') | map('regex_replace', '^NODE_TYPE_', '') | reject('in', _sap_types) | list | length == 0
+          - _sap | selectattr('status_interval_s', 'defined') | rejectattr('status_interval_s', 'integer') | list | length == 0
+          - _sap | selectattr('status_interval_s', 'defined') | rejectattr('status_interval_s', 'ge', 1) | list | length == 0
+          - _sap | selectattr('status_interval_s', 'defined') | rejectattr('status_interval_s', 'le', 300) | list | length == 0
+          # A zenoh-egress destination's dest is the PARTNER'S router, held to the same
+          # literal-address discipline as a socket dest. The granted prefix is declared
+          # twice (prefix + allow_prefix), the same defense-in-depth idiom as allow_dest,
+          # and must be a literal root: a partner is granted one fixed namespace, never a
+          # wildcard. partner_bundle_dir names the directory holding what the partner
+          # issued (cert.pem, key.pem, ca.pem) — PLACED on this pod, never minted here.
+          - _zenoh_egress | rejectattr('dest', 'match', '^zenoh://(\d{1,3}(\.\d{1,3}){3}|\[[0-9A-Fa-f:.]+\]):\d{1,5}$') | list | length == 0
+          - _zenoh_egress | rejectattr('prefix', 'defined') | list | length == 0
+          - _zenoh_egress | rejectattr('prefix', 'match', '^[^/*$][^*$]*$') | list | length == 0
+          - _zenoh_egress | rejectattr('allow_prefix', 'defined') | list | length == 0
+          - _zenoh_egress | rejectattr('partner_bundle_dir', 'defined') | list | length == 0
+          # A peer reaching the pen over the LAN is opened from exactly these literal IPv4
+          # addresses (the firewall renders them); without allow_sources it is mesh-only.
+          - _peers | selectattr('allow_sources', 'defined') | rejectattr('allow_sources', 'match', '^\d{1,3}(\.\d{1,3}){3}( *, *\d{1,3}(\.\d{1,3}){3})*$') | list | length == 0
+          # read_keys is a list of fabric keys, and only a peer has an identity to read with.
+          - _peers | selectattr('read_keys', 'defined') | selectattr('read_keys', 'string') | list | length == 0
+          - (arms | default([], true)) | selectattr('read_keys', 'defined') | list | length == 0
+          # Data that came DOWN must never go back UP under this pod's slot: a bridge_allow
+          # naming downlink/ would have the uplink bridge re-export it.
+          - (bridge_allow | default('', true)) is not search('downlink/')
+        fail_msg: >-
+          Bad egress declaration in 40-egress.yml. Every destination needs an explicit
+          `enabled`, an id matching [a-z0-9-] (not "downlink"), a cert_cn, and keys; each key
+          must start with a literal publisher or release/<lane>/, and never in ops, attest,
+          system, downlink or @. A socket destination (the default; or explicit kind other
+          than zenoh-egress) needs a dest of udp://, tcp://, tcp-server:// or sapient:// with a literal,
+          specific IP:port; tcp-server:// also needs allow_sources (literal IPv4 addresses),
+          max_clients 1-64 and replay 0-1024 when given. A `kind: zenoh-egress` destination
+          needs a dest of zenoh://IP:PORT (the partner's own router, literal), a literal
+          (non-wildcard) prefix, allow_prefix, and partner_bundle_dir (where the partner's
+          issued cert/key/CA were placed for this pod). Ids must be unique across peers, arms
+          and egress. A peer's allow_sources is literal IPv4 addresses; its read_keys is a
+          list of fabric keys held to the same rule as egress keys; an arm has no read_keys.
+          SAPIENT node_type must be a standard NodeType and status_interval_s 1-300.
+          bridge_allow in 10-pod.yml must never name downlink/, which would re-export
+          fabric data upstream under this pod's slot.
+      tags: [always]
+
+    # A declared peer mints its own cert. Nothing here is ever minted by hand:
+    # the ACL template is generated from the same `peers` data, so a hand-minted
+    # cert would have no policy and a hand-written policy would have no cert.
+    - name: pen — derive leaf-cert specs for declared peers
+      ansible.builtin.set_fact:
+        peer_leaf_certs: >-
+          {{ peer_leaf_certs | default([]) + [ {
+               'name': item.id,
+               'cn':   item.cert_cn,
+               'eku':  'clientAuth',
+               'san':  'DNS:' ~ item.cert_cn
+             } ] }}
+      loop: "{{ active_peers }}"
+      loop_control: { label: "{{ item.id }} ({{ item.cert_cn }})" }
+      tags: [pen, onboard]
+
+    # An arm's key stays here — our listener presents it on the partner's behalf.
+    # Leaf named <id>-arm so it cannot collide with a peer of the same id.
+    - name: pen — derive leaf-cert specs for declared arms
+      ansible.builtin.set_fact:
+        arm_leaf_certs: >-
+          {{ arm_leaf_certs | default([]) + [ {
+               'name': item.id ~ '-arm',
+               'cn':   item.cert_cn,
+               'eku':  'clientAuth,serverAuth',
+               'san':  'DNS:' ~ item.cert_cn
+             } ] }}
+      loop: "{{ active_arms }}"
+      loop_control: { label: "{{ item.id }} ({{ item.cert_cn }})" }
+      tags: [pen, arm, onboard]
+
+    # THE POD'S OWN HEALTH PUBLISHER gets its certificate from the same CA, in the same
+    # loop, from the same spec shape as an arm. It is a publisher; the only thing that
+    # makes it special is that its data is about the pod rather than from a sensor.
+    # clientAuth only — it dials the router and never serves.
+    - name: pen — derive the leaf-cert spec for the health publisher
+      ansible.builtin.set_fact:
+        health_leaf_certs:
+          - name: "health"
+            cn: "{{ health_pub_cn }}"
+            eku: "clientAuth"
+            san: "DNS:{{ health_pub_cn }}"
+      when: health_pub_enabled | default(false) | bool
+      tags: [pen, health, onboard]
+
+    # A destination's certificate is minted on declaration, like an arm's; its READ grant
+    # waits for release (templates/pen/router-acl.json5.j2). Named <id>-egress so it cannot
+    # collide with an arm or a peer of the same id. clientAuth only: an egress arm dials
+    # the pen and never serves.
+    - name: pen — derive leaf-cert specs for egress destinations
+      ansible.builtin.set_fact:
+        egress_leaf_certs: >-
+          {{ egress_leaf_certs | default([]) + [ {
+               'name': dest.id ~ '-egress',
+               'cn':   dest.cert_cn,
+               'eku':  'clientAuth',
+               'san':  'DNS:' ~ dest.cert_cn
+             } ] }}
+      loop: "{{ active_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }} ({{ dest.cert_cn }})" }
+      tags: [pen, egress, onboard]
+
+    # The downlink bridge's pen identity. Its FABRIC identity is the slot, never this.
+    - name: pen — derive the leaf-cert spec for the downlink bridge
+      ansible.builtin.set_fact:
+        downlink_leaf_certs:
+          - name: "downlink-bridge"
+            cn: "octo-downlink-bridge"
+            eku: "clientAuth"
+            san: "DNS:octo-downlink-bridge"
+      when: (downlink_users | default([], true)) | length > 0
+      tags: [pen, egress, onboard]
+
+    # THE GUARD IS INSIDE THE SCRIPT, not a `creates:`, because a keypair is two files
+    # and `creates:` can only name one. Both single-file choices are wrong, each in a way
+    # that only appears later:
+    #
+    #   creates: the CERT — `remove-arm` deletes the private key and deliberately keeps
+    #     the certificate, so an audit record naming that CN still resolves to who it
+    #     was. Re-adding the same id then finds the cert, skips the mint, and the very
+    #     next task fails placing a private key that was never generated. Measured: a
+    #     remove-then-readd left the pod unable to converge at all.
+    #
+    #   creates: the KEY — this script writes the key first, so an interruption between
+    #     the two openssl calls leaves a key with no certificate, and the guard then
+    #     blocks the mint that would finish the job. Permanently.
+    #
+    # Requiring BOTH, non-empty, is the only condition that means "this identity is
+    # complete". Anything less is re-minted, which is safe: a half-made identity has
+    # never been used by anything.
+    - name: pen — leaf certs from the CA (ours + declared peers)
+      ansible.builtin.shell: |
+        set -e
+        cn="{{ item.cn }}"; out="{{ pen_state_dir }}/zenoh/tls/{{ item.name }}"
+        if [ -s "${out}-key.pem" ] && [ -s "${out}-cert.pem" ]; then
+          echo COMPLETE; exit 0
+        fi
+        openssl ecparam -name prime256v1 -genkey -noout -out "${out}-key.pem"
+        openssl req -new -key "${out}-key.pem" -subj "/CN=${cn}" -out "{{ pen_state_dir }}/ca/{{ item.name }}.csr"
+        openssl x509 -req -in "{{ pen_state_dir }}/ca/{{ item.name }}.csr" \
+          -CA {{ pen_state_dir }}/zenoh/tls/ca-roots.pem -CAkey {{ pen_state_dir }}/ca/ca-key.pem \
+          -CAcreateserial -days 825 -sha256 \
+          -extfile <(printf "subjectAltName={{ item.san }}\nextendedKeyUsage={{ item.eku }}\nbasicConstraints=CA:FALSE") \
+          -out "${out}-cert.pem"
+        echo MINTED
+      args:
+        executable: /bin/bash
+      changed_when: "'MINTED' in (mint_result.stdout | default(''))"
+      register: mint_result
+      loop: >-
+        {{ pen_leaf_certs + (peer_leaf_certs | default([]))
+           + (arm_leaf_certs | default([])) + (health_leaf_certs | default([]))
+           + (egress_leaf_certs | default([])) + (downlink_leaf_certs | default([])) }}
+      loop_control: { label: "{{ item.name }} (CN={{ item.cn }})" }
+      tags: [pen, onboard]
+
+    # Certs and CA are public; keys are not. The sinks and arms run nonroot, so an
+    # unreadable cert fails silently — the session never opens but the container stays
+    # up. `verify-octo-pod.yml --tags sink` is the check.
+    - name: pen — list TLS material
+      ansible.builtin.find:
+        paths: "{{ pen_state_dir }}/zenoh/tls"
+        patterns: ["*.pem"]
+      register: _pen_tls
+      tags: [pen, onboard]
+
+    # pod-key.pem and health-key.pem are excluded: the next task owns them (0640
+    # root:{{ audit_runtime_uid }}). Without the exclusion the two tasks fight, 0600 here
+    # and 0640 there, and the file reports changed on every single run forever.
+    - name: pen — TLS modes (certs + CA public, keys private)
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        mode: "{{ '0600' if item.path.endswith('-key.pem') else '0644' }}"
+      loop: "{{ _pen_tls.files | rejectattr('path', 'search', '/(pod|health)-key\\.pem$') | list }}"
+      loop_control: { label: "{{ item.path | basename }}" }
+      tags: [pen, onboard]
+
+    # ONLY the keys a nonroot container actually mounts are opened to the container gid.
+    # Peer keys stay 0600: the pen authorises a peer by CN and never reads its key.
+    #
+    # health-key.pem belongs here for exactly the same reason pod-key.pem does. The
+    # health publisher is a container running as {{ audit_runtime_uid }} that mounts the
+    # pen's TLS directory directly, the way the router does, rather than getting its own
+    # copy the way an arm does. It was missed because the image did not exist yet when
+    # this was written, so the publisher had never once started: the pen carried a
+    # 0600 root:root key and nothing was there to be refused by it.
+    #
+    # Measured on a clean 0.3.1 install: `Invalid TLS private key file: Permission
+    # denied (os error 13)`, then a crash loop. Loud, at least, which is why it took
+    # minutes rather than days.
+    - name: pen — keys readable by the nonroot container runtime
+      ansible.builtin.file:
+        path: "{{ pen_state_dir }}/zenoh/tls/{{ item }}"
+        owner: root
+        group: "{{ audit_runtime_uid }}"
+        mode: "0640"
+      loop: "{{ ['pod-key.pem'] + (['health-key.pem'] if (health_pub_enabled | default(false) | bool) else []) }}"
+      notify: restart health publisher
+      tags: [pen, onboard]
+
+    # The router reads config.json5 ONCE at startup, and it is a bind-mounted file —
+    # `docker compose up -d` will NOT recreate the container for a file change. Without
+    # this notify, adding a partner rewrites the ACL, the router keeps enforcing the old
+    # one, and every publish from the new partner is silently denied with no log anywhere.
+    # Bundle and ACL come from the same `peers` data, so the instructions we hand a
+    # partner cannot describe a grant the router does not enforce.
+    - name: peer — bundle dir
+      ansible.builtin.file:
+        path: "{{ pen_state_dir }}/bundles/{{ item.id }}/tls"
+        state: directory
+        mode: "0700"
+      loop: "{{ active_peers }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [pen, peer, onboard]
+
+    - name: peer — bundle cert
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ item.id }}-cert.pem"
+        dest: "{{ pen_state_dir }}/bundles/{{ item.id }}/tls/{{ item.cert_cn }}-cert.pem"
+        remote_src: true
+        mode: "0600"
+      loop: "{{ active_peers }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [pen, peer, onboard]
+      # check mode does not create the parent dir, so a not-yet-onboarded
+      # partner reports missing-destination here. Real runs fail hard.
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    - name: peer — bundle key
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ item.id }}-key.pem"
+        dest: "{{ pen_state_dir }}/bundles/{{ item.id }}/tls/{{ item.cert_cn }}-key.pem"
+        remote_src: true
+        mode: "0600"
+      loop: "{{ active_peers }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [pen, peer, onboard]
+      # check mode does not create the parent dir, so a not-yet-onboarded
+      # partner reports missing-destination here. Real runs fail hard.
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    - name: peer — bundle CA
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/ca-roots.pem"
+        dest: "{{ pen_state_dir }}/bundles/{{ item.id }}/tls/ca-roots.pem"
+        remote_src: true
+        mode: "0600"
+      loop: "{{ active_peers }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [pen, peer, onboard]
+      # check mode does not create the parent dir, so a not-yet-onboarded
+      # partner reports missing-destination here. Real runs fail hard.
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    - name: peer — bundle instructions
+      ansible.builtin.template:
+        src: peer/bundle-README.md.j2
+        dest: "{{ pen_state_dir }}/bundles/{{ item.id }}/README.md"
+        mode: "0600"
+      loop: "{{ active_peers }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [pen, peer, onboard]
+
+    # config.json5 is bind-mounted and read once at startup, so `compose up` will not
+    # pick up a change here — the router must be restarted explicitly.
+    - name: pen — router ACL
+      ansible.builtin.template:
+        src: pen/router-acl.json5.j2
+        dest: "{{ pen_state_dir }}/zenoh/config.json5"
+        mode: "0644"
+        backup: true
+      notify: restart pen router
+      tags: [pen, onboard]
+
+    # Handlers otherwise run at end of play — after the sinks and arms have started
+    # against the previous ACL, where their writes are denied.
+    #
+    # `always` because tags ARE honoured on meta tasks: untagged, this is skipped by
+    # --tags onboard, which is precisely the run that adds a new CN to the ACL. The
+    # partner's arm would then start against the old policy and be denied in silence.
+    - name: pen — load the new ACL before anything connects
+      ansible.builtin.meta: flush_handlers
+      tags: [always]
+
+    # Quadlet units instead of a compose file (docs/design-podman-migration.md).
+    # The .env indirection is gone: everything it carried is inlined at render.
+    - name: pen — router quadlet
+      ansible.builtin.template:
+        src: pen/octo-pen-zenoh-router.container.j2
+        dest: /etc/containers/systemd/octo-pen-zenoh-router.container
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart pen router
+      tags: [pen, onboard]
+
+    - name: pen — catch-all audit sink quadlet
+      ansible.builtin.template:
+        src: pen/octo-pen-audit-sink.container.j2
+        dest: /etc/containers/systemd/octo-pen-audit-sink.container
+        mode: "0644"
+      vars:
+        sink_suffix: ""
+        sink_key: "{{ pen_namespace }}/**"
+        sink_sub_id: "{{ pen_id }}"
+      notify: reload systemd
+      tags: [pen, onboard]
+
+    # One sink unit per declared publisher, from the same data as the ACL — a
+    # namespace that can be written is a namespace that is watched.
+    - name: pen — per-publisher audit sink quadlets
+      ansible.builtin.template:
+        src: pen/octo-pen-audit-sink.container.j2
+        dest: "/etc/containers/systemd/octo-pen-audit-sink-{{ item.id }}.container"
+        mode: "0644"
+      vars:
+        sink_suffix: "-{{ item.id }}"
+        sink_key: "{{ item.namespace }}"
+        sink_sub_id: "{{ pen_id }}-{{ item.id }}"
+      loop: "{{ active_peers + active_arms }}"
+      loop_control: { label: "{{ item.id }}" }
+      notify: reload systemd
+      tags: [pen, onboard]
+
+    # The downlink namespace is written by the downlink bridge, so it is watched like any
+    # other written namespace: one sink, from the same declaration that grants the write.
+    - name: pen — downlink audit sink quadlet
+      ansible.builtin.template:
+        src: pen/octo-pen-audit-sink.container.j2
+        dest: /etc/containers/systemd/octo-pen-audit-sink-downlink.container
+        mode: "0644"
+      vars:
+        sink_suffix: "-downlink"
+        sink_key: "downlink/**"
+        sink_sub_id: "{{ pen_id }}-downlink"
+      when: (downlink_users | default([], true)) | length > 0
+      notify: reload systemd
+      tags: [pen, egress, onboard]
+
+    # Removal converges too: a sink unit no declaration names is stopped and
+    # deleted, not left running with a valid credential. The unit-file set on
+    # disk IS the declared set — same source the ACL renders from.
+    - name: pen — find sink units on disk
+      ansible.builtin.find:
+        paths: /etc/containers/systemd
+        patterns: "octo-pen-audit-sink*.container"
+      register: _sink_units
+      tags: [pen, onboard]
+
+    - name: pen — reap sink units no declaration names
+      ansible.builtin.shell: |
+        systemctl stop "{{ item | basename | regex_replace('\\.container$', '') }}.service" 2>/dev/null || true
+        rm -f "{{ item }}"
+      loop: >-
+        {{ _sink_units.files | map(attribute='path')
+           | reject('in', _declared_sink_files) | list }}
+      vars:
+        _declared_sink_files: >-
+          {{ ['/etc/containers/systemd/octo-pen-audit-sink.container']
+             + ((active_peers + active_arms)
+                | map(attribute='id')
+                | map('regex_replace', '^(.*)$', '/etc/containers/systemd/octo-pen-audit-sink-\1.container')
+                | list)
+             + (['/etc/containers/systemd/octo-pen-audit-sink-downlink.container']
+                if (downlink_users | default([], true)) | length > 0 else []) }}
+      changed_when: true
+      notify: reload systemd
+      tags: [pen, onboard]
+    # The one hard invariant in the whole ordering: images must be local before anything
+    # tries to start. Everything else — when they are pulled, from which registry, over
+    # the internet or the mesh — is arrangement. Assert it HERE, where it is true, rather
+    # than requiring it in step 1, where a mesh registry does not yet exist for this pod.
+    #
+    # Left to compose, a missing image is "Error response from daemon: unauthorized" in
+    # the middle of a converge, naming neither which image nor which registry nor what to
+    # do. That is what the arm bring-up did on a real pod.
+    # PULL, rather than ask whether it is already local. `docker image inspect` answers
+    # "is this in the local image store", and an image served by a registry — a mirror on
+    # the mesh, or one on this very box — is deliberately NOT in the local store until
+    # something pulls it. So a correctly-seeded pod failed this check while holding every
+    # byte it needed, a few hundred milliseconds from being able to prove it.
+    #
+    # Pulling both verifies and warms: if it cannot be pulled the reason is the real one
+    # — unauthorized, no such manifest, no route — and that reason is worth more than an
+    # assertion of ours guessing at it.
+    - name: pen — pull the images it is about to start
+      ansible.builtin.command: "podman pull {{ item }}"
+      register: _pen_pull
+      changed_when: "'Storing signatures' in _pen_pull.stdout or 'Writing manifest' in _pen_pull.stdout"
+      failed_when: false
+      # The pen's own images. The health publisher is deliberately NOT here: it is a
+      # separate compose project now, precisely so that an image it cannot fetch cannot
+      # stop the router.
+      loop: ["{{ zenoh_image }}", "{{ audit_image }}"]
+      tags: [pen, onboard]
+
+    - name: pen — an image it cannot get cannot be started
+      ansible.builtin.assert:
+        that: _failed_pulls | length == 0
+        fail_msg: >-
+          Could not get: {{ _failed_pulls | join(', ') }}.
+          {{ _pen_pull.results | selectattr('rc', 'ne', 0) | map(attribute='stderr')
+             | select('truthy') | list | first | default('') }}
+          The pen cannot start without them. image_mirror is
+          '{{ image_mirror | default("") or "each image's own registry" }}' — if that is
+          a registry on this box, bootstrap seeds it from the carried bundle; if it is
+          remote, this pod needs a route to it.
+        quiet: true
+      vars:
+        _failed_pulls: >-
+          {{ _pen_pull.results | default([]) | selectattr('rc', 'defined')
+             | selectattr('rc', 'ne', 0) | map(attribute='item') | list }}
+      tags: [pen, onboard]
+
+    # Generate + start. daemon_reload runs the Quadlet generator over the unit
+    # files just rendered; `state: started` is idempotent — a running unit is a
+    # no-op, a missing one starts. The router blocks in "starting" until its
+    # listener answers (Notify=healthy), so the sinks that follow (After=) can
+    # never race it — the compose service_healthy gate, kept.
+    - name: pen — generate units from the quadlets
+      ansible.builtin.systemd:
+        daemon_reload: true
+      tags: [pen, onboard]
+
+    - name: pen — up
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+      loop: >-
+        {{ ['octo-pen-zenoh-router.service', 'octo-pen-audit-sink.service']
+           + ((active_peers + active_arms)
+              | map(attribute='id')
+              | map('regex_replace', '^(.*)$', 'octo-pen-audit-sink-\1.service')
+              | list) }}
+      tags: [pen, onboard]
+
+    # The router restart above orphans every sink that was already running, because they
+    # do not retry a lost session. This used to be a for-loop in the handler
+    # restarting ALL of them; it is now one call to the thing that owns sink liveness,
+    # which repairs only the ones actually dead. Synchronous because `join` runs verify
+    # seconds later, and a sink repaired two timer ticks from now would fail it.
+    # ---- the pod's own health, started AFTER and SEPARATELY from the pen ----------
+    #
+    # Its own compose project and its own failure. `docker compose up` pulls every service
+    # in a file before starting any of them, so while this lived in the pen's compose file
+    # a health image the pod could not fetch stopped the ROUTER. A pod that cannot reach a
+    # registry then lost capture, not just visibility — in exactly the disconnected case
+    # the image bundle exists for.
+    #
+    # failed_when: false is the whole point. Health that can stop a pod capturing is worse
+    # than no health.
+    - name: health — quadlet unit
+      ansible.builtin.template:
+        src: pen/octo-health-pub.container.j2
+        dest: /etc/containers/systemd/octo-health-pub.container
+        mode: "0644"
+      when: health_pub_enabled | default(false) | bool
+      tags: [health, onboard]
+
+    - name: health — generate its unit
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: health_pub_enabled | default(false) | bool
+      tags: [health, onboard]
+
+    - name: health — up
+      ansible.builtin.systemd:
+        name: octo-health-pub.service
+        state: started
+      register: _health_up
+      failed_when: false
+      when: health_pub_enabled | default(false) | bool
+      tags: [health, onboard]
+
+    - name: health — say so if it did not start
+      ansible.builtin.debug:
+        msg: >-
+          The health publisher did not start, and the pod is otherwise fine. It reports
+          this pod's state onto the fabric; without it the pod still captures, still
+          publishes, and is simply invisible from elsewhere.
+
+          {{ 'The registry refused the image as unauthorized. A pod holds no registry
+              credential by design, so carry the image: rebuild the bundle with
+              tools/build-airgap-bundle.sh and re-install with --with-images.'
+             if (_health_up.msg | default('') | lower) is search('unauthorized|denied')
+             else (_health_up.msg | default('') | trim) }}
+
+          Its own words: journalctl -u octo-health-pub -n 20
+          To stop trying: octo-pod apply -e health_pub_enabled=false
+      when:
+        - health_pub_enabled | default(false) | bool
+        - _health_up.failed | default(false)
+      tags: [health, onboard]
+
+
+    - name: pen — repair anything the router restart left zombied
+      ansible.builtin.command: /usr/local/sbin/octo-watchdog --now
+      register: _wd
+      changed_when: "'REPAIR' in _wd.stdout"
+      # Non-zero also means "reported drift", which is information, not a reason to stop
+      # a converge. `verify` is what asserts; this only repairs.
+      failed_when: false
+      tags: [pen, onboard]
+
+    - name: pen — what the watchdog did
+      ansible.builtin.debug:
+        msg: "{{ _wd.stdout_lines }}"
+      when: _wd.stdout | default('') | length > 0
+      tags: [pen, onboard]
+
+    # =============================================================== the arm
+    # No compose seeding any more: arms render straight to Quadlet units from
+    # arm/octo-arm.container.j2 (docs/design-podman-migration.md). The env
+    # contract that lived in arm/env.j2 lives in that one template now.
+
+    # THE LEGACY SINGLE ARM, and these two tasks prepare it. Gated like the bring-up
+    # below, which has always been `arm_enabled | default(false)` — these were not, so
+    # they ran on every pod and referenced arm_bind_host / arm_allow_sources /
+    # arm_udp_feeds / arm_feeds, which exist only in example/host_vars. A pod built the
+    # real way, by `identity write`, has none of them: the example converged and every
+    # actual first `apply` died here on an undefined variable.
+    #
+    # Publishers now come from `arms:` via add-arm and are handled by the partner-arm
+    # tasks below, so on a pod declared the modern way this whole leg stays dormant —
+    # which is what arm_enabled defaulting to false already said.
+    # The task below is NAMED "cert dir" and only ever copied files into one. Nothing
+    # creates /etc/octo-arm/tls, and `copy:` makes the file, never the directory above
+    # it. Latent rather than live, because this legacy single-arm path is off by
+    # default, but it is the same defect that broke the health file and daemon.json.
+    - name: arm — the cert directory itself
+      ansible.builtin.file:
+        path: "{{ arm_tls_dir }}"
+        state: directory
+        mode: "0755"
+      when: arm_enabled | default(false)
+      tags: [arm, onboard]
+
+    - name: arm — cert dir + place arm certs from the pen CA (644, nonroot)
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ item.src }}"
+        dest: "{{ arm_tls_dir }}/{{ item.dest }}"
+        remote_src: true
+        mode: "0644"
+      loop:
+        - { src: arm-cert.pem,  dest: arm-cert.pem }
+        - { src: arm-key.pem,   dest: arm-key.pem }
+        - { src: ca-roots.pem,  dest: ca-root.pem }
+      when: arm_enabled | default(false)
+      tags: [arm, onboard]
+
+    # (the built-in arm's quadlet renders below, after the image decision —
+    # a dev clone's :dev override must be in force before any unit names it)
+
+    # A CLONE OF THIS REPO CAN BUILD ITS OWN ARMS; a packaged pod cannot, because the
+    # package ships no arms/ source. Detect which we are rather than making the operator
+    # know: if the Rust workspace is beside these playbooks, build from it; otherwise pull
+    # the digest-pinned image. Both paths produce the same container.
+    - name: arm — is the arm source here (a clone), or not (a package)?
+      ansible.builtin.stat: { path: "{{ playbook_dir }}/../arms/Cargo.toml" }
+      register: _arm_src
+      tags: [arm, onboard]
+
+    # A DIGEST-PINNED IMAGE CANNOT BE BUILT. `docker compose --build` has to tag what it
+    # produces, and "build tag cannot contain a digest" is where that ends: a digest names
+    # a specific set of bytes, and building is how you would make different ones. So the
+    # pin decides the path, not the presence of source.
+    #
+    # Left on source-detection alone this failed on a real pod: a box that had once been
+    # an rsync install still had /opt/octo-pod/arms lying beside the playbooks, so a
+    # PACKAGE pod — which ships no arm source and must pull — was read as a clone and
+    # tried to build a digest. Detection by "is there source here" is a guess about how
+    # the software arrived; the image reference is a fact about what is being asked for.
+    - name: arm — are the arm images pinned by digest?
+      ansible.builtin.set_fact:
+        _arm_pinned: "{{ (udp_ingest_image | default('') ~ tcp_ingest_image | default('')
+                          ~ tcp_connect_image | default('')) is search('@sha256:') }}"
+      tags: [arm, onboard]
+
+    - name: arm — how to bring an arm up, given where we are
+      ansible.builtin.set_fact:
+        _arm_from_src: "{{ _arm_src.stat.exists and not _arm_pinned }}"
+      tags: [arm, onboard]
+
+    # A dev clone builds its own arm images; the quadlets then reference the
+    # local dev tags instead of the fleet digests. Same two paths as before —
+    # build from the workspace beside these playbooks, or pull the pin — just
+    # without the compose --build overlay in the middle.
+    - name: arm — build the arm images from source (dev clones only)
+      ansible.builtin.command: >-
+        podman build -f {{ playbook_dir }}/../arms/{{ item }}/Dockerfile
+        -t localhost/octo-{{ item }}:dev {{ playbook_dir }}/../arms
+      loop: [udp-ingest, tcp-ingest, tcp-connect]
+      register: _arm_build_out
+      changed_when: "'COMMIT' in _arm_build_out.stdout"
+      when: _arm_from_src
+      tags: [arm, onboard]
+
+    - name: arm — dev builds override the image pins for this run
+      ansible.builtin.set_fact:
+        udp_ingest_image: localhost/octo-udp-ingest:dev
+        tcp_ingest_image: localhost/octo-tcp-ingest:dev
+        tcp_connect_image: localhost/octo-tcp-connect:dev
+      when: _arm_from_src
+      tags: [arm, onboard]
+
+    # Off by default: this leg is dormant (octo-tcp-ingest exited 2026-08-06, nothing
+    # feeds :8087). Declaring it false keeps a run from resurrecting it silently —
+    # flip arm_enabled when something is actually sending.
+    - name: arm — built-in arm quadlet
+      ansible.builtin.template:
+        src: arm/octo-arm.container.j2
+        dest: /etc/containers/systemd/octo-tcp-ingest.container
+        mode: "0644"
+      vars:
+        a:
+          key_prefix: "{{ pen_namespace }}"
+          bind_host: "{{ arm_bind_host | default('127.0.0.1') }}"
+          allow_sources: "{{ arm_allow_sources | default('') }}"
+          tls_dir: "{{ arm_tls_dir }}"
+          udp_feeds: "{{ arm_udp_feeds | default('') }}"
+          tcp_feeds: "{{ arm_feeds | default('') }}"
+      when: arm_enabled | default(false)
+      notify: reload systemd
+      tags: [arm, onboard]
+
+    - name: arm — generate + start the built-in arm
+      ansible.builtin.systemd:
+        name: octo-tcp-ingest.service
+        state: started
+        daemon_reload: true
+      when: arm_enabled | default(false)
+      tags: [arm, onboard]
+
+    # ================================================== third-party arms
+    # One instance per partner: an arm process has a single INGEST_KEY_PREFIX, so sharing
+    # ours would land partner data in raw/octo/**, which bridge_allow releases to the fabric.
+    - name: partner-arm — tls dir
+      ansible.builtin.file:
+        path: "/etc/octo-arm-{{ item.id }}/tls"
+        state: directory
+        mode: "0755"
+      loop: "{{ active_arms }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [arm, onboard]
+
+    - name: partner-arm — place cert (public)
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ item.id }}-arm-cert.pem"
+        dest: "/etc/octo-arm-{{ item.id }}/tls/arm-cert.pem"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ active_arms }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [arm, onboard]
+      # THE MINT IS A SHELL TASK, AND CHECK MODE SKIPS SHELL TASKS. So on a dry run the
+      # certificate this copies does not exist yet, and reporting that as a failure, even
+      # an ignored one, prints red for a file the run itself declined to create. An
+      # operator reading `octo-pod check` before their first apply sees two failures and
+      # reasonably concludes something is wrong. Nothing is.
+      #
+      # `_pen_tls` is the find that ran after the mint, so in check mode it lists what was
+      # already on disk and nothing more. Outside check mode the first clause is true and
+      # this is always attempted, where a missing source IS a real failure.
+      when: >-
+        not ansible_check_mode
+        or (pen_state_dir ~ '/zenoh/tls/' ~ item.id ~ '-arm-cert.pem')
+           in (_pen_tls.files | default([]) | map(attribute='path') | list)
+      # check mode does not create the parent dir either, so a partner that IS minted but
+      # not yet onboarded still reports a missing destination here. Real runs fail hard.
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    - name: partner-arm — place private key (readable ONLY by the arm's runtime uid)
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ item.id }}-arm-key.pem"
+        dest: "/etc/octo-arm-{{ item.id }}/tls/arm-key.pem"
+        remote_src: true
+        owner: root
+        group: "{{ audit_runtime_uid }}"
+        mode: "0640"
+      loop: "{{ active_arms }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [arm, onboard]
+      # THE MINT IS A SHELL TASK, AND CHECK MODE SKIPS SHELL TASKS. So on a dry run the
+      # certificate this copies does not exist yet, and reporting that as a failure, even
+      # an ignored one, prints red for a file the run itself declined to create. An
+      # operator reading `octo-pod check` before their first apply sees two failures and
+      # reasonably concludes something is wrong. Nothing is.
+      #
+      # `_pen_tls` is the find that ran after the mint, so in check mode it lists what was
+      # already on disk and nothing more. Outside check mode the first clause is true and
+      # this is always attempted, where a missing source IS a real failure.
+      when: >-
+        not ansible_check_mode
+        or (pen_state_dir ~ '/zenoh/tls/' ~ item.id ~ '-arm-key.pem')
+           in (_pen_tls.files | default([]) | map(attribute='path') | list)
+      # check mode does not create the parent dir either, so a partner that IS minted but
+      # not yet onboarded still reports a missing destination here. Real runs fail hard.
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    # ca-root.pem, singular — the arm's expected filename; the pen's own is ca-roots.pem.
+    - name: partner-arm — place CA root
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/ca-roots.pem"
+        dest: "/etc/octo-arm-{{ item.id }}/tls/ca-root.pem"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ active_arms }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [arm, onboard]
+      # check mode does not create the parent dir, so a not-yet-onboarded
+      # partner reports missing-destination here. Real runs fail hard.
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    # One quadlet per partner arm. The container name renders directly as
+    # octo-<kind>-<id> — the compose-era override.<id>.yml existed only because
+    # container_name was hardcoded in a shared file, which once capped a pod at
+    # ONE TCP sensor (the second silently fought the first for the name).
+    - name: partner-arm — quadlet
+      ansible.builtin.template:
+        src: arm/octo-arm.container.j2
+        dest: "/etc/containers/systemd/octo-{{ item.kind | default('udp-ingest') }}-{{ item.id }}.container"
+        mode: "0644"
+      loop: "{{ active_arms }}"
+      loop_control: { label: "{{ item.id }}" }
+      vars: { a: "{{ item }}" }
+      register: _rendered_partner_arms
+      notify: reload systemd
+      tags: [arm, onboard]
+
+    # Removal converges for arms exactly as for sinks: an arm unit file no
+    # declaration names is stopped and deleted. (The orphans check below still
+    # guards RUNNING containers — this reaps the unit files.)
+    - name: partner-arm — find arm units on disk
+      ansible.builtin.find:
+        paths: /etc/containers/systemd
+        patterns: "octo-udp-ingest-*.container,octo-tcp-ingest-*.container,octo-tcp-connect-*.container"
+      register: _arm_units
+      tags: [arm, onboard]
+
+    - name: partner-arm — reap arm units no declaration names
+      ansible.builtin.shell: |
+        systemctl stop "{{ item | basename | regex_replace('\\.container$', '') }}.service" 2>/dev/null || true
+        rm -f "{{ item }}"
+      loop: >-
+        {{ _arm_units.files | map(attribute='path')
+           | reject('in', _declared_arm_files) | list }}
+      vars:
+        _declared_arm_files: >-
+          {%- set out = [] -%}
+          {%- for arm in active_arms -%}
+            {%- set _ = out.append('/etc/containers/systemd/octo-'
+                 ~ (arm.kind | default('udp-ingest')) ~ '-' ~ arm.id ~ '.container') -%}
+          {%- endfor -%}
+          {{ out }}
+      changed_when: true
+      notify: reload systemd
+      tags: [arm, onboard]
+
+    # PULL FIRST, SO THE FAILURE IS OURS TO EXPLAIN. The pen does exactly this before it
+    # starts (see "pen — an image it cannot get cannot be started"); the arms did not, and
+    # `docker compose up` surfaced a bare "error from registry: unauthorized" naming no
+    # image, no cause and no remedy. That is the single most likely failure on a new pod:
+    # the arm images are private and A POD HOLDS NO REGISTRY CREDENTIAL BY DESIGN, so
+    # every pod installed without carrying them lands here. The most predictable failure
+    # in the system deserves the best message in it, not the worst.
+    - name: arm — the images the declared arms need
+      ansible.builtin.set_fact:
+        _arm_refs: "{{ active_arms | map(attribute='kind', default='udp-ingest')
+                       | unique | list | map('extract', _by_kind) | select('truthy') | list }}"
+      vars:
+        _by_kind:
+          udp-ingest: "{{ udp_ingest_image | default('') }}"
+          tcp-ingest: "{{ tcp_ingest_image | default('') }}"
+          tcp-connect: "{{ tcp_connect_image | default('') }}"
+      when: not _arm_from_src
+      tags: [arm, onboard]
+
+    - name: arm — pull them before starting anything
+      ansible.builtin.command: "podman pull {{ item }}"
+      register: _arm_pull
+      changed_when: "'Storing signatures' in _arm_pull.stdout or 'Writing manifest' in _arm_pull.stdout"
+      failed_when: false
+      loop: "{{ _arm_refs | default([]) }}"
+      when: not _arm_from_src
+      tags: [arm, onboard]
+
+    - name: arm — an image it cannot get cannot be started
+      ansible.builtin.assert:
+        that: _failed | length == 0
+        fail_msg: >-
+          Could not get: {{ _failed | join(', ') }}.
+
+          {{ 'The registry refused the request as unauthorized. The arm images are private and this pod has no registry credential — that is deliberate, not a misconfiguration: a pod that can be stolen should not carry one.'
+             if _unauth else 'The registry could not be reached.' }}
+
+          image_mirror is '{{ image_mirror | default("") or "each image's own registry" }}'.
+          Three ways forward, in the order most sites want them:
+
+          (1) Carry the images to the pod, so it needs no credential at all. From a
+          laptop that can already reach this box:
+          tools/install-to-pod.sh <user>@{{ mesh_ip | default(inventory_hostname) }} --with-images
+          then on the pod: octo-pod bootstrap -e bootstrap_mode=airgap -e image_mirror=localhost:5000
+
+          (2) Point image_mirror at a registry this pod CAN reach, and seed it once from
+          the same bundle. This is what a site with more than one pod should do.
+
+          (3) Make the packages public, if their contents are not sensitive. That is an
+          org decision, not a pod one, and it changes nothing else here.
+        quiet: true
+      vars:
+        _failed: >-
+          {{ _arm_pull.results | default([]) | selectattr('rc', 'defined')
+             | selectattr('rc', 'ne', 0) | map(attribute='item') | list }}
+        _unauth: >-
+          {{ _arm_pull.results | default([]) | selectattr('rc', 'defined')
+             | selectattr('rc', 'ne', 0) | map(attribute='stderr') | join(' ')
+             | lower is search('unauthorized|denied|authentication required') }}
+      when: not _arm_from_src
+      tags: [arm, onboard]
+
+    - name: partner-arm — generate the units just rendered
+      ansible.builtin.systemd:
+        daemon_reload: true
+      tags: [arm, onboard]
+
+    # Restart only changed arms so corrected endpoints take effect. Unchanged arms
+    # remain running; certificate and release handling are independent of this step.
+    - name: partner-arm — up
+      ansible.builtin.systemd:
+        name: "octo-{{ item.item.kind | default('udp-ingest') }}-{{ item.item.id }}.service"
+        state: "{{ 'restarted' if item.changed else 'started' }}"
+      loop: "{{ _rendered_partner_arms.results | default([]) }}"
+      loop_control: { label: "{{ item.item.id }} ({{ item.item.namespace }})" }
+      tags: [arm, onboard]
+
+    # ==================================================================== egress
+    # THE OUTBOUND DIRECTION, the mirror of the partner arms above. One egress arm per
+    # destination in 40-egress.yml: its own pen certificate (minted with the others), its
+    # own TLS and audit directories, one literal destination, and a unit that runs whether
+    # or not the destination is released. Releasing is an ACL change, not a restart: an
+    # unreleased arm's subscription is refused by the pen and it sends nothing.
+    # Every per-destination path uses `dest`, not `item`, so the publisher removal check
+    # in tests/test_templates.py cannot mistake an egress key for an arm key.
+    - name: egress — tls dir
+      ansible.builtin.file:
+        path: "/etc/octo-egress-{{ dest.id }}/tls"
+        state: directory
+        mode: "0755"
+      loop: "{{ active_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      tags: [egress, onboard]
+
+    - name: egress — place cert (public)
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ dest.id }}-egress-cert.pem"
+        dest: "/etc/octo-egress-{{ dest.id }}/tls/egress-cert.pem"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ active_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      # As for partner arms: the mint is a shell task that check mode skips.
+      when: >-
+        not ansible_check_mode
+        or (pen_state_dir ~ '/zenoh/tls/' ~ dest.id ~ '-egress-cert.pem')
+           in (_pen_tls.files | default([]) | map(attribute='path') | list)
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: [egress, onboard]
+
+    - name: egress — place private key (readable ONLY by the arm's runtime uid)
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ dest.id }}-egress-key.pem"
+        dest: "/etc/octo-egress-{{ dest.id }}/tls/egress-key.pem"
+        remote_src: true
+        owner: root
+        group: "{{ audit_runtime_uid }}"
+        mode: "0640"
+      loop: "{{ active_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      when: >-
+        not ansible_check_mode
+        or (pen_state_dir ~ '/zenoh/tls/' ~ dest.id ~ '-egress-key.pem')
+           in (_pen_tls.files | default([]) | map(attribute='path') | list)
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: [egress, onboard]
+
+    - name: egress — place CA root
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/ca-roots.pem"
+        dest: "/etc/octo-egress-{{ dest.id }}/tls/ca-root.pem"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ active_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: [egress, onboard]
+
+    # A zenoh-egress destination holds TWO identities: the one above (our own pod-CA cert,
+    # minted here, for reading the pen) and this one (the partner's own CA, cert and key,
+    # issued BY THEM for us) — the mirror of a peer's bundle in 20-peers.yml, run in
+    # reverse. Nothing here is ever minted on this pod: `partner_bundle_dir` is a directory
+    # on the CONTROL NODE (handed over out of band, the same way a partner hands over a
+    # bundle to us) holding cert.pem, key.pem and ca.pem. `remote_src` is deliberately
+    # absent — unlike every other egress copy in this play, the source lives on the
+    # controller, not on the pod.
+    - name: egress — zenoh-egress partner tls dir
+      ansible.builtin.file:
+        path: "/etc/octo-egress-{{ dest.id }}/partner-tls"
+        state: directory
+        mode: "0750"
+      loop: "{{ active_zenoh_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      tags: [egress, onboard]
+
+    - name: egress — place the partner's issued certificate (public)
+      ansible.builtin.copy:
+        src: "{{ dest.partner_bundle_dir }}/cert.pem"
+        dest: "/etc/octo-egress-{{ dest.id }}/partner-tls/partner-cert.pem"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ active_zenoh_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      tags: [egress, onboard]
+
+    - name: egress — place the partner's issued private key (readable ONLY by the arm's runtime uid)
+      ansible.builtin.copy:
+        src: "{{ dest.partner_bundle_dir }}/key.pem"
+        dest: "/etc/octo-egress-{{ dest.id }}/partner-tls/partner-key.pem"
+        owner: root
+        group: "{{ audit_runtime_uid }}"
+        mode: "0640"
+      loop: "{{ active_zenoh_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      tags: [egress, onboard]
+
+    - name: egress — place the partner's own CA (so this arm can verify their router)
+      ansible.builtin.copy:
+        src: "{{ dest.partner_bundle_dir }}/ca.pem"
+        dest: "/etc/octo-egress-{{ dest.id }}/partner-tls/partner-ca.pem"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ active_zenoh_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      tags: [egress, onboard]
+
+    # The audit record is the evidence of what left the pod, so it outlives the arm:
+    # `octo-pod egress remove` keeps it, and only this arm's uid may write it.
+    - name: egress — audit dir, writable only by the arm's runtime uid
+      ansible.builtin.file:
+        path: "{{ egress_audit_dir }}/{{ dest.id }}"
+        state: directory
+        owner: "{{ audit_runtime_uid }}"
+        group: "{{ audit_runtime_uid }}"
+        mode: "0750"
+      loop: "{{ active_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      tags: [egress, onboard]
+
+    - name: egress — downlink bridge tls dir
+      ansible.builtin.file:
+        path: "{{ downlink_tls_dir }}"
+        state: directory
+        mode: "0755"
+      when: (downlink_users | default([], true)) | length > 0
+      tags: [egress, onboard]
+
+    - name: egress — place the downlink bridge's pen certificate, key and CA
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ item.src }}"
+        dest: "{{ downlink_tls_dir }}/{{ item.dest }}"
+        remote_src: true
+        owner: root
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: downlink-bridge-cert.pem, dest: downlink-cert.pem, group: root, mode: "0644" }
+        - { src: downlink-bridge-key.pem,  dest: downlink-key.pem,  group: "{{ audit_runtime_uid }}", mode: "0640" }
+        - { src: ca-roots.pem,             dest: ca-root.pem,       group: root, mode: "0644" }
+      loop_control: { label: "{{ item.dest }}" }
+      when: (downlink_users | default([], true)) | length > 0
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: [egress, onboard]
+
+    # The image: a pinned reference when one is given (a carried image, or one CI
+    # publishes), otherwise built here from arms/egress, which only a clone has. A pod
+    # with neither and something to run refuses, naming both ways forward.
+    - name: egress — does this pod run anything outbound?
+      ansible.builtin.set_fact:
+        _egress_needed: >-
+          {{ downlink_users | length > 0 }}
+        _egress_from_src: "{{ (egress_image | default('', true)) | length == 0 }}"
+      tags: [egress, onboard]
+
+    - name: egress — is the egress source here?
+      ansible.builtin.stat: { path: "{{ playbook_dir }}/../arms/egress/Dockerfile" }
+      register: _egress_src
+      when: _egress_needed and _egress_from_src
+      tags: [egress, onboard]
+
+    - name: egress — an image it cannot build or pull cannot be started
+      ansible.builtin.assert:
+        that: _egress_src.stat.exists | default(false)
+        fail_msg: >-
+          This pod declares egress but has no egress image. Set egress_image_upstream to a
+          pinned reference this pod carries or can pull, or run from a clone of octo-pod,
+          which builds localhost/octo-egress:dev from arms/egress.
+        quiet: true
+      when: _egress_needed and _egress_from_src
+      tags: [egress, onboard]
+
+    - name: egress — build the egress image from source (clones only)
+      ansible.builtin.command: >-
+        podman build -f {{ playbook_dir }}/../arms/egress/Dockerfile
+        -t localhost/octo-egress:dev {{ playbook_dir }}/../arms
+      register: _egress_build
+      changed_when: "'COMMIT' in _egress_build.stdout"
+      when: _egress_needed and _egress_from_src
+      tags: [egress, onboard]
+
+    - name: egress — the source build is the image for this run
+      ansible.builtin.set_fact:
+        egress_image: localhost/octo-egress:dev
+      when: _egress_needed and _egress_from_src
+      tags: [egress, onboard]
+
+    - name: egress — pull the pinned image before starting anything
+      ansible.builtin.command: "podman pull {{ egress_image }}"
+      register: _egress_pull
+      changed_when: "'Writing manifest' in _egress_pull.stdout"
+      when: _egress_needed and not _egress_from_src
+      tags: [egress, onboard]
+
+    # sapient:// destinations run the SAPIENT session arm, from its own image, got the same
+    # way as the egress image: pinned when given, otherwise built from a clone.
+    - name: egress — does this pod hold a SAPIENT session?
+      ansible.builtin.set_fact:
+        _sapient_needed: "{{ active_egress | selectattr('dest', 'match', '^sapient://') | list | length > 0 }}"
+        _sapient_from_src: "{{ (sapient_image | default('', true)) | length == 0 }}"
+      tags: [egress, onboard]
+
+    - name: egress — is the sapient source here?
+      ansible.builtin.stat: { path: "{{ playbook_dir }}/../arms/sapient/Dockerfile" }
+      register: _sapient_src
+      when: _sapient_needed and _sapient_from_src
+      tags: [egress, onboard]
+
+    - name: egress — a sapient:// destination needs the sapient image
+      ansible.builtin.assert:
+        that: _sapient_src.stat.exists | default(false)
+        fail_msg: >-
+          This pod declares a sapient:// destination but has no sapient image. Set
+          sapient_image_upstream to a pinned reference this pod carries or can pull, or run
+          from a clone of octo-pod, which builds localhost/octo-sapient:dev from arms/sapient.
+        quiet: true
+      when: _sapient_needed and _sapient_from_src
+      tags: [egress, onboard]
+
+    - name: egress — build the sapient image from source (clones only)
+      ansible.builtin.command: >-
+        podman build -f {{ playbook_dir }}/../arms/sapient/Dockerfile
+        -t localhost/octo-sapient:dev {{ playbook_dir }}/../arms
+      register: _sapient_build
+      changed_when: "'COMMIT' in _sapient_build.stdout"
+      when: _sapient_needed and _sapient_from_src
+      tags: [egress, onboard]
+
+    - name: egress — the source build is the sapient image for this run
+      ansible.builtin.set_fact:
+        sapient_image: localhost/octo-sapient:dev
+      when: _sapient_needed and _sapient_from_src
+      tags: [egress, onboard]
+
+    - name: egress — pull the pinned sapient image before starting anything
+      ansible.builtin.command: "podman pull {{ sapient_image }}"
+      register: _sapient_pull
+      changed_when: "'Writing manifest' in _sapient_pull.stdout"
+      when: _sapient_needed and not _sapient_from_src
+      tags: [egress, onboard]
+
+    - name: egress — quadlet per destination
+      ansible.builtin.template:
+        src: "egress/{{ 'octo-zenoh-egress.container.j2' if (dest.kind | default('')) == 'zenoh-egress' else 'octo-egress.container.j2' }}"
+        dest: "/etc/containers/systemd/octo-egress-{{ dest.id }}.container"
+        mode: "0644"
+      vars: { d: "{{ dest }}" }
+      register: _egress_units
+      loop: "{{ active_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }} -> {{ dest.dest }}" }
+      tags: [egress, onboard]
+
+    # Removal converges for destinations as for arms: a unit file no declaration names is
+    # stopped and deleted, so a forgotten unit cannot resurrect its arm at boot.
+    - name: egress — find egress units on disk
+      ansible.builtin.find:
+        paths: /etc/containers/systemd
+        patterns: "octo-egress-*.container"
+      register: _egress_on_disk
+      tags: [egress, onboard]
+
+    - name: egress — reap egress units no declaration names
+      ansible.builtin.shell: |
+        systemctl stop "{{ item | basename | regex_replace('\\.container$', '') }}.service" 2>/dev/null || true
+        rm -f "{{ item }}"
+      loop: >-
+        {{ _egress_on_disk.files | map(attribute='path')
+           | reject('in', active_egress | map(attribute='id')
+                    | map('regex_replace', '^(.*)$', '/etc/containers/systemd/octo-egress-\1.container')
+                    | list) | list }}
+      changed_when: true
+      tags: [egress, onboard]
+
+    - name: egress — generate the units just rendered
+      ansible.builtin.systemd:
+        daemon_reload: true
+      tags: [egress, onboard]
+
+    # A changed unit means a changed destination, keys or image: restart that arm so it
+    # runs what was declared. An unchanged one is only made sure to be running. An
+    # unreleased session destination (egress_session_schemes) is stopped instead: its arm
+    # would register with the far side before any data was released to it.
+    - name: egress — up
+      ansible.builtin.systemd:
+        name: "octo-egress-{{ item.dest.id }}.service"
+        state: >-
+          {{ 'stopped'
+             if item.dest.dest.split('://')[0] in egress_session_schemes
+                and not ((item.dest.release | default({})).from_fabric | default(false) | bool)
+             else ('restarted' if item.changed else 'started') }}
+      loop: "{{ _egress_units.results | default([]) }}"
+      loop_control: { label: "{{ item.dest.id }}" }
+      tags: [egress, onboard]
+
+    # ================================================================== firewall
+    # DENY BY DEFAULT, IN EVERY DIRECTION, once pod_firewall_enabled is true. Rendered after
+    # the arms and destinations so it opens exactly what was just declared, and applied by
+    # octo-firewall-apply, which keeps a change only if the mesh and the fabric router still
+    # answer afterwards and otherwise restores the previous ruleset.
+    - name: firewall — the WAN leg is the default route's interface
+      ansible.builtin.set_fact:
+        firewall_wan_iface: "{{ ansible_facts['default_ipv4']['interface'] | default('') }}"
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    - name: firewall — the apply-and-verify script
+      ansible.builtin.template:
+        src: host/octo-firewall-apply.sh.j2
+        dest: /usr/local/sbin/octo-firewall-apply
+        mode: "0755"
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    # The ports the mesh's management told this agent to reach: management and signal
+    # (TCP), relays (TCP for WebSocket, UDP for QUIC), STUN and TURN (UDP). Read from the
+    # agent, not assumed: a goatnet runs its relays on whatever port it chose, and a ruleset
+    # that blocks them passes every check while the existing tunnels last, then strands
+    # every relayed peer at the next reboot. Before the pod has joined, the agent knows
+    # nothing and netbird_relay_ports alone applies.
+    - name: firewall — what the mesh's management told the agent to reach
+      ansible.builtin.command: netbird status --json
+      register: _fw_nb
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    - name: firewall — the mesh's control-plane and relay ports, from the agent
+      vars:
+        _nb: "{{ (_fw_nb.stdout | from_json) if (_fw_nb.rc | default(1)) == 0 and (_fw_nb.stdout | default('') | length) > 0 else {} }}"
+        _uris: >-
+          {{ [(_nb.management | default({})).url | default(''), (_nb.signal | default({})).url | default('')]
+             + ((_nb.relays | default({})).details | default([]) | map(attribute='uri') | list) }}
+      ansible.builtin.set_fact:
+        firewall_mesh_tcp_ports: >-
+          {{ ([443] + (netbird_relay_ports | default([443]))
+              + (_uris | select('match', '^(https?|rels?)://[^/:]+:[0-9]+')
+                 | map('regex_replace', '^[a-z]+://[^/:]+:([0-9]+).*$', '\1') | map('int') | list))
+             | unique | sort }}
+        firewall_mesh_udp_ports: >-
+          {{ ([443, 3478] + (netbird_relay_ports | default([443]))
+              + (_uris | select('match', '^(rels?://|stun:|turns?:)[^/:?]+:[0-9]+')
+                 | map('regex_replace', '^(?:[a-z]+://|[a-z]+:)[^/:?]+:([0-9]+).*$', '\1') | map('int') | list))
+             | unique | sort }}
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    # Found on the lab gateway: NetBird's own DNS answered the management name with a
+    # mesh address first, the ruleset opened the control plane on the WAN leg only, and
+    # octo-firewall-apply refused every change, rightly, because a new connection to
+    # management was dropped. The agent's own reconnect would have gone the same way.
+    # Resolve the name the agent actually uses, through the same resolver, and keep
+    # only the addresses inside the mesh range; the template opens those, and only
+    # those, over the mesh. Never fails the play: no answer means no extra opening.
+    - name: firewall — the mesh addresses the management name resolves to
+      vars:
+        _nb_mgmt: >-
+          {{ (((_fw_nb.stdout | from_json).management | default({})).url | default(''))
+             if (_fw_nb.rc | default(1)) == 0 and (_fw_nb.stdout | default('') | length) > 0 else '' }}
+        _mgmt_host: >-
+          {{ (_nb_mgmt | regex_replace('^[a-z]+://([^/:]+).*$', '\1'))
+             if (_nb_mgmt | length) > 0 else (netbird_mgmt_host | default('', true) | trim) }}
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -c
+          - |
+            import ipaddress, json, socket, sys
+            host, cidr = sys.argv[1], ipaddress.ip_network(sys.argv[2])
+            try:
+                infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+            except (OSError, UnicodeError):
+                infos = []
+            addrs = sorted({i[4][0] for i in infos}, key=ipaddress.ip_address)
+            print(json.dumps([a for a in addrs if ipaddress.ip_address(a) in cidr]))
+          - "{{ _mgmt_host | default('', true) }}"
+          - "{{ mesh_cidr }}"
+      register: _fw_mgmt_mesh
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: pod_firewall_enabled | bool and (_mgmt_host | length) > 0
+      tags: [firewall]
+
+    - name: firewall — open the management's mesh addresses, if it has any
+      ansible.builtin.set_fact:
+        firewall_mesh_mgmt_ips: >-
+          {{ (_fw_mgmt_mesh.stdout | from_json)
+             if (_fw_mgmt_mesh.rc | default(1)) == 0 and (_fw_mgmt_mesh.stdout | default('') | length) > 0
+             else [] }}
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    - name: firewall — render the ruleset from the declarations
+      ansible.builtin.template:
+        src: host/octo-firewall.nft.j2
+        dest: "{{ pod_firewall_file }}.new"
+        mode: "0600"
+      register: _fw_new
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    - name: firewall — is the ruleset on disk the one being enforced?
+      ansible.builtin.command: nft list table inet octo_pod
+      register: _fw_live
+      changed_when: false
+      failed_when: false
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    - name: firewall — compare with the last applied ruleset
+      ansible.builtin.command: cmp -s {{ pod_firewall_file }}.new {{ pod_firewall_file }}
+      register: _fw_same
+      changed_when: false
+      failed_when: false
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    - name: firewall — apply, verify the mesh and the router still answer, or restore
+      ansible.builtin.command: /usr/local/sbin/octo-firewall-apply {{ pod_firewall_file }}.new
+      register: _fw_apply
+      when:
+        - pod_firewall_enabled | bool
+        - _fw_same.rc != 0 or _fw_live.rc != 0
+      tags: [firewall]
+
+    - name: firewall — load the verified ruleset at boot
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/octo-pod-firewall.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=octo-pod firewall (deny by default; openings from the declarations)
+          DefaultDependencies=no
+          Before=network-pre.target
+          Wants=network-pre.target
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/sbin/nft -f {{ pod_firewall_file }}
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=multi-user.target
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    - name: firewall — enabled at boot
+      ansible.builtin.systemd:
+        name: octo-pod-firewall.service
+        enabled: true
+        daemon_reload: true
+      when: pod_firewall_enabled | bool
+      tags: [firewall]
+
+    # Turning it off converges too: the table and the boot unit go, and nothing of the
+    # old ruleset is left to load at the next boot.
+    - name: firewall — off means off
+      ansible.builtin.shell: |
+        changed=0
+        if nft list table inet octo_pod >/dev/null 2>&1; then nft delete table inet octo_pod; changed=1; fi
+        if [ -f /etc/systemd/system/octo-pod-firewall.service ]; then
+          systemctl disable octo-pod-firewall.service 2>/dev/null || true
+          rm -f /etc/systemd/system/octo-pod-firewall.service {{ pod_firewall_file }}
+          systemctl daemon-reload
+          changed=1
+        fi
+        rm -f {{ pod_firewall_file }}.new /usr/local/sbin/octo-firewall-apply
+        [ "$changed" = 1 ] && echo REMOVED || true
+      register: _fw_off
+      changed_when: "'REMOVED' in _fw_off.stdout"
+      when: not (pod_firewall_enabled | bool)
+      tags: [firewall]
+
+    # ================================================ converge in BOTH directions
+    # CREATING FROM A DECLARATION IS THE EASY HALF. Until now this play created what was
+    # declared and never noticed what was no longer declared — so deleting an arm from
+    # 30-arms.yml regenerated the ACL without its grant, regenerated the router config,
+    # reported `ok`, and LEFT ITS CONTAINER RUNNING with a valid certificate, still
+    # accepting traffic on its port and still publishing.
+    #
+    # That is the worst shape a convergence bug takes: the operator believes they revoked
+    # a publisher, every artifact agrees with them, and the publisher is still there. The
+    # only place it was visible was `octo-pod status`, which nothing forces anyone to run.
+    #
+    # WHY THIS REPORTS AND REFUSES RATHER THAN DELETING. Removing a live publisher
+    # destroys its certificate and interrupts whatever it is carrying, and this play runs
+    # unattended from a timer on some pods. Runtime faults may be repaired automatically;
+    # DECLARATION DRIFT IS A HUMAN DECISION. So the default is to fail loudly and name the
+    # exact command — and `-e reap_orphans=true` is the deliberate act that applies it.
+    - name: orphans — what is running that nothing declares
+      ansible.builtin.command: podman ps --format '{% raw %}{{.Names}}{% endraw %}'
+      register: _running_names
+      changed_when: false
+      failed_when: false
+      tags: [arm, onboard, orphans]
+
+    - name: orphans — compare running publishers against the declaration
+      ansible.builtin.set_fact:
+        _orphans: >-
+          {{ _running_names.stdout_lines | default([])
+             | select('match', '^octo-')
+             | reject('in', _infra)
+             | reject('in', _declared)
+             | list }}
+      vars:
+        # INFRASTRUCTURE IS NOT AN ORPHAN. The router, the pod-wide audit sink and the
+        # on-pod registry are not publishers and no declaration names them — reporting
+        # them as "stop these by hand" is advice that breaks the pod. Kept identical to
+        # the INFRA set in bin/octo-pod-status so the two views cannot disagree.
+        _infra:
+          - "octo-pen-zenoh-router"
+          - "octo-pen-audit-sink"
+          - "octo-registry"
+          - "octo-health-pub"
+          - "octo-uplink-bridge"
+          - "octo-downlink-bridge"
+          - "octo-pen-audit-sink-downlink"
+        # Every container name a declared publisher is allowed to own: its arm container
+        # under any of the three kinds, and its per-publisher audit sink.
+        _declared: >-
+          {{ (active_arms | default([]) | map(attribute='id') | product(
+                ['octo-udp-ingest-', 'octo-tcp-ingest-', 'octo-tcp-connect-'])
+              | map('reverse') | map('join') | list)
+             + (active_arms | default([]) | map(attribute='id')
+                | map('regex_replace', '^', 'octo-pen-audit-sink-') | list)
+             + (peers | default([]) | map(attribute='id')
+                | map('regex_replace', '^', 'octo-pen-audit-sink-') | list)
+             + (active_egress | default([]) | map(attribute='id')
+                | map('regex_replace', '^', 'octo-egress-') | list)
+             + (['octo-tcp-ingest', 'octo-udp-ingest'] if arm_enabled | default(false) | bool else []) }}
+      tags: [arm, onboard, orphans]
+
+    - name: "orphans — remove them (deliberate; -e reap_orphans=true)"
+      ansible.builtin.command: "podman rm -f {{ item }}"
+      register: _reaped
+      changed_when: _reaped.rc == 0
+      loop: "{{ _orphans | default([]) }}"
+      when:
+        - _orphans | default([]) | length > 0
+        - reap_orphans | default(false) | bool
+      tags: [arm, onboard, orphans]
+
+    - name: orphans — a publisher nothing declares is still publishing
+      ansible.builtin.assert:
+        that: (_orphans | default([]) | length) == 0
+        fail_msg: >-
+          These containers are running and NOTHING in this pod's declaration accounts for
+          them: {{ _orphans | join(', ') }}.
+
+          They keep accepting data and publishing with the certificate they were issued.
+          Removing a publisher from 30-arms.yml or 20-peers.yml regenerates the ACL
+          without its grant, but it does not stop what is already running, so the access
+          you believe you revoked is still live.
+
+          To take them down properly:
+
+          octo-pod remove-arm <id>
+
+          That stops the containers, deletes BOTH copies of the private key (the pen's
+          and the arm's own), and removes the declaration.
+
+          To have this play remove them here, re-run with -e reap_orphans=true
+
+          Reaping stops the containers and NOTHING ELSE. Both private keys stay on disk,
+          still signed by this pod's CA. That is survivable because the regenerated ACL
+          no longer grants the CN, and the router reloads it before anything reconnects,
+          so the credential is inert. It is not a retirement. Follow up with remove-arm
+          when you want the key gone.
+
+          This refuses rather than reaping by default because stopping a live publisher
+          interrupts whatever it is carrying, and this play runs unattended on some pods.
+        quiet: true
+      when: not (reap_orphans | default(false) | bool)
+      tags: [arm, onboard, orphans]
+
+    # =============================================================== sync leg
+    # 0750, not 0755: these hold the slot private key, and a world-traversable parent
+    # undoes the mode on the file inside it.
+    - name: sync-leg — dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: "{{ audit_runtime_uid }}"
+        mode: "0750"
+      loop: ["{{ fabric_uplink_dir }}", "{{ sub_leaf_dir }}"]
+      tags: [sync_leg]
+
+    - name: sync-leg — subscribe leaf from the pen CA (idempotent)
+      ansible.builtin.shell: |
+        set -e
+        openssl ecparam -name prime256v1 -genkey -noout -out {{ sub_leaf_dir }}/uplink-bridge-key.pem
+        openssl req -new -key {{ sub_leaf_dir }}/uplink-bridge-key.pem -subj "/CN=octo-uplink-bridge" -out /tmp/sub.csr
+        openssl x509 -req -in /tmp/sub.csr -CA {{ pen_state_dir }}/zenoh/tls/ca-roots.pem \
+          -CAkey {{ pen_state_dir }}/ca/ca-key.pem -CAcreateserial -days 825 -sha256 \
+          -extfile <(printf "subjectAltName=DNS:octo-uplink-bridge\nextendedKeyUsage=clientAuth,serverAuth\nbasicConstraints=CA:FALSE") \
+          -out {{ sub_leaf_dir }}/uplink-bridge-cert.pem
+        cp {{ pen_state_dir }}/zenoh/tls/ca-roots.pem {{ sub_leaf_dir }}/root-cert.pem
+        chmod 644 {{ sub_leaf_dir }}/*.pem
+      args:
+        creates: "{{ sub_leaf_dir }}/uplink-bridge-cert.pem"
+        executable: /bin/bash
+      tags: [sync_leg]
+
+    # The pinned digest is the check the CLI cannot be talked out of. `release --slot`
+    # pins the CA roots it authenticated; whichever roots this apply leaves in place (the
+    # operator's -e copy when the slot is being placed, else the installed file) must be
+    # those, byte for byte. Both bridges trust that one file, so a substituted root would
+    # let anyone who holds its key stand in for the router.
+    - name: sync-leg - read the CA roots this apply leaves in place
+      ansible.builtin.stat:
+        path: >-
+          {{ (fabric_ca_root_src | default(fabric_uplink_dir ~ '/fabric-ca-root.pem'))
+             if fabric_slot_cert_src is defined else fabric_uplink_dir ~ '/fabric-ca-root.pem' }}
+        checksum_algorithm: sha256
+      register: ca_roots_file
+      when: fabric_ca_roots_sha256 | default('') | length > 0
+      tags: [sync_leg]
+
+    - name: sync-leg - refuse CA roots other than the ones release authenticated
+      ansible.builtin.assert:
+        that: not ca_roots_file.stat.exists or ca_roots_file.stat.checksum == (fabric_ca_roots_sha256 | lower)
+        fail_msg: >-
+          {{ ca_roots_file.stat.path | default('the CA roots') }} has SHA-256
+          {{ ca_roots_file.stat.checksum | default('?') }}, not the pinned
+          {{ fabric_ca_roots_sha256 }}. Either the file is not the one the bundle carried or
+          someone substituted it. For a new bundle, run octo-pod release --slot with it first.
+        quiet: true
+      when: fabric_ca_roots_sha256 | default('') | length > 0
+      tags: [sync_leg]
+
+    # Certificate and CA root are public material: anyone may read them.
+    - name: sync-leg — place the slot certificate and CA root (public)
+      ansible.builtin.copy: { src: "{{ item.src }}", dest: "{{ item.dest }}", mode: "0644" }
+      loop:
+        - { src: "{{ fabric_slot_cert_src }}", dest: "{{ fabric_uplink_dir }}/{{ fabric_slot_anchor }}-cert.pem" }
+        - { src: "{{ fabric_ca_root_src }}",   dest: "{{ fabric_uplink_dir }}/fabric-ca-root.pem" }
+      when: fabric_slot_cert_src is defined
+      tags: [sync_leg]
+
+    # The private key is NOT. It authorises this pod to publish onto the shared fabric, so
+    # it is the highest-value credential on the box, worth more than any arm key which only
+    # reaches the local pen. It sat at 0644 alongside the certificate, world-readable by
+    # every local account. Same treatment the arm keys already get.
+    - name: sync-leg — place the slot private key (restricted)
+      ansible.builtin.copy:
+        src: "{{ fabric_slot_key_src }}"
+        dest: "{{ fabric_uplink_dir }}/{{ fabric_slot_anchor }}-key.pem"
+        owner: root
+        group: "{{ audit_runtime_uid }}"
+        mode: "0640"
+      when: fabric_slot_cert_src is defined
+      tags: [sync_leg]
+
+    # The bridge dials the upstream fabric by NAME, and that name resolves only through
+    # the pins written above — both come from the identity layer. Missing, the bridge
+    # starts, fails to resolve, and reports the same "sent" counters it would if it were
+    # working. Refuse to start it rather than hand back a silent success.
+    - name: sync-leg — the upstream fabric is known before the bridge starts
+      ansible.builtin.assert:
+        that:
+          - fabric_endpoint | default('') | length > 0
+          - fabric_host_pins | default([]) | length > 0
+        fail_msg: >-
+          Releasing upstream needs fabric_endpoint and fabric_host_pins, which name the
+          fabric this pod publishes into. They come with the pod's token, in
+          host_vars/{{ inventory_hostname }}/05-fabric.yml. Ask whoever issued the slot
+          for the endpoint and the mesh DNS pins; the pod cannot derive them.
+        quiet: true
+      # Non-empty, not merely defined: `identity write` always emits the key and
+      # leaves it "" when the token carried no slot — which it says out loud —
+      # so `is defined` is true on every pod and this fired on pods that have
+      # nothing to bridge. A pod that only captures locally is a supported shape.
+      when: fabric_slot_anchor | default('') | length > 0
+      tags: [sync_leg]
+
+    # The uplink bridge runs as a Quadlet unit from its pinned image (uplink_bridge_image),
+    # carried in the airgap bundle like every arm.
+    - name: sync-leg — bridge image, unit and up
+      block:
+        - name: sync-leg — bridge quadlet (carries bridge_allow, the release gate)
+          ansible.builtin.template:
+            src: bridge/octo-uplink-bridge.container.j2
+            dest: /etc/containers/systemd/octo-uplink-bridge.container
+            mode: "0644"
+          register: _uplink_unit
+
+        - name: sync-leg — bridge up
+          ansible.builtin.systemd:
+            name: octo-uplink-bridge.service
+            state: "{{ 'restarted' if _uplink_unit.changed else 'started' }}"
+            daemon_reload: true
+      # Non-empty, not merely defined: `identity write` always emits the key and
+      # leaves it "" when the token carried no slot — which it says out loud —
+      # so `is defined` is true on every pod and this fired on pods that have
+      # nothing to bridge. A pod that only captures locally is a supported shape.
+      when: fabric_slot_anchor | default('') | length > 0
+      tags: [sync_leg]
+
+    # ================================================================ downlink leg
+    # THE UPLINK IN REVERSE. It runs when this pod has egress destinations AND holds a
+    # slot: the bridge's fabric session IS the slot identity, so a pod without one cannot
+    # read the fabric at all, and saying so beats a unit that crash-loops on a missing key.
+    - name: downlink-leg — destinations without a slot read nothing
+      ansible.builtin.debug:
+        msg: >-
+          This pod declares egress destinations but holds no slot, so the downlink
+          bridge has no fabric identity and is not started. Join with a token that
+          carries a slot, or release one with `egress release --slot`, then apply.
+      when:
+        - (downlink_users | default([], true)) | length > 0
+        - fabric_slot_anchor | default('') | length == 0
+      tags: [egress, sync_leg]
+
+    - name: downlink-leg — the upstream fabric is known before the bridge starts
+      ansible.builtin.assert:
+        that:
+          - fabric_endpoint | default('') | length > 0
+          - fabric_host_pins | default([]) | length > 0
+        fail_msg: >-
+          Reading fabric keys needs fabric_endpoint and fabric_host_pins, which name the
+          fabric this pod reads. They come with the pod's token, in
+          host_vars/{{ inventory_hostname }}/05-fabric.yml.
+        quiet: true
+      when:
+        - (downlink_users | default([], true)) | length > 0
+        - fabric_slot_anchor | default('') | length > 0
+      tags: [egress, sync_leg]
+
+    - name: downlink-leg — bridge quadlet (carries downlink_allow, the downward gate)
+      ansible.builtin.template:
+        src: egress/octo-downlink-bridge.container.j2
+        dest: /etc/containers/systemd/octo-downlink-bridge.container
+        mode: "0644"
+      register: _downlink_unit
+      when:
+        - (downlink_users | default([], true)) | length > 0
+        - fabric_slot_anchor | default('') | length > 0
+      tags: [egress, sync_leg]
+
+    - name: downlink-leg — bridge up
+      ansible.builtin.systemd:
+        name: octo-downlink-bridge.service
+        state: "{{ 'restarted' if _downlink_unit.changed else 'started' }}"
+        daemon_reload: true
+      when:
+        - (downlink_users | default([], true)) | length > 0
+        - fabric_slot_anchor | default('') | length > 0
+      tags: [egress, sync_leg]
+
+    - name: sync-leg - no slot, no uplink bridge
+      ansible.builtin.shell: |
+        if [ -f /etc/containers/systemd/octo-uplink-bridge.container ] || podman container exists octo-uplink-bridge; then
+          systemctl stop octo-uplink-bridge.service || exit 1
+          if podman container exists octo-uplink-bridge; then
+            podman rm -f octo-uplink-bridge || exit 1
+          fi
+          rm -f /etc/containers/systemd/octo-uplink-bridge.container || exit 1
+          systemctl daemon-reload || exit 1
+          echo REMOVED
+        fi
+      register: _uplink_reap
+      changed_when: "'REMOVED' in _uplink_reap.stdout"
+      when: fabric_slot_anchor | default('') | length == 0
+      tags: [sync_leg]
+
+    # Removal converges: no destinations, or no slot, means no bridge left behind to
+    # restart at boot.
+    - name: downlink-leg — no destinations or no slot, no bridge
+      ansible.builtin.shell: |
+        if [ -f /etc/containers/systemd/octo-downlink-bridge.container ]; then
+          systemctl stop octo-downlink-bridge.service 2>/dev/null || true
+          rm -f /etc/containers/systemd/octo-downlink-bridge.container
+          systemctl daemon-reload
+          echo REMOVED
+        fi
+      register: _downlink_reap
+      changed_when: "'REMOVED' in _downlink_reap.stdout"
+      when: >-
+        (downlink_users | default([], true)) | length == 0
+        or fabric_slot_anchor | default('') | length == 0
+      tags: [egress, sync_leg]
+
+  handlers:
+    # A KEY THE CONTAINER COULD NOT READ IS FIXED ON DISK, NOT IN THE PROCESS. The health
+    # publisher mounts the pen's key, and a bind-mounted file's permissions change under a
+    # running container without the container noticing: it already failed to open the key
+    # at startup and will not try again.
+    #
+    # A crash-looping container does eventually pick this up, because each restart re-opens
+    # the file, so this handler buys determinism rather than correctness. That distinction
+    # matters when someone is watching an install: "it recovers within the backoff window"
+    # and "it is running when apply finishes" are different promises, and only the second
+    # one is checkable.
+    #
+    # failed_when: false because on a first run the container does not exist yet. The
+    # compose project a few tasks later creates it, and it reads the permissions this task
+    # just set. Nothing to restart is not a failure.
+    - name: restart health publisher
+      # failed_when: false — on a first run the unit is not generated yet; the
+      # quadlet render a few tasks later creates it, and it reads the
+      # permissions this task just set. Nothing to restart is not a failure.
+      ansible.builtin.command: systemctl restart octo-health-pub.service
+      changed_when: true
+      failed_when: false
+      when: health_pub_enabled | default(false) | bool
+
+    # Restarts the ROUTER and nothing else.
+    #
+    # This handler used to also restart every audit sink, because sinks do not retry a
+    # lost session. That made one publisher's ACL change fan out across the
+    # whole pod — N sinks restarted serially for a change that concerned one of them —
+    # and it put the repair of a sink somewhere that only runs when a human runs
+    # `apply`. A sink's liveness is now the sink's own business: octo-watchdog.timer
+    # checks each one every minute and restarts the individual container that is dead.
+    #
+    # The arms are deliberately not restarted either. They ride the gap out and resume
+    # on their own, dropping anything that aged out rather than replaying it stale.
+    - name: restart pen router
+      ansible.builtin.shell: |
+        set -eo pipefail
+        # NOTHING TO RESTART ON A FIRST RUN. The ACL is written and flushed before
+        # anything connects, which is right — but on a pod being built for the first
+        # time the router does not exist yet: `pen — up` creates it a few tasks later,
+        # and it will read the ACL that was just written. Restarting a container that
+        # has never existed is not a failure to recover from, it is a step that has
+        # nothing to do. Every earlier test ran on a box where the router was already
+        # there, so the first apply on a genuinely new pod was the first to hit this.
+        if ! systemctl cat octo-pen-zenoh-router.service >/dev/null 2>&1; then
+          echo "router unit not generated yet — the new ACL will be read when it starts"
+          exit 0
+        fi
+        # PartOf on the sinks restarts them WITH the router, after Notify=healthy
+        # says its listener answers — the orphan-sinks window is closed by
+        # systemd itself now, not repaired after the fact.
+        systemctl restart octo-pen-zenoh-router.service
+        for _ in $(seq 1 20); do ss -tlnp | grep -q ":{{ pen_listen_port }}" && break; sleep 1; done
+        ss -tlnp | grep -q ":{{ pen_listen_port }}" || { echo "router did not return on {{ pen_listen_port }}"; exit 1; }
+      args: { executable: /bin/bash }     # pipefail
+      changed_when: true
+
+    # noqa no-changed-when — a handler only runs because something already changed.
+    - name: apply net-isolation
+      ansible.builtin.command: "nft -f /etc/nftables-net-isolation.nft"
+      changed_when: true
+    - name: restart journald
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted
+
+    # Applies to ALL of /etc/netplan, not just our file. Only fires when our file
+    # changed, and `netplan generate` above has already proven the set parses.
+    - name: apply netplan
+      ansible.builtin.command: netplan apply
+      changed_when: true
+
+    - name: reload systemd
+      ansible.builtin.systemd: { daemon_reload: true }
+    - name: enable net-isolation
+      ansible.builtin.systemd: { name: net-isolation, enabled: true }

@@ -1,0 +1,109 @@
+# Dependency policy for the arms. COPIED FROM goat's deny.toml so the fleet has one
+# license allow-list and one set of bans, not two that drift. Sync it rather than
+# editing it locally: a crate allowed here and denied there is a question nobody
+# can answer at 3am.
+#
+# cargo-deny — Rust license / bans / sources gate.
+#
+# Single responsibility: enforce the project's permissive-license posture
+# (Tier 1-4 permissive allowlist; Tier-5 disqualified by omission) plus
+# wildcard / duplicate-version / unknown-source bans on the Rust dep tree.
+#
+# In `.github/workflows/ci.yml`, cargo-audit handles RustSec vulnerabilities;
+# maintenance advisories are visible warnings, matching goat. CI runs cargo-deny
+# only for licenses, bans and sources, so it does not double-scan advisories.
+# The [advisories] section below retains the named exceptions for manual advisory
+# checks; it is not used by the CI cargo-deny command.
+#
+# To run the CI cargo-deny check locally:
+#   cargo install cargo-deny
+#   cargo deny check licenses bans sources
+
+[graph]
+all-features = true
+no-default-features = false
+
+# ---------------------------------------------------------------------------
+# Licenses — permissive allowlist. Add only after confirming
+# the license is on the Tier 1-4 ladder; never add a Tier-5 (SSPL /
+# Commons Clause / Elastic v2 / restrictive BSL / "non-commercial").
+# ---------------------------------------------------------------------------
+# ADVISORY IGNORES — every one is transitive through zenoh =1.9.0, which is pinned
+# deliberately ("a minor bump has changed wire behaviour before"). Same posture as
+# GOAT: name them, say why, and keep the
+# vulnerability gate live so any NEW vulnerability outside the CI ignore list fails.
+#
+# RE-CHECK TRIGGER: whenever zenoh is bumped in arms/Cargo.toml. Delete any entry that
+# no longer appears — an ignore list that only grows stops being a decision.
+[advisories]
+ignore = [
+  # rsa 0.9.10 — Marvin timing sidechannel on RSA private-key operations.
+  # Not reachable here: the pen mints prime256v1 (EC) leaves, and zenoh's pubkey auth
+  # mechanism (the only consumer) is unconfigured — transport.auth.pubkey is null in
+  # the generated router config. Reassess if RSA certs or pubkey auth are ever enabled.
+  "RUSTSEC-2023-0071",
+  # lz4_flex decompression can leak uninitialised memory or a reused output buffer.
+  # Reached only through zenoh-transport's compression feature on a link that negotiated
+  # compression (not websocket-specific). Every arm opens a mode=client session that pins
+  # transport/unicast and transport/multicast compression/enabled = false
+  # (arms/common/src/session.rs, arms/egress/src/session.rs), so the decompress path is
+  # unreachable. No zenoh release past 1.9.0 moves lz4_flex to the fixed 0.11.6; all pin
+  # ^0.10.0. Reassess if any session enables compression or zenoh re-bumps lz4_flex.
+  "RUSTSEC-2026-0041",
+  # paste — unmaintained, not a vulnerability. Build-time proc-macro only.
+  "RUSTSEC-2024-0436",
+  # rustls-pemfile — unmaintained, superseded upstream. No known vulnerability.
+  "RUSTSEC-2025-0134",
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    # Permissive DATA license (Community Data License Agreement) carried by the
+    # Mozilla CA trust-store crates (webpki-roots / webpki-root-certs, the rustls
+    # ecosystem standard since their MPL->CDLA relicense). No copyleft, no
+    # field-of-use restriction — same tier as CC0/Unicode-DFS above.
+    "CDLA-Permissive-2.0",
+    "0BSD",
+    "BSL-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+# ---------------------------------------------------------------------------
+# Bans — guard against duplicate / wildcard crates.
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies carry no version, which cargo-deny reads as a wildcard. Inside one
+# workspace that is how you refer to a sibling crate — octo-arm-common is not fetched
+# from a registry — so allow it here rather than weakening `wildcards` itself, which
+# still catches a real `foo = "*"` from crates.io.
+allow-wildcard-paths = true
+highlight = "all"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Sources — only crates.io + the explicitly-named git remotes below.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,20 @@
+# Third-Party Licenses
+
+octo-pod's arm images contain the Rust crates listed here, under these licenses.
+Generated from `arms/Cargo.lock` by `cargo about generate --frozen --fail about.hbs` in
+`arms/`. CI fails when this file is out of date.
+
+{{#each overview}}
+- {{{name}}} ({{count}})
+{{/each}}
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by: {{#each used_by}}{{crate.name}} {{crate.version}}{{#unless @last}}, {{/unless}}{{/each}}
+
+```text
+{{{text}}}
+```
+
+{{/each}}

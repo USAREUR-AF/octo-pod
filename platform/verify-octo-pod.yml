@@ -1,0 +1,401 @@
+---
+# octo-pod — VERIFICATION. Proves the pen ACL actually enforces what the
+# `peers` declaration says, rather than trusting that the config loaded.
+#
+#   ansible-playbook -i inventory.ini verify-octo-pod.yml
+#   ansible-playbook -i inventory.ini verify-octo-pod.yml --tags acl
+#
+# Why this exists: on 2026-08-10 the pen's ACL subject had no cert_common_names,
+# which Zenoh treats as a WILDCARD — every CA-rooted cert had first-party write.
+# The config was valid, loaded cleanly, and logged no errors. Only an allow/deny
+# test finds that class of fault. Run it after any change to `peers`,
+# `pen_firstparty_cns` or the zenoh config template.
+#
+# Runs ON the pod, in a throwaway venv, so it needs no control-machine tooling and
+# tests from inside the same trust domain as a real peer.
+
+- name: verify octo-pod
+  hosts: octopod
+  become: true
+  gather_facts: false
+
+  tasks:
+    # ------------------------------------------------------------------ acl
+    - name: acl — python + venv present
+      ansible.builtin.package:
+        name: [python3-venv, python3-pip]
+        state: present
+      retries: 20
+      delay: 15
+      register: _v
+      until: _v is succeeded
+      tags: [acl]
+
+    # Pinned to the pen's zenoh: an unpinned install pulled 1.10.1 against a 1.9.0 router.
+    # The golden image builds this venv already, so an airgapped pod needs no PyPI here.
+    - name: acl — throwaway zenoh client venv
+      ansible.builtin.pip:
+        name: "eclipse-zenoh=={{ verify_zenoh_version }}"
+        virtualenv: "{{ verify_venv | default('/opt/octo-verify/venv') }}"
+        virtualenv_command: python3 -m venv
+      tags: [acl]
+
+    - name: acl — render the allow/deny test from the peers declaration
+      ansible.builtin.template:
+        src: pen/verify-acl.py.j2
+        dest: "{{ verify_venv | default('/opt/octo-verify/venv') }}/../verify-pen-acl.py"
+        mode: "0755"
+      tags: [acl]
+
+    # Non-zero exit = the ACL does not enforce the declaration. Do not soften this.
+    - name: acl — every declared peer may write ONLY its own namespace
+      ansible.builtin.command:
+        cmd: "{{ verify_venv | default('/opt/octo-verify/venv') }}/bin/python ../verify-pen-acl.py"
+        chdir: "{{ verify_venv | default('/opt/octo-verify/venv') }}"
+      register: acl_result
+      changed_when: false
+      tags: [acl]
+
+    - name: acl — result
+      ansible.builtin.debug:
+        msg: "{{ acl_result.stdout_lines }}"
+      tags: [acl]
+
+    # ----------------------------------------------------------------- sink
+    # An audit sink whose zenoh session fails to open exits its subscriber task but leaves
+    # the process running and still serving metrics. `podman ps` shows Up, restart counts
+    # stay 0, and every liveness probe passes while nothing whatsoever is being audited.
+    # That state can run unnoticed for days; one trigger is TLS material the nonroot runtime could not read. `goat_audit_subscriber_
+    # session_state` is the only signal that distinguishes working from zombie — assert it.
+    # The port arrives as an ENVIRONMENT VARIABLE, not as Jinja inside the script.
+    # {% raw %} is here to protect podman's Go templates ({{.Names}}) from Ansible, and
+    # it protected `{{ audit_metrics_port }}` too — so curl was handed a literal
+    # "http://<sink-ip>:{{ audit_metrics_port }}/metrics", got nothing, and every sink
+    # reported "<no metrics>". This check could never pass on any pod, and it fails in
+    # the shape of the fault it exists to detect: a dead subscriber looks identical to
+    # a URL that was never built. octo-watchdog does the same job correctly by escaping
+    # the braces ({{ "{{" }}.Names{{ "}}" }}) instead of raw-blocking the whole script.
+    - name: sink — every audit sink reports a live subscriber
+      environment:
+        METRICS_PORT: "{{ audit_metrics_port }}"
+      ansible.builtin.shell: |
+        {% raw %}
+        set -uo pipefail
+        fail=0; found=0
+        for c in $(podman ps --format '{{.Names}}' | grep '^octo-pen-audit-sink' || true); do
+          found=1
+          ip=$(podman inspect "$c" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+          key=$(podman inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+                 | sed -n 's/^AUDIT_SUBSCRIBER_KEY=//p')
+          st=$(curl -s --max-time 5 "http://${ip}:${METRICS_PORT}/metrics" \
+                 | awk '/^goat_audit_subscriber_session_state/{print $2}')
+          if [ "${st:-}" = "1" ]; then
+            echo "  PASS  ${c}  subscriber live on ${key}"
+          else
+            echo "  FAIL  ${c}  session_state=${st:-<no metrics>}  key=${key}"
+            fail=1
+          fi
+        done
+        [ "$found" = "1" ] || { echo "  FAIL  no audit sinks running at all"; fail=1; }
+        exit $fail
+        {% endraw %}
+      args: { executable: /bin/bash }     # pipefail: dash does not support it
+      register: sink_result
+      changed_when: false
+      tags: [sink]
+
+    - name: sink — result
+      ansible.builtin.debug:
+        msg: "{{ sink_result.stdout_lines }}"
+      tags: [sink]
+
+    # ----------------------------------------------------------------- certs
+    # An expired leaf fails the TLS handshake, and on this pod that presents as a sink
+    # that is up but subscribing nothing — not as an error. Nothing else watches this:
+    # the leaves run 825 days, so the first anyone would know is a silent audit gap.
+    - name: certs — nothing expires within {{ cert_expiry_warn_days | default(90) }} days
+      ansible.builtin.shell: |
+        set -uo pipefail
+        secs=$(( {{ cert_expiry_warn_days | default(90) }} * 86400 ))
+        fail=0
+        for c in {{ pen_state_dir }}/zenoh/tls/*-cert.pem \
+                 {{ pen_state_dir }}/zenoh/tls/ca-roots.pem \
+                 {{ sub_leaf_dir }}/*-cert.pem; do
+          [ -f "$c" ] || continue
+          end=$(openssl x509 -in "$c" -noout -enddate 2>/dev/null | cut -d= -f2)
+          if openssl x509 -in "$c" -noout -checkend "$secs" >/dev/null 2>&1; then
+            printf "  PASS  %-26s %s\n" "$(basename "$c")" "$end"
+          else
+            printf "  FAIL  %-26s %s  <- renew\n" "$(basename "$c")" "$end"
+            fail=1
+          fi
+        done
+        exit $fail
+      args: { executable: /bin/bash }
+      register: cert_result
+      changed_when: false
+      failed_when: false
+      tags: [certs]
+
+    - name: certs — result
+      ansible.builtin.debug:
+        msg: "{{ cert_result.stdout_lines }}"
+      tags: [certs]
+
+    # Renewal is: delete the leaf and re-run configure-octo-pod.yml --tags pen. The mint
+    # task is `creates:`-guarded, so it only regenerates what is missing.
+    - name: certs — fail on anything expiring
+      ansible.builtin.assert:
+        that: cert_result.rc == 0
+        fail_msg: >-
+          One or more pen certificates expire within
+          {{ cert_expiry_warn_days | default(90) }} days. An expired leaf does not error
+          loudly — the session simply never opens. See the list above.
+        quiet: true
+      tags: [certs]
+
+    # ---------------------------------------------------------------- decode
+    # Proves the declared schema actually parses what is on the wire — not merely
+    # that a descriptor is attached. Protobuf will half-parse a wrong message and
+    # report no error, so the test is "all bytes consumed", per key.
+    #
+    # stethoscope's decode-roundtrip cannot do this here: it reads the audit tail,
+    # and those events carry no payload bodies, so it reports SKIPPED forever.
+    - name: decode — build the declared descriptor
+      ansible.builtin.shell: |
+        set -e
+        d=/tmp/verify-decode/{{ item.id }}
+        rm -rf "$d" && mkdir -p "$d"
+        git clone --depth 1 -q "{{ item.schema.proto_git }}" "$d/src"
+        mkdir -p "$d/root/{{ item.schema.import_root }}"
+        cp -r "$d/src/." "$d/root/{{ item.schema.import_root }}/"
+        rm -rf "$d/root/{{ item.schema.import_root }}/.git"
+        podman run --rm -v "$d/root":/w -w /w python:3.12.13-slim sh -c \
+          'pip install --quiet --disable-pip-version-check grpcio-tools==1.83.0 protobuf==7.35.1 &&
+           python -m grpc_tools.protoc -I. --include_imports \
+             --descriptor_set_out=/w/schema.fds {{ item.schema.entry }} &&
+           chmod 0644 /w/schema.fds'
+      loop: "{{ (active_peers + active_arms) | selectattr('schema', 'defined') | list }}"
+      loop_control: { label: "{{ item.id }}" }
+      changed_when: false
+      tags: [decode]
+
+    - name: decode — every live key parses cleanly against it
+      ansible.builtin.shell: |
+        set -e
+        cat > /tmp/verify-decode/{{ item.id }}/check.py <<'PYEOF'
+        import time, re, sys, zenoh
+        from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+        c = zenoh.Config()
+        for k, v in [("mode",'"client"'), ("connect/endpoints",'["tls/penhost:7447"]'),
+                     ("connect/exit_on_failure",'{ "client": false }'),
+                     ("connect/timeout_ms",'{ "client": -1 }'),
+                     ("scouting/multicast/enabled","false"),
+                     ("transport/link/tls/root_ca_certificate",'"/tls/ca-roots.pem"'),
+                     ("transport/link/tls/connect_certificate",'"/tls/pod-cert.pem"'),
+                     ("transport/link/tls/connect_private_key",'"/tls/pod-key.pem"'),
+                     ("transport/link/tls/enable_mtls","true"),
+                     ("transport/link/tls/verify_name_on_connect","false")]:
+            c.insert_json5(k, v)
+        fds = descriptor_pb2.FileDescriptorSet()
+        fds.ParseFromString(open("/w/schema.fds","rb").read())
+        pool = descriptor_pool.DescriptorPool()
+        for f in fds.file: pool.Add(f)
+        md = None
+        for f in fds.file:
+            for m in f.message_type:
+                if m.name == "MSGNAME":
+                    md = pool.FindMessageTypeByName((f.package + "." if f.package else "") + m.name)
+        assert md is not None, "MSGNAME not found in descriptor"
+        Msg = message_factory.GetMessageClass(md)
+        s = zenoh.open(c); seen = {}
+        def on(x):
+            k = str(x.key_expr)
+            if k in seen: return
+            try: seen[k] = x.payload.to_bytes()
+            except Exception: seen[k] = bytes(x.payload)
+        s.declare_subscriber("NAMESPACE", on)
+        t0 = time.time()
+        while time.time() - t0 < 30: time.sleep(0.3)
+        s.close()
+        if not seen:
+            print("  SKIP  no traffic on NAMESPACE in 30s"); sys.exit(0)
+        bad = 0
+        for k, b in sorted(seen.items()):
+            try:
+                m = Msg(); n = m.ParseFromString(b)
+                ok = (n == len(b))
+                print("  %-5s %-6d %s" % ("PASS" if ok else "PARTIAL", len(b), k[-72:]))
+                bad += 0 if ok else 1
+            except Exception as e:
+                print("  FAIL  %-6d %s  (%s)" % (len(b), k[-72:], type(e).__name__)); bad += 1
+        print("\n  %d key(s), %d failed" % (len(seen), bad))
+        sys.exit(1 if bad else 0)
+        PYEOF
+        sed -i 's/MSGNAME/{{ item.schema.message }}/g; s#NAMESPACE#{{ item.namespace }}#g' \
+          /tmp/verify-decode/{{ item.id }}/check.py
+        podman run --rm --add-host penhost:host-gateway \
+          -v {{ pen_state_dir }}/zenoh/tls:/tls:ro \
+          -v /tmp/verify-decode/{{ item.id }}/root:/w:ro \
+          -v /tmp/verify-decode/{{ item.id }}/check.py:/check.py:ro \
+          python:3.12.13-slim sh -c \
+          'pip install --quiet --disable-pip-version-check eclipse-zenoh==1.9.0 protobuf==7.35.1 && python /check.py'
+      loop: "{{ (active_peers + active_arms) | selectattr('schema', 'defined') | list }}"
+      loop_control: { label: "{{ item.id }} ({{ item.namespace }})" }
+      register: decode_result
+      changed_when: false
+      tags: [decode]
+
+    - name: decode — result
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ decode_result.results }}"
+      loop_control: { label: "{{ item.item.id }}" }
+      tags: [decode]
+
+    # ------------------------------------------------------- declared vs observed
+    # The MISSING quadrant: a publisher we declared
+    # that is not actually publishing. This is the failure that went unnoticed for a
+    # day on the SAPIENT feed — declared, expected, silent, and nobody alerted.
+    - name: drift — is every declared publisher actually publishing?
+      ansible.builtin.shell: |
+        set -o pipefail
+        # The sink colourises its output, so "events=" is not contiguous on the wire:
+        # it is "flush \e[3mevents\e[0m\e[2m=\e[0m256". Strip SGR codes before matching,
+        # or this silently counts zero for a publisher that is publishing fine.
+        timeout 20 podman logs --since 2m octo-pen-audit-sink-{{ item.id }} 2>&1 \
+          | sed 's/\x1b\[[0-9;]*m//g' \
+          | grep -oE "events=[0-9]+" | awk -F= '{s+=$2} END {print s+0}'
+      args: { executable: /bin/bash }
+      loop: "{{ active_peers + active_arms }}"
+      loop_control: { label: "{{ item.id }} ({{ item.namespace }})" }
+      register: drift
+      changed_when: false
+      failed_when: false          # gather all publishers, then assert once below
+      tags: [drift]
+
+    - name: drift — report
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.id }}: {{ 'PUBLISHING (' ~ item.stdout ~ ' events/2m)'
+             if (item.stdout | default('0') | trim | int) > 0
+             else 'DECLARED BUT NOT OBSERVED on ' ~ item.item.namespace
+                  ~ ' — normal on a pod whose sensors are not switched on yet;'
+                  ~ ' a fault on one that was. Add -e drift_must_flow=true to make'
+                  ~ ' silence fail.' }}
+      loop: "{{ drift.results | default([]) }}"
+      loop_control: { label: "{{ item.item.id }}" }
+      tags: [drift]
+
+    # TWO DIFFERENT QUESTIONS, and this play was answering them as one.
+    #
+    #   is this pod correctly BUILT?   the ACL enforces the declaration, the certificates
+    #                                  are valid, the sinks are genuinely subscribed
+    #   is data flowing RIGHT NOW?     depends on whether a sensor is switched on
+    #
+    # Silence is the failure that went unnoticed for a day on the SAPIENT feed, so it is
+    # always reported. But it FAILED by default — and `verify` runs as the last step of
+    # `join`, when no publisher can possibly be flowing yet. Every first join therefore
+    # ended in a failure about a pod that was built perfectly, and an operator setting up
+    # a machine before its sensors exist was told their pod was broken.
+    #
+    # So: reported always, fatal on request. A deployed pod being health-checked sets
+    # drift_must_flow=true and silence is a fault; a pod being built does not, and
+    # silence is just Tuesday.
+    - name: drift — fail on declared-but-silent publishers
+      ansible.builtin.assert:
+        that: (item.stdout | default('0') | trim | int) > 0
+        fail_msg: >-
+          {{ item.item.id }} is declared but produced NO events on {{ item.item.namespace }}
+          in the last 2 minutes. Either it stopped, or its sink
+          (octo-pen-audit-sink-{{ item.item.id }}) is zombied — check
+          goat_audit_subscriber_session_state before blaming the publisher.
+        quiet: true
+      loop: "{{ drift.results | default([]) }}"
+      loop_control: { label: "{{ item.item.id }}" }
+      when:
+        - drift_must_flow | default(false)
+        - not (drift_allow_silent | default(false))
+        # An on-demand publisher (a test arm you drive by hand) is still REPORTED above,
+        # but silence is not a fault for it. Only continuous feeds are asserted.
+        - item.item.expect.continuous | default(true)
+      tags: [drift]
+
+    # -------------------------------------------------------------- release gate
+    # Two independent gates must agree: `release.to_fabric` per publisher, and
+    # bridge_allow. A publisher released in one but not the other is a config bug.
+    - name: gate — release flags agree with bridge_allow
+      ansible.builtin.assert:
+        that:
+          - (item.release.to_fabric | default(false)) == (item.namespace in (bridge_allow | default('')).split(',') | map('trim') | list)
+        fail_msg: >-
+          {{ item.id }}: release.to_fabric={{ item.release.to_fabric | default(false) }}
+          but bridge_allow={{ bridge_allow }} — the two gates disagree.
+        success_msg: "{{ item.id }}: release gate consistent (to_fabric={{ item.release.to_fabric | default(false) }})"
+      loop: "{{ active_peers + active_arms }}"
+      loop_control: { label: "{{ item.id }}" }
+      tags: [gate]
+
+    # -------------------------------------------------------------- downward gate
+    # The mirror of the release gate. A released destination's keys must all sit in
+    # downlink_allow, and downlink_allow must name nothing that no released destination
+    # declares: either disagreement is a config bug, and the second one means the
+    # downlink bridge subscribes to data nobody is allowed to receive.
+    - name: gate — released destinations are listed in downlink_allow
+      ansible.builtin.assert:
+        that: dest['keys'] | difference(_allow) | length == 0
+        fail_msg: >-
+          {{ dest.id }} is released (from_fabric true) but downlink_allow lacks
+          {{ dest['keys'] | difference(_allow) | join(', ') }}. Run
+          'octo-pod egress release {{ dest.id }}' to repair both gates.
+        success_msg: "{{ dest.id }}: downward gate consistent"
+      vars:
+        _allow: "{{ (downlink_allow | default('', true)).split(',') | select | list }}"
+      loop: "{{ active_egress | selectattr('release.from_fabric', 'defined')
+                | selectattr('release.from_fabric') | list }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      tags: [gate, egress]
+
+    - name: gate — downlink_allow names only keys a released destination declares
+      ansible.builtin.assert:
+        that: _orphan_keys | length == 0
+        fail_msg: >-
+          downlink_allow names {{ _orphan_keys | join(', ') }}, which no released
+          destination or peer reader declares. 'octo-pod egress check' shows the state of each one.
+        quiet: true
+      vars:
+        _allow: "{{ (downlink_allow | default('', true)).split(',') | select | list }}"
+        _declared: >-
+          {{ (active_egress | selectattr('release.from_fabric', 'defined')
+              | selectattr('release.from_fabric') | map(attribute='keys') | flatten | list)
+             + (active_peer_readers | map(attribute='read_keys') | flatten | list) }}
+        _orphan_keys: "{{ _allow | difference(_declared) }}"
+      tags: [gate, egress]
+
+    # Running is not delivering: an arm can be up with its subscription refused. These
+    # say the units exist and run; the audit record under /var/lib/octo-egress/<id>/ and
+    # the destination itself say whether data arrived. An unreleased session destination
+    # (egress_session_schemes) must NOT be running: it would announce this pod to the far
+    # side before its data was released.
+    - name: egress — each destination's arm runs exactly when it should
+      ansible.builtin.command: "systemctl is-active octo-egress-{{ dest.id }}.service"
+      register: _egress_active
+      changed_when: false
+      failed_when: (_egress_active.stdout == 'active') != (_should_run | bool)
+      vars:
+        _should_run: >-
+          {{ dest.dest.split('://')[0] not in egress_session_schemes
+             or ((dest.release | default({})).from_fabric | default(false) | bool) }}
+      loop: "{{ active_egress }}"
+      loop_control: { loop_var: dest, label: "{{ dest.id }}" }
+      tags: [egress]
+
+    - name: egress — the downlink bridge is running
+      ansible.builtin.command: systemctl is-active octo-downlink-bridge.service
+      register: _downlink_active
+      changed_when: false
+      failed_when: _downlink_active.stdout != 'active'
+      when:
+        - (downlink_users | default([], true)) | length > 0
+        - fabric_slot_anchor | default('') | length > 0
+      tags: [egress]

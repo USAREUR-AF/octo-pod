@@ -1,0 +1,21 @@
+# MANAGED BY ANSIBLE — the pod's ingest LAN leg.
+#
+# netplan rather than nmcli on purpose. nmcli lives in the community.general collection,
+# which is not in ansible-core and pulls the 287 MB `ansible` package; worse, a stock
+# Ubuntu Server has no NetworkManager at all, so an nmcli task cannot run there. netplan
+# ships on every Ubuntu and drives whichever renderer the box already uses.
+#
+# never-default is the load-bearing line: this NIC carries a partner's sensor traffic and
+# must never become the box's default route, or the mesh uplink is lost.
+network:
+  version: 2
+  renderer: {{ network_renderer | default('networkd') }}
+  ethernets:
+    {{ lan_iface }}:
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - "{{ lan_ip }}/{{ lan_prefix | default(16) }}"
+      # no gateway4/routes on purpose — publishers are on-link, and a default route here
+      # would steal the uplink.
+      link-local: []

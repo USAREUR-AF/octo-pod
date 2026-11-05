@@ -1,0 +1,9 @@
+# MANAGED BY octo-pod — this pod's identity. Yours; an upgrade never touches it.
+#
+# connection=local because a pod converges ITSELF. Nothing reaches in over SSH, which
+# is why a pod at a site nobody can drive to is still maintainable.
+[octopod]
+{{ pod_name }} ansible_connection=local
+
+[octopod:vars]
+ansible_python_interpreter=/usr/bin/python3

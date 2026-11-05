@@ -1,0 +1,33 @@
+# Portable registration test receiver. See README.md for validation limits.
+[package]
+name = "sapient-receiver"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SAPIENT BSI Flex 335 v2.0 fusion-node receiver: frame, validate (dstl rules), ack; lenient or strict"
+
+[[bin]]
+name = "sapient-receiver"
+path = "src/main.rs"
+
+[dependencies]
+sapient-proto = { workspace = true, features = ["descriptor"] }
+prost-reflect = { version = "0.16", features = ["serde"] }
+serde_json = "1"
+prost = { workspace = true }
+prost-types = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+sha2 = "0.11"

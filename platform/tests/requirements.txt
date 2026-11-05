@@ -1,0 +1,5 @@
+# Offline template tests. No ansible, no pod, no network — these two are the whole
+# dependency set, deliberately, so CI and an editor resolve the same thing.
+#   pip install -r tests/requirements.txt
+jinja2>=3.1
+PyYAML>=6.0

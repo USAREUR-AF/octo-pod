@@ -1,0 +1,62 @@
+# Full builds and final-image loader checks before merge. No registry credentials or pushes.
+name: PR images
+on:
+  pull_request:
+    paths: ['arms/**', 'tools/pr-image-matrix.py', 'tools/check-pr-image.sh', '.github/workflows/pr-images.yml']
+permissions:
+  contents: read
+concurrency:
+  group: pr-images-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      images: ${{ steps.select.outputs.images }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: select changed images
+        id: select
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: echo "images=$(python3 tools/pr-image-matrix.py "$BASE" "$HEAD")" >> "$GITHUB_OUTPUT"
+  build:
+    needs: changes
+    if: needs.changes.outputs.images != '[]'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        arm: ${{ fromJSON(needs.changes.outputs.images) }}
+        arch: [amd64, arm64]
+        include:
+          - {arch: amd64, runner: ubuntu-24.04}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: build the complete image on its native runner
+        uses: docker/build-push-action@v7
+        with:
+          context: arms
+          file: arms/${{ matrix.arm }}/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          tags: local/octo-${{ matrix.arm }}:pr
+          load: true
+          push: false
+          provenance: false
+          cache-from: type=gha,scope=pr-image-${{ matrix.arm }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=pr-image-${{ matrix.arm }}-${{ matrix.arch }}
+      - name: verify final-image architecture, nonroot user and every installed binary
+        env:
+          ARM: ${{ matrix.arm }}
+          ARCH: ${{ matrix.arch }}
+        run: bash tools/check-pr-image.sh "local/octo-${ARM}:pr" "$ARCH" "arms/${ARM}/Dockerfile"

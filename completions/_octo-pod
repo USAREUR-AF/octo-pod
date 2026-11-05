@@ -1,0 +1,11 @@
+#compdef octo-pod otp
+# Use the same candidate generator as Bash; pass words as argv, never shell code.
+local -a candidates
+candidates=("${(@f)$(bash -c '
+  COMP_CWORD=$1; shift
+  COMP_WORDS=("$@")
+  source /usr/share/bash-completion/completions/octo-pod
+  _octo_pod
+  printf "%s\n" "${COMPREPLY[@]}"
+' -- "$((CURRENT - 1))" "${words[@]}")}")
+compadd -- "${candidates[@]}"

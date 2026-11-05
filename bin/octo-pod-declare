@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""
+octo-pod add-arm / add-peer / set-lan / release — edit the declaration, never by hand.
+
+    octo-pod add-arm  radar1 --udp 48021 --from 10.1.2.3 --feed cat62-v1
+    octo-pod add-arm  radar-one  --dial 192.0.2.104:9000 --framing len32be
+    octo-pod add-peer acme
+    octo-pod set-lan  --iface eth1 --addr 10.1.2.10/24
+    octo-pod release  radar1 --slot ~/slot --ca-fingerprint SHA256:<hex>
+
+DESIGN: this edits the DECLARATION and nothing else. It does not touch the pen, mint a
+certificate or start a container — `octo-pod check` then `apply` still do that, and the
+operator still reads the diff. The CLI exists to make a correct declaration easy to
+write, not to make applying it invisible.
+
+Validation is deliberately here AND in the playbook. Here it is a fast, friendly error
+before anything is written; there it is the gate that cannot be bypassed.
+"""
+import argparse
+import ipaddress
+import datetime
+import os
+import pathlib
+import re
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import octo_pod_slot as slotlib  # noqa: E402  (the slot bundle, authenticated)
+
+# Honour OCTO_POD_ETC like the octo-pod wrapper does. Without it this tool could only
+# be exercised as root against the real identity, which is why its behaviour was never
+# tested.
+ETC = pathlib.Path(os.environ.get("OCTO_POD_ETC", "/etc/octo-pod"))
+FEED_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def die(msg):
+    sys.exit(f"error: {msg}")
+
+
+def pod_dir():
+    hv = ETC / "host_vars"
+    pods = [p for p in hv.iterdir() if p.is_dir()] if hv.is_dir() else []
+    if not pods:
+        die(f"no pod identity under {hv} — run 'octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>' first")
+    if len(pods) > 1:
+        die(f"more than one pod under {hv}: {[p.name for p in pods]}")
+    return pods[0]
+
+
+def load(path):
+    try:
+        import yaml
+    except ImportError:
+        die("pyyaml missing — apt install python3-yaml")
+    return yaml.safe_load(path.read_text()) or {}
+
+
+def existing_ids(d, egress=False):
+    """Ids declared as peers and arms; with egress, egress destinations too.
+
+    A new id must be unique across all three files: egress add already refuses an arm's
+    id, and the playbook's uniqueness assert fails the next check on a clash. `release`
+    asks without egress, because only an arm or a peer has a to_fabric gate to open."""
+    out = []
+    files = (("20-peers.yml", "peers"), ("30-arms.yml", "arms"))
+    for f, k in files + ((("40-egress.yml", "egress"),) if egress else ()):
+        p = d / f
+        if p.exists():
+            out += [x.get("id") for x in (load(p).get(k) or [])]
+    return [x for x in out if x]
+
+
+def existing_ports(d):
+    p = d / "30-arms.yml"
+    return [a.get("port") for a in (load(p).get("arms") or [])] if p.exists() else []
+
+
+def main():
+    # ROOT, CHECKED BEFORE ARGUMENTS ARE PARSED. /etc/octo-pod is root-owned, so every
+    # verb here ends in a write that a normal user cannot make. Without this the failure
+    # was an unhandled PermissionError: eleven lines of Python traceback ending in
+    # "Permission denied: .../30-arms.yml", printed at an operator who had simply
+    # forgotten sudo. A traceback is not an error message. It names a file rather than a
+    # cause, it looks like the tool is broken rather than the invocation, and it buries
+    # the one word that fixes it.
+    #
+    # Deliberately before argparse, so `octo-pod add-arm` with no arguments at all still
+    # says the useful thing rather than complaining about a missing id it would not have
+    # been allowed to write anyway.
+    if os.geteuid() != 0:
+        sys.stderr.write(
+            "\nERROR: run with sudo. Declarations live in /etc/octo-pod, which is "
+            "root-owned.\n"
+            f"  sudo octo-pod {' '.join(sys.argv[1:]) or '<verb> ...'}\n\n")
+        return 2
+
+    ap = argparse.ArgumentParser(prog="octo-pod add-arm|add-peer", add_help=True)
+    ap.add_argument("verb", choices=["add-arm", "add-peer", "set-lan", "set-mesh", "set-firewall",
+                                    "release"])
+    ap.add_argument("id", nargs="?")
+    ap.add_argument("--udp", type=int, help="UDP port this publisher sends to")
+    ap.add_argument("--tcp", type=int, help="TCP port this publisher connects to")
+    # The inverse direction, and the one people get wrong. A sensor that serves its own
+    # stream (radar-one class) never dials us; pointing a listening arm at one gives two
+    # servers and no connection, which looks exactly like a dead feed. Declaring it was
+    # a hand-edit of 30-arms.yml until this flag existed — and hand-edits are the thing
+    # these commands exist to remove.
+    ap.add_argument("--dial", metavar="HOST:PORT",
+                    help="dial OUT to a sensor that serves its own stream (radar-one shape)")
+    ap.add_argument("--from", dest="src",
+                    help="add-arm: their static source IP, the ONLY access control an arm has. "
+                         "add-peer: the IPv4 addresses that may dial the pen over the LAN "
+                         "(without it a peer is mesh-only)")
+    ap.add_argument("--bind", help="address this arm listens on. Defaults to the address publishers "
+                                   "reach the pod on, which is the mesh when the pod is on one — so a "
+                                   "sensor on the LAN needs this set to the pod's LAN address")
+    ap.add_argument("--feed", default="feed1", help="feed label, [A-Za-z0-9_-]")
+    # TCP only. Start with stream — nothing is lost, only unit boundaries — then capture a
+    # few samples and set this to what you see. Without the flag a non-default framing was
+    # a hand-edit, which is the one thing these commands exist to avoid.
+    ap.add_argument("--framing", choices=["stream", "newline", "len32be", "len32le"],
+                    help="TCP framing (default stream). Ignored for --udp")
+    ap.add_argument("--description", default="")
+    ap.add_argument("--iface", help="set-lan: interface your sensors reach you on")
+    ap.add_argument("--addr", help="set-lan: this box's address on it, e.g. 10.1.2.10/24")
+    ap.add_argument("--ssh-from", help="set-lan: address or CIDR list that may SSH to the pod from "
+                                       "the LAN, e.g. a jump host; the pod firewall closes SSH to "
+                                       "everything else except the mesh")
+    ap.add_argument("--slot", help="release: the bundle directory the operator sent (PEMs, signed "
+                                   "profile, NOTES.md)")
+    ap.add_argument("--ca-fingerprint",
+                    help="release: the fingerprint of the key that signs the bundle, as the goatnet's "
+                         "operators gave it to you and `goat ca add` prints it (SHA256:<hex>)")
+    ap.add_argument("--mgmt", help="set-mesh: the mesh management server, e.g. https://netbird.example.net")
+    ap.add_argument("--repo", help="set-mesh: where octo-pod upgrade fetches releases from")
+    ap.add_argument("--portal", help="set-mesh: where publish-to-portal registers schemas")
+    ap.add_argument("--mirror", help="set-mesh: registry this pod pulls images from, e.g. localhost:5000")
+    args = ap.parse_args()
+
+    d = pod_dir()
+
+    # set-firewall: the deny-by-default pod firewall, on or off, as a declaration. A one-off
+    # `apply -e pod_firewall_enabled=true` lasts one run: the next plain apply takes the
+    # table down again, because off means off.
+    if args.verb == "set-firewall":
+        state = (args.id or "").lower()
+        if state not in ("on", "off"):
+            die("usage: octo-pod set-firewall on|off")
+        pod_file = d / "10-pod.yml"
+        text = pod_file.read_text() if pod_file.exists() else ""
+        val = "true" if state == "on" else "false"
+        if re.search(r"^pod_firewall_enabled:", text, re.M):
+            text = re.sub(r"^pod_firewall_enabled:.*$", f"pod_firewall_enabled: {val}", text,
+                          count=1, flags=re.M)
+        else:
+            text = text.rstrip("\n") + f"\npod_firewall_enabled: {val}\n"
+        pod_file.write_text(text)
+        print(f"set {pod_file}:\n  pod_firewall_enabled: {val}")
+        if state == "on":
+            ssh = load(d / "00-site.yml").get("mgmt_ssh_sources") or []
+            if ssh:
+                print(f"  SSH stays open to the mesh and to {', '.join(ssh)}")
+            else:
+                print("  SSH stays open to the mesh ONLY. If you manage this pod over the LAN, "
+                      "declare that path first:\n    octo-pod set-lan --iface <if> --addr <ip>/<prefix> "
+                      "--ssh-from <jump host>/32")
+            print("  apply keeps the new ruleset only if the mesh and the fabric router still accept\n"
+                  "  new connections, and puts the previous one back otherwise")
+        print("\nNothing on the pod has changed yet. Next:\n  octo-pod check\n  octo-pod apply")
+        return 0
+
+    # set-lan: the one value an operator must supply that cannot come from a token — the
+    # site's own network. A verb rather than "edit this YAML" because it is the only
+    # hand-edit left in the install path, and hand-edits are where typos live.
+    if args.verb == "set-lan":
+        if not (args.iface and args.addr):
+            die("usage: octo-pod set-lan --iface eth1 --addr 10.1.2.10/24")
+        if "/" not in args.addr:
+            die(f"--addr {args.addr!r} needs a prefix, e.g. 10.1.2.10/24")
+        ip, prefix = args.addr.split("/", 1)
+        try:
+            # IPv4Address, not ip_address: the prefix bound and the message are IPv4, and
+            # an IPv6 address here was written to 00-site.yml as if it were one.
+            ipaddress.IPv4Address(ip)
+            if not 0 < int(prefix) <= 32:
+                raise ValueError
+        except ValueError:
+            die(f"--addr {args.addr!r} is not a valid IPv4 address with prefix")
+
+        ssh_from = []
+        for cidr in (args.ssh_from or "").split(","):
+            cidr = cidr.strip()
+            if not cidr:
+                continue
+            try:
+                net = ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                die(f"--ssh-from {cidr!r} is not an address or CIDR")
+            if net.version != 4 or net.prefixlen < 8:
+                die(f"--ssh-from {cidr!r} must be IPv4 and no wider than /8: SSH is the "
+                    "management door, and a wide range opens it to a whole network")
+            ssh_from.append(str(net))
+
+        site = d / "00-site.yml"
+        text = site.read_text() if site.exists() else ""
+        pairs = [("lan_iface", f'"{args.iface}"'), ("lan_ip", f'"{ip}"'), ("lan_prefix", prefix)]
+        if args.ssh_from is not None:
+            pairs.append(("mgmt_ssh_sources", "[" + ", ".join(f'"{c}"' for c in ssh_from) + "]"))
+        for key, val in pairs:
+            if re.search(rf"^{key}:", text, re.M):
+                text = re.sub(rf"^{key}:.*$", f"{key}: {val}", text, count=1, flags=re.M)
+            else:
+                text += f"\n{key}: {val}\n"
+        site.write_text(text)
+        print(f"set {site}:\n  lan_iface: {args.iface}\n  lan_ip: {ip}\n  lan_prefix: {prefix}")
+        if args.ssh_from is not None:
+            print(f"  mgmt_ssh_sources: {ssh_from or '(none: SSH only from the mesh)'}")
+        print("\nNothing on the pod has changed yet. Next:\n  octo-pod check\n  octo-pod apply")
+        return 0
+
+    # set-mesh: the fabric this pod joins, by command.
+    #
+    # `init` used to end by telling the operator to edit 05-fabric.yml when they wanted to
+    # join a mesh later — which is the one thing this tool exists to stop. Every other
+    # declaration has a verb precisely because hand-edits are where typos live, and a typo
+    # in a management URL presents as `netbird up` hanging with no error.
+    #
+    # It does NOT enrol. Writing down which mesh this pod belongs to and actually joining
+    # it need different things — the second needs a setup key, which is a credential and
+    # arrives separately — so they stay separate commands. This prints the one that follows.
+    if args.verb == "set-mesh":
+        if not (args.mgmt or args.repo or args.portal or args.mirror):
+            die("usage: octo-pod set-mesh --mgmt https://<netbird-host>\n"
+                "       optionally --repo <release surface>  --portal <portal url>\n"
+                "                  --mirror <registry>  (e.g. localhost:5000)")
+        if args.mgmt and not args.mgmt.startswith(("http://", "https://")):
+            die(f"--mgmt {args.mgmt!r} must be a URL, e.g. https://netbird.example.net.\n"
+                "  It must also be the address that resolves from OUTSIDE the mesh: a name\n"
+                "  that only resolves once you are already on it cannot be used to join.")
+        for u in (args.repo, args.portal):
+            if u and not u.startswith(("http://", "https://")):
+                die(f"{u!r} must be a URL")
+
+        fab = d / "05-fabric.yml"
+        text = fab.read_text() if fab.exists() else ""
+        wrote = []
+        # image_mirror is a registry HOST:PORT, not a URL: it is prefixed onto an image
+        # reference, and "https://" in front of one produces a name the registry client cannot resolve.
+        if args.mirror and args.mirror.startswith(("http://", "https://")):
+            die(f"--mirror {args.mirror!r} is a registry host:port, not a URL.\n"
+                "  It is prefixed onto image references, so drop the scheme: localhost:5000")
+
+        for key, val in (("netbird_mgmt_host", args.mgmt),
+                         ("octo_repo_url", args.repo),
+                         ("fabric_portal_url", args.portal),
+                         ("image_mirror", args.mirror)):
+            if not val:
+                continue
+            if re.search(rf"^{key}:", text, re.M):
+                text = re.sub(rf"^{key}:.*$", f'{key}: "{val}"', text, count=1, flags=re.M)
+            else:
+                text += f'\n{key}: "{val}"\n'
+            wrote.append(f"  {key}: {val}")
+        fab.write_text(text)
+        print(f"set {fab}:\n" + "\n".join(wrote))
+        if args.mgmt:
+            print("\nThat records WHICH mesh. It does not join one — that needs a setup key:")
+            print(f"  sudo octo-pod join --setup-key <KEY> --mgmt {args.mgmt} --pod {d.name}")
+        else:
+            print("\nNothing on the pod has changed yet. Next:\n  octo-pod check\n  octo-pod apply")
+        return 0
+
+    # release: open BOTH upstream gates for one publisher, and locate the slot material.
+    #
+    # The two gates exist so that no single edit can start exporting data. Naming one
+    # publisher keeps that property — you still cannot release everything at once — while
+    # removing the hand-edit, which is where the mistakes were. It prints the extra-vars
+    # rather than applying, because apply is still a deliberate act you read first.
+    if args.verb == "release":
+        if not args.id:
+            die("usage: octo-pod release <publisher-id> --slot <dir>")
+        if not args.slot:
+            die("--slot <dir> is required: the bundle directory the operator sent")
+        slot = pathlib.Path(args.slot).expanduser()
+
+        # The operator's bundle names the cert for the anchor, so the anchor is derivable
+        # rather than another string to copy by hand and get wrong. The bundle carries two
+        # files with 'ca' in the name: the fabric's CA root, which signed the router's
+        # certificate, and the public key that signs the bundle. Only the first belongs in
+        # the uplink, and the shared module refuses to guess between them.
+        # The bundle is authenticated before any gate opens, so a bad one changes nothing.
+        pod_now = load(d / "10-pod.yml") if (d / "10-pod.yml").exists() else {}
+        try:
+            material = slotlib.slot_material(slot)
+            trusted = slotlib.trust(material, expected=args.ca_fingerprint,
+                                    pinned_ca=str(pod_now.get(slotlib.PIN_CA, "") or ""),
+                                    pinned_roots=str(pod_now.get(slotlib.PIN_ROOTS, "") or ""),
+                                    ask=slotlib.terminal_ask())
+        except slotlib.SlotError as exc:
+            die(str(exc))
+        anchor = material.anchor
+        certs, keys, cas = [material.cert], [material.key], [material.ca]
+
+        ids = existing_ids(d)
+        if args.id not in ids:
+            die(f"{args.id} is not declared on this pod. Known: {', '.join(sorted(ids)) or 'none'}")
+
+        # gate 1 — the publisher's own consent, in its entry
+        opened = False
+        for fn in ("30-arms.yml", "20-peers.yml"):
+            f = d / fn
+            if not f.exists():
+                continue
+            text = f.read_text()
+            m = re.search(rf"^(\s*)- id: {re.escape(args.id)}\s*$", text, re.M)
+            if not m:
+                continue
+            block_start = m.end()
+            nxt = re.search(r"^\s*- id: ", text[block_start:], re.M)
+            block_end = block_start + (nxt.start() if nxt else len(text) - block_start)
+            block = text[block_start:block_end]
+            if re.search(r"to_fabric:\s*true", block):
+                print(f"already open: release.to_fabric in {fn}")
+            else:
+                # Replace the line AND its trailing comment: the comment says "shut until
+                # you have seen their data", which becomes a lie the moment it is opened.
+                new_block, n = re.subn(r"to_fabric:\s*false.*(?:\n\s*#.*)*",
+                                       "to_fabric: true", block, count=1)
+                if not n:
+                    new_block = block
+                if new_block == block:
+                    die(f"{args.id} in {fn} has no 'release: to_fabric:' line to open")
+                text = text[:block_start] + new_block + text[block_end:]
+                f.write_text(text)
+                print(f"opened release.to_fabric for {args.id} in {fn}")
+            opened = True
+            break
+        if not opened:
+            die(f"could not find {args.id} in 30-arms.yml or 20-peers.yml")
+
+        # gate 2 — the pod's namespace allowlist
+        pod_file = d / "10-pod.yml"
+        text = pod_file.read_text()
+        ns = f"raw/{args.id}/**"
+        m = re.search(r'^bridge_allow:\s*"([^"]*)"', text, re.M)
+        if not m:
+            die(f"no bridge_allow line in {pod_file}")
+        current = [x for x in m.group(1).split(",") if x]
+        if ns in current:
+            print(f"already allowed: {ns} in bridge_allow")
+        else:
+            current.append(ns)
+            text = text[: m.start()] + f'bridge_allow: "{",".join(current)}"' + text[m.end():]
+            pod_file.write_text(text)
+            print(f"added {ns} to bridge_allow in 10-pod.yml")
+
+        # gate 3 — the slot ANCHOR, persisted. It is what makes the bridge run at all:
+        # `octo-pod status` reads it from this file, and the bridge's apply step is gated on
+        # `fabric_slot_anchor | length > 0`. An anchor supplied only as a runtime -e therefore
+        # leaves status reporting "no slot" and a plain re-apply (or a reboot) brings the pod
+        # up with the bridge silently skipped. Written from the cert filename — the same
+        # source the printed -e used.
+        text = pod_file.read_text()
+        am = re.search(r'^fabric_slot_anchor:\s*"[^"]*"', text, re.M)
+        if not am:
+            die(f"no fabric_slot_anchor line in {pod_file}")
+        if f'fabric_slot_anchor: "{anchor}"' in text:
+            print("already set: fabric_slot_anchor in 10-pod.yml")
+        else:
+            text = text[: am.start()] + f'fabric_slot_anchor: "{anchor}"' + text[am.end():]
+            pod_file.write_text(text)
+            print(f"set fabric_slot_anchor to {anchor} in 10-pod.yml")
+
+        # gate 4: what authenticated the bundle, pinned. A later release checks the signing
+        # key against it, and every apply refuses CA roots with another digest.
+        for line in slotlib.record(pod_file, trusted):
+            print(line)
+        for warning in trusted.warnings:
+            print(f"WARNING: {warning}")
+
+        # The staging copies are a private key sitting in a home directory. Say so, and
+        # say what to do about it, at the moment the operator is looking at the path.
+        insecure = [f for f in (keys[0],) if (f.stat().st_mode & 0o077)]
+        warn = ""
+        if insecure:
+            warn = (f"\n  WARNING: {keys[0]} is readable by other local accounts"
+                    f"\n           chmod 600 {keys[0]}\n")
+
+        print(f"""
+Both gates are open for {args.id}. Nothing has been applied.{warn}
+
+  octo-pod check
+  sudo octo-pod apply \\
+    -e fabric_slot_cert_src={certs[0]} \\
+    -e fabric_slot_key_src={keys[0]} \\
+    -e fabric_ca_root_src={cas[0]}
+
+The slot anchor is now written into 10-pod.yml, so it needs no -e. The three cert/key
+srcs stay: they copy the operator's bundle into /etc/octo-uplink on this run, and the
+tasks that place them skip on later applies once the files are there.
+
+apply installs the key at 0640 root-owned under /etc/octo-uplink. The copies in
+{slot} are staging only: delete them afterwards, they are a private key.
+
+The operator must also have granted this anchor write access upstream. Without that the
+bridge reports success while everything it sends is discarded at the far end, so ask them
+to confirm arrival.""")
+        return 0
+
+    if not re.match(r"^[a-z0-9][a-z0-9-]*$", args.id or ""):
+        die(f"id {args.id!r} must be lowercase alphanumeric/dashes — it becomes a namespace and a CN")
+    if args.id in existing_ids(d, egress=True):
+        die(f"{args.id} is already declared in {d}")
+
+    if args.verb == "add-arm":
+        # `is not None`, not truthiness: --udp 0 is a value given, and it must reach the
+        # range check below rather than read as no flag at all.
+        given = [f for v, f in ((args.udp, "--udp"), (args.tcp, "--tcp"), (args.dial, "--dial"))
+                 if v is not None]
+        if len(given) != 1:
+            die("give exactly one of --udp, --tcp or --dial"
+                + (f" (got {', '.join(given)})" if given else ""))
+
+        if args.dial:
+            # We dial out, so this arm owns no port on this box — the port belongs to
+            # the sensor. `target`, not `port`, is what the arm is given.
+            host, _, dport = args.dial.rpartition(":")
+            if not host or not dport.isdigit() or not 0 < int(dport) < 65536:
+                die(f"--dial {args.dial!r} must be HOST:PORT, e.g. 192.0.2.104:9000")
+            transport, kind, locus = "tcp", "tcp-connect", f'target: "{args.dial}"'
+            # The target already names who we talk to, so --from is redundant when it is
+            # an address. Derive it rather than make the operator repeat it — and say so.
+            if not args.src:
+                try:
+                    ipaddress.ip_address(host)
+                except ValueError:
+                    die("--from is required when --dial names a hostname: allow_sources is "
+                        f"matched against the address {host!r} actually answers on")
+                args.src = host
+                print(f"note: allow_sources taken from --dial ({host})")
+        else:
+            transport = "udp" if args.udp is not None else "tcp"
+            port = args.udp if transport == "udp" else args.tcp
+            kind, locus = f"{transport}-ingest", f"port: {port}"
+            # The playbook checks listener ports for clashes, not range, so an out-of-range
+            # port surfaced only as an arm that cannot bind. --dial has the same bound.
+            if not 0 < port < 65536:
+                die(f"--{transport} {port} must be a port number, 1-65535")
+            if port in existing_ports(d):
+                die(f"port {port} is already used by another arm on this pod")
+            if port in (7447, 22):
+                die(f"port {port} is reserved (pen listener / ssh)")
+
+        # WHICH LEG THIS ARM LISTENS ON. The default is the address publishers reach the
+        # pod on, and that prefers the MESH when the pod has one. Right for a peer dialling
+        # in; wrong for a radar on the ingest LAN, where the arm then binds an address the
+        # sensor cannot route to, hears nothing, and reports received=0 with no error
+        # anywhere. Measured on a live pod: 95 datagrams sent, received=0, dropped_source=0.
+        if args.bind:
+            try:
+                ipaddress.ip_address(args.bind)
+            except ValueError:
+                die(f"--bind {args.bind!r} is not an IP address. It is the address on THIS "
+                    "pod that the sensor sends to, usually the pod's address on the ingest LAN.")
+
+        if not FEED_RE.match(args.feed):
+            die(f"--feed {args.feed!r} must match [A-Za-z0-9_-] — the arm rejects slashes and crash-loops")
+        if not args.src:
+            die("--from is required: an arm's publisher presents no credential, so its source "
+                "IP is both the access control and the provenance stamped into every key")
+        for ip in args.src.split(","):
+            try:
+                ipaddress.ip_address(ip.strip())
+            except ValueError:
+                die(f"--from {ip.strip()!r} is not an IP address")
+
+        today = datetime.date.today().isoformat()
+        if args.framing and transport != "tcp":
+            die("--framing applies to --tcp or --dial only; a UDP datagram is already one unit")
+        framing_line = f"\n    framing: {args.framing}" if args.framing else ""
+        how = "dials out to" if args.dial else f"{transport} publisher"
+        # Omitted entirely when not given, so the arm keeps defaulting to the address
+        # publishers reach the pod on. An empty bind_host would bind nothing.
+        bind_line = f'\n    bind_host: "{args.bind}"' if args.bind else ""
+        entry = f"""
+  - id: {args.id}
+    kind: {kind}
+    description: "{args.description or f'{args.id} — {how}'}"
+    cert_cn: octo-arm-{args.id}
+    namespace: "raw/{args.id}/**"
+    enabled: true
+    feed: {args.feed}
+    transport: {transport}
+    {locus}{framing_line}
+    allow_sources: "{args.src}"{bind_line}
+    trust_tier: T1
+    onboarded: "{today}"
+    release:
+      to_fabric: false   # shut until you have seen their data. Opening it also needs
+                       # raw/{args.id}/** added to bridge_allow in 10-pod.yml.
+"""
+        target, key = d / "30-arms.yml", "arms"
+    else:
+        today = datetime.date.today().isoformat()
+        # `transport` belongs to the add-arm branch above; this used to reference it and
+        # died with an UnboundLocalError traceback instead of saying what was wrong.
+        if args.framing:
+            die("--framing applies to an arm, not a peer — a peer speaks zenoh already, "
+                "so it frames its own messages")
+        if args.dial or args.udp or args.tcp:
+            die("--udp/--tcp/--dial apply to add-arm — a peer connects to us on its own")
+        # --from opens the pen to this peer over the LAN, from exactly these addresses.
+        # Without it the peer reaches the pen over the mesh only, as before. Literal IPv4,
+        # because the firewall and the playbook's declaration gate hold the same rule.
+        sources = ""
+        if args.src:
+            ips = []
+            for ip in (x.strip() for x in args.src.split(",") if x.strip()):
+                try:
+                    addr = ipaddress.IPv4Address(ip)
+                except ValueError:
+                    die(f"--from {ip!r} is not a literal IPv4 address")
+                if addr.is_unspecified:
+                    die("--from 0.0.0.0 would open the pen to anyone on the LAN")
+                ips.append(str(addr))
+            sources = f'\n    allow_sources: "{", ".join(ips)}"   # dials the pen over the LAN from these only'
+        entry = f"""
+  - id: {args.id}
+    kind: zenoh-native
+    description: "{args.description or f'{args.id} — zenoh peer'}"
+    cert_cn: octo-peer-{args.id}
+    namespace: "raw/{args.id}/**"{sources}
+    enabled: true
+    connects: client   # never peer/router — a peering router becomes a transitive trust bridge
+    trust_tier: T2
+    onboarded: "{today}"
+    release:
+      to_fabric: false
+"""
+        target, key = d / "20-peers.yml", "peers"
+
+    # These files hold ONE list and nothing else (derived vars live in group_vars), so a
+    # plain append is correct. The earlier version inserted at a computed line offset to
+    # dodge a trailing expression that no longer exists — line-offset surgery on YAML is
+    # exactly the fragility this simplification removes.
+    text = target.read_text() if target.exists() else f"{key}: []\n"
+    text = re.sub(rf"^{key}:\s*\[\]\s*$", f"{key}:", text, count=1, flags=re.M)
+    if not re.search(rf"^{key}:", text, re.M):
+        text = f"{key}:\n{text}"
+    target.write_text(text.rstrip("\n") + "\n" + entry.lstrip("\n"))
+
+    # Re-read it: if we produced YAML that does not parse, or lost an entry, say so now
+    # rather than at 3am on the pen.
+    try:
+        import yaml
+        back = yaml.safe_load(target.read_text()) or {}
+    except Exception as e:
+        die(f"wrote invalid YAML to {target}: {e}")
+    ids = [x.get("id") for x in (back.get(key) or [])]
+    if args.id not in ids:
+        die(f"{target} does not contain {args.id} after the write — file left as is, inspect it")
+
+    print(f"declared {args.id} in {target}")
+    print("\nNothing on the pod has changed yet. Next:")
+    print("  octo-pod check     # read the diff")
+    print("  octo-pod apply")
+    if args.verb == "add-peer":
+        print(f"\nAfter apply, package their bundle for hand-off:\n  sudo octo-pod peer bundle {args.id}")
+        print(f"To let them subscribe to released fabric keys:\n  sudo octo-pod peer allow-read {args.id} --key <anchor>/<key>")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

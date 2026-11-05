@@ -1,0 +1,28 @@
+target/
+.env
+*.pem
+*.key
+
+# Outbound partner bundles — contain private key material. Never commit.
+*.tar.gz
+*.tar.gz.gpg
+*.pem
+*.key
+
+# Mac / python noise
+.DS_Store
+__pycache__/
+*.pyc
+
+# Build output. Never committed: it holds the .deb, and join tokens carry a live NetBird
+# setup key and slot material. An artifact directory inside the source tree is one
+# `git add .` away from publishing a credential.
+dist/
+
+# draw.io writes a lock file beside an open diagram; it is editor state, not the diagram.
+.$*.dtmp
+
+# ...and a backup copy of the previous revision on every save, same idea. Committing one
+# means the repo carries two diagrams that disagree, and the stale one is the one nobody
+# notices is stale.
+.$*.bkp

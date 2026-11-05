@@ -1,0 +1,106 @@
+# /etc/containers/systemd/octo-egress-{{ d.id }}.container  MANAGED BY ANSIBLE
+{#
+   One unit per destination declared in 40-egress.yml: the mirror of an arm. Caller
+   supplies `d`, the destination's entry. The unit runs whether or not the destination is
+   released. Unreleased, its certificate matches no subject in the pen ACL, so its
+   subscription is refused and it sends nothing; releasing it is an ACL change, not a
+   restart of this unit.
+
+   A SESSION destination (egress_session_schemes, today sapient://) is the exception: its
+   arm registers and heartbeats with the far side whether or not data flows, so running it
+   unreleased would announce this pod before its data was released. Unreleased, its unit
+   has no install section, so nothing starts it at boot, and apply stops it.
+#}
+{% set _session = d.dest.split('://')[0] in egress_session_schemes %}
+{% set _released = (d.release | default({})).from_fabric | default(false) %}
+
+[Unit]
+Description=octo-pod egress {{ d.id }} ({{ d.description | default('egress destination') }})
+After=octo-pen-zenoh-router.service network-online.target
+Wants=octo-pen-zenoh-router.service network-online.target
+
+[Container]
+{% if d.dest is match('^sapient://') %}
+{#- A SAPIENT session: the session arm, as one of the pod's egress destinations. It reads
+    only its released downlink keys, writes nothing to the pen, dials the one allowed
+    address as the sensor side and records every send in its audit directory. #}
+{%  set _sap = d.sapient | default({}, true) %}
+Image={{ sapient_image }}
+ContainerName=octo-egress-{{ d.id }}
+Exec=/usr/local/bin/sapient
+{% else %}
+Image={{ egress_image }}
+ContainerName=octo-egress-{{ d.id }}
+Exec=/usr/local/bin/egress-arm
+{% endif %}
+# Host networking: the arm dials the pen on this host, and either sends to the one
+# address it was declared with or, for tcp-server://, listens on the pod's own address
+# for the consumers allowed to dial it.
+Network=host
+# The binary closes its pen session and its audit record on SIGINT; podman's default
+# SIGTERM would end it without either.
+PodmanArgs=--stop-signal=SIGINT
+{% if d.dest is match('^sapient://') %}
+Environment=SAPIENT_ARM_ID={{ d.id }}
+Environment=SAPIENT_FEED={{ d.id }}
+Environment=SAPIENT_ROLE=asm
+Environment=SAPIENT_TARGET={{ d.dest | regex_replace('^sapient://', '') }}
+Environment=SAPIENT_EGRESS_KEYS={{ d['keys'] | join(',') }}
+# The destination must also appear here, exactly: the arm refuses to start otherwise.
+Environment=SAPIENT_ALLOW_DEST={{ d.allow_dest }}
+Environment=SAPIENT_NODE_TYPE={{ (_sap.node_type | default('OTHER', true)) | upper }}
+Environment=SAPIENT_STATUS_INTERVAL_S={{ _sap.status_interval_s | default(5) }}
+{%  if _sap.capabilities | default('', true) %}
+Environment=SAPIENT_CAPABILITIES={{ _sap.capabilities }}
+{%  endif %}
+{%  if _sap.framing | default('', true) %}
+Environment=SAPIENT_FRAMING={{ _sap.framing }}
+{%  endif %}
+Environment=SAPIENT_ENDPOINT=tls/{{ mesh_ip }}:{{ pen_listen_port }}
+Environment=SAPIENT_CERT=/etc/octo/tls/egress-cert.pem
+Environment=SAPIENT_KEY=/etc/octo/tls/egress-key.pem
+Environment=SAPIENT_ROOT_CA=/etc/octo/tls/ca-root.pem
+Environment=SAPIENT_AUDIT_DIR=/var/lib/octo-egress
+# The node id it registers under lives beside its audit record, so a restart registers
+# as the same node and the controller does not see a new sensor every time.
+Environment=SAPIENT_STATE_DIR=/var/lib/octo-egress/state
+{% else %}
+Environment=EGRESS_ID={{ d.id }}
+Environment=EGRESS_KEYS={{ d['keys'] | join(',') }}
+Environment=EGRESS_DEST={{ d.dest }}
+# The destination must also appear here, exactly: the arm refuses to start otherwise.
+Environment=EGRESS_ALLOW_DEST={{ d.allow_dest }}
+{% if d.dest is match('^tcp-server://') %}
+# Who may dial this listener, and how many at once: the arm refuses to listen without peers.
+Environment=EGRESS_PEERS={{ d.allow_sources | replace(' ', '') }}
+Environment=EGRESS_MAX_CLIENTS={{ d.max_clients | default(1) }}
+Environment=EGRESS_REPLAY={{ d.replay | default(0) }}
+{% endif %}
+Environment=EGRESS_ENDPOINT=tls/{{ mesh_ip }}:{{ pen_listen_port }}
+Environment=EGRESS_CERT=/etc/octo/tls/egress-cert.pem
+Environment=EGRESS_KEY=/etc/octo/tls/egress-key.pem
+Environment=EGRESS_ROOT_CA=/etc/octo/tls/ca-root.pem
+Environment=EGRESS_AUDIT_DIR=/var/lib/octo-egress
+{% endif %}
+Environment=RUST_LOG={{ d.log_level | default('info') }}
+# One TLS directory and one audit directory per destination: one destination's key and
+# record are not readable by another destination's arm.
+Volume=/etc/octo-egress-{{ d.id }}/tls:/etc/octo/tls:ro
+Volume={{ egress_audit_dir }}/{{ d.id }}:/var/lib/octo-egress
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+# Exit 2 is a declaration the arm refused. A restart cannot fix it and would add another
+# refusal to the audit record every few seconds, so the unit stays failed until apply
+# renders a corrected declaration and restarts it.
+RestartPreventExitStatus=2
+RestartSec=5s
+
+{% if _released or not _session %}
+[Install]
+WantedBy=multi-user.target default.target
+{% else %}
+# No install section: an unreleased session destination does not start at boot. Releasing it
+# rewrites this unit, and apply then starts it.
+{% endif %}

@@ -1,0 +1,36 @@
+name: Bug report
+description: Something octo-pod does wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Report security issues privately (see SECURITY.md), not here. Leave out real
+        addresses, hostnames, keys and enrollment output; use documentation addresses.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The commands and declarations that show it.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `octo-pod version`.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output, redacted.
+      render: text

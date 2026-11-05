@@ -1,0 +1,146 @@
+{# Generated per entry in `peers` (20-peers.yml). Same data as the ACL and the firewall, so
+   the instructions can never describe a grant the router does not actually enforce, or an
+   endpoint the firewall does not actually open. #}
+{% set p = item %}
+{% set _write = p.namespace | regex_replace('/\*\*$', '') %}
+{% set _lan = (p.allow_sources | default('', true)) | length > 0 %}
+{% set _host = (lan_ip | default('', true)) if _lan else mesh_ip %}
+{% set _reads = (p.read_keys | default([]) | map('regex_replace', '^', 'downlink/') | list)
+               if (p.release | default({})).from_fabric | default(false) else [] %}
+# Connecting to the octo-pod pen — {{ p.id }}
+
+{{ p.description | default('Third-party Zenoh peer.') }}
+
+## 1. Your Files
+
+```
+tls/{{ p.cert_cn }}-cert.pem     your client certificate
+tls/{{ p.cert_cn }}-key.pem      your private key — keep it private
+tls/ca-roots.pem                 our CA, so you can verify us
+```
+
+Check they are intact:
+
+```bash
+openssl verify -CAfile tls/ca-roots.pem tls/{{ p.cert_cn }}-cert.pem
+```
+
+## 2. Open a Session in Client Mode
+
+Keep your existing session to your own router. **Add** a second one pointed at us: a session
+holds one TLS identity, so you cannot reuse the existing one or add our address to its
+endpoints.
+
+{% if _lan and not _host %}
+**Ask us for the endpoint.** You reach us over the site LAN, from
+{{ p.allow_sources }}, but this pod has no LAN address declared yet.
+{% endif %}
+```json5
+{
+  mode: "client",                                   // not "peer", not "router"
+
+  connect: {
+    endpoints: ["tls/{{ _host or '<ask us>' }}:{{ pen_listen_port }}"],
+    exit_on_failure: { client: false },             // REQUIRED, default is true
+    timeout_ms:      { client: -1 },                // REQUIRED, default is 0
+    retry: { period_init_ms: 1000, period_max_ms: 4000, period_increase_factor: 2 }
+  },
+
+  scouting: { multicast: { enabled: false } },      // REQUIRED, default is true
+
+  transport: { link: { tls: {
+    root_ca_certificate:    "ca-roots.pem",
+    connect_certificate:    "{{ p.cert_cn }}-cert.pem",
+    connect_private_key:    "{{ p.cert_cn }}-key.pem",
+    enable_mtls:            true,
+    verify_name_on_connect: false
+  } } }
+}
+```
+
+The three REQUIRED lines override Zenoh defaults that break this:
+
+- `exit_on_failure` and `timeout_ms`: a client that cannot reach us at startup exits instead
+  of retrying. Our pod gets restarted; without these your session dies and stays dead.
+- `scouting.multicast`: other Zenoh routers may share the network. With scouting on, you may
+  attach to the wrong one.
+
+`verify_name_on_connect: false` is needed because our certificate is issued for our mesh
+identity, not the address you dial.
+
+{% if _lan %}
+You reach us over the site LAN, and only from {{ p.allow_sources }}. A connection from any
+other address is dropped before TLS starts, which looks like a timeout on your side.
+{% else %}
+You reach us over the mesh. Ask us if you need to connect from the site LAN instead.
+{% endif %}
+
+## 3. Publish to `{{ _write }}/…` — Bare Keys
+
+```
+session.put("{{ _write }}/<anything you like>", payload)
+```
+
+Structure below that prefix is yours; we keep it verbatim.
+
+**Do not prefix your keys with an org, tenant or anchor id.** Our router is default-deny:
+keys outside `{{ p.namespace }}` are discarded silently, and your side still reports a
+successful publish.
+
+## 4. Subscribe
+
+{% if _reads %}
+You may read these keys, and only these:
+
+```
+{% for k in _reads %}
+{{ k }}
+{% endfor %}
+```
+
+```
+session.declare_subscriber("{{ _reads[0] }}", on_sample)
+```
+
+They are released to you one key at a time; a subscription anywhere else receives nothing,
+silently, the same way a denied publish looks successful. If you expect data on a key that
+is listed here and see none, tell us: the release may be open while the source is quiet.
+{% else %}
+You have no read access. Your certificate may publish to `{{ p.namespace }}` and nothing
+else. Ask us if you need to subscribe to something, and we will release it to you by key.
+{% endif %}
+
+## 5. Send Us
+
+1. **Your Zenoh version.** We are pinned to {{ zenoh_image }}. Different releases may not
+   interoperate; send this before anything else.
+2. **Reachability:** `nc -vz {{ _host or '<our address>' }} {{ pen_listen_port }}`
+3. **The key structure** you will publish under `{{ _write }}/`.
+4. **Your payload format**, and a schema if you have one. Without one it is opaque bytes.
+
+## 6. Wait for Our Confirmation
+
+**A connected session does not mean it worked.** A rejected key looks identical to a
+successful publish from your end: a denied put produces no log line on either side. We will
+confirm the key, size and rate we actually receive. Until then, assume nothing arrived.
+
+## If It Does Not Work
+
+| Symptom | Cause, in order of likelihood |
+|---|---|
+| Connects, we see nothing | key prefix, see section 3 |
+| Subscribed, you receive nothing | key not in the list in section 4, or the source is quiet |
+| Session will not establish | Zenoh version, or `enable_mtls` and cert paths |
+| TLS handshake fails | wrong CA file, or `verify_name_on_connect` not `false` |
+| Cannot connect at all | reachability: `nc -vz {{ _host or '<our address>' }} {{ pen_listen_port }}`{{ ', and your source address must be ' ~ p.allow_sources if _lan }} |
+
+Send us your client log. We see rejected keys and failed handshakes that you cannot.
+
+---
+Your data stays in our local pen with an audit trail.
+{% if p.release is defined and p.release.to_fabric | default(false) %}
+Released onward to the fabric per our agreement.
+{% else %}
+Nothing leaves the site until we have both agreed it should. That is a separate
+conversation and does not block you publishing.
+{% endif %}

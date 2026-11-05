@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# MANAGED BY ANSIBLE — edit platform/templates/host/octo-watchdog.sh.j2
+#
+# octo-watchdog — repair runtime faults on this pod. Never apply a declaration.
+#
+# THE LINE THIS SCRIPT DOES NOT CROSS
+#   A runtime fault is the actual state degrading while the desired state stayed put: a
+#   sink that is up but subscribing nothing, a router that is running but not listening.
+#   Restoring those is unambiguously correct and needs no permission, which is the whole
+#   point on a box that has no operator to ask.
+#
+#   Declaration drift is the opposite — the desired state MOVED. Acting on that restarts
+#   the router and disturbs every arm on the pod, so this script only ever REPORTS it.
+#   `octo-pod apply` remains a deliberate act a human reads first. A watchdog that
+#   applied config would be a 3am outage waiting for someone to edit a file.
+#
+# WHY IT EXISTS AT ALL
+#   The audit sinks do not reconnect after the router restarts, and a dead sink
+#   keeps running, stays green in `podman ps`, and serves metrics — so nothing notices.
+#   That state ran unnoticed for six days once. The repair used to live in the ansible
+#   handler as a for-loop restarting EVERY sink whenever the ACL changed, which made one
+#   publisher's change fan out across the whole pod. A sink's liveness is the sink's own
+#   business; this is where it is now handled, one at a time, when it is actually dead.
+set -uo pipefail
+
+STATE_DIR="{{ pen_state_dir }}"
+STATUS="$STATE_DIR/watchdog.status"
+SEEN="$STATE_DIR/watchdog.state"
+ETC="{{ octo_pod_etc | default('/etc/octo-pod') }}"
+METRICS_PORT="{{ audit_metrics_port }}"
+PEN_PORT="{{ pen_listen_port }}"
+
+# --now: repair immediately instead of waiting for a second bad check. `apply` calls
+# this after restarting the router, because the sinks it just orphaned should be healthy
+# by the time `verify` runs seconds later — not two timer ticks from now. In this mode a
+# sink is given time to come up before it is judged, so a freshly started one that is
+# still opening its session is not restarted for being new.
+NOW=0
+[ "${1:-}" = "--now" ] && NOW=1
+
+ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { printf '%s %s\n' "$(ts)" "$*"; }
+# Errors to stderr, per the shell style guide: journald tags them separately, and a
+# caller piping stdout still sees the thing that went wrong.
+err() { printf '%s %s\n' "$(ts)" "$*" >&2; }
+
+checked=0; repaired=0; faults=0; drift=0
+notes=""
+now_unhealthy=""
+prev_unhealthy="$(cat "$SEEN" 2>/dev/null || true)"
+
+note() { notes="${notes}${notes:+; }$1"; }
+
+# Debounce: repair only what was unhealthy on the PREVIOUS tick too. A single failed
+# scrape is a scrape problem; two in a row is the container. Cheaper and more portable
+# than comparing container start times, and it stops a restart loop on a slow starter.
+was_unhealthy() {
+  [ "$NOW" = 1 ] && return 0
+  case " $prev_unhealthy " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+sink_state() {  # sink_state <container> — the metric, or empty
+  local ip
+  ip="$(podman inspect "$1" --format '{{ "{{" }}range .NetworkSettings.Networks{{ "}}" }}{{ "{{" }}.IPAddress{{ "}}" }}{{ "{{" }}end{{ "}}" }}' 2>/dev/null)"
+  [ -n "$ip" ] || return 0
+  curl -s --max-time 5 "http://${ip}:${METRICS_PORT}/metrics" 2>/dev/null \
+    | awk '/^goat_audit_subscriber_session_state/{print $2}'
+}
+
+live_within() {  # live_within <container> <seconds> — poll, so "still starting" is not "dead"
+  local c="$1" deadline=$(( $2 / 2 ))
+  for _ in $(seq 1 "$((deadline + 1))"); do
+    [ "$(sink_state "$c")" = "1" ] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- audit sinks
+# Same probe verify-octo-pod.yml uses: the sinks are off host-networking, so reach them
+# on their container address rather than a published port.
+for c in $(podman ps --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | grep '^octo-pen-audit-sink' || true); do
+  checked=$((checked + 1))
+  st="$(sink_state "$c")"
+  [ "${st:-}" = "1" ] && continue
+  # Converge-time: give it a moment. A sink started seconds ago by `pen — up` has not
+  # opened its session yet, and restarting it for that would be churn, not repair.
+  if [ "$NOW" = 1 ] && live_within "$c" 20; then
+    continue
+  fi
+  faults=$((faults + 1))
+  now_unhealthy="$now_unhealthy $c"
+  if was_unhealthy "$c"; then
+    err "REPAIR $c — session_state=${st:-<no metrics>} for two consecutive checks"
+    if systemctl restart "$c.service" >/dev/null 2>&1; then
+      repaired=$((repaired + 1))
+      note "restarted $c"
+    else
+      note "could not restart $c"
+    fi
+  else
+    log "watch  $c — session_state=${st:-<no metrics>}; will repair if still bad next tick"
+  fi
+done
+
+# ---------------------------------------------------------------- the clock
+# Not repairable here — a box with no time source cannot invent one — so this is
+# reported, loudly. Everything cert-based fails on a bad clock, and cert renewal
+# refuses to run, so this explains a pod that looks broken for no visible reason.
+year="$(date -u +%Y)"
+if [ "${year:-0}" -lt 2025 ]; then
+  faults=$((faults + 1))
+  note "clock reads ${year}: every certificate will read as not-yet-valid"
+  err "FAULT  clock reads ${year} — TLS cannot work and renewal will refuse to run"
+fi
+
+# ---------------------------------------------------------------- the router
+# Running but not listening is the same class of fault as a zombie sink, and it takes
+# every arm down with it — they reconnect on their own once the port is back.
+if podman ps --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | grep -q '^octo-pen-zenoh-router$'; then
+  checked=$((checked + 1))
+  if ! ss -tln 2>/dev/null | grep -q ":${PEN_PORT}\b"; then
+    faults=$((faults + 1))
+    now_unhealthy="$now_unhealthy octo-pen-zenoh-router"
+    if was_unhealthy octo-pen-zenoh-router; then
+      err "REPAIR octo-pen-zenoh-router — up but nothing listening on ${PEN_PORT}"
+      # if/then, not `A && B || C`: with the latter, C also runs when A succeeds and B
+      # returns non-zero, so a successful restart could report itself as a failure.
+      # (PartOf restarts sinks with it; the router uses --sdnotify=healthy on Podman 4.7+)
+      if systemctl restart octo-pen-zenoh-router.service >/dev/null 2>&1; then
+        repaired=$((repaired + 1))
+        note "restarted the pen router"
+      else
+        note "could not restart the pen router"
+      fi
+    else
+      log "watch  octo-pen-zenoh-router — no listener on ${PEN_PORT}"
+    fi
+  fi
+fi
+
+# ------------------------------------------------------- declaration vs reality
+# REPORT ONLY. Both directions matter and neither is this script's to fix:
+#   declared but absent  — `apply` has not been run since someone added a publisher
+#   present but undeclared — a publisher was removed from the declaration and its
+#                            listener is STILL RUNNING, still taking data off the wire
+# The second is the more dangerous: revoking a publisher in the declaration does not
+# stop the container that was serving it.
+if [ -d "$ETC/host_vars" ] && command -v python3 >/dev/null 2>&1; then
+  declared="$(python3 - "$ETC" <<'PY' 2>/dev/null
+import glob, sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+ids = []
+for f in glob.glob(sys.argv[1] + "/host_vars/*/[23]0-*.yml"):
+    doc = yaml.safe_load(open(f)) or {}
+    for key in ("arms", "peers"):
+        for p in doc.get(key) or []:
+            if p.get("enabled"):
+                ids.append(p["id"])
+print(" ".join(sorted(set(ids))))
+PY
+)"
+  if [ -n "${declared:-}" ]; then
+    for id in $declared; do
+      podman ps --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | grep -q -- "-${id}\$" || {
+        drift=$((drift + 1)); note "$id is declared but has no container — apply has not run"
+        err "DRIFT  $id declared, nothing running for it"; }
+    done
+    for c in $(podman ps --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | grep -E '^octo-(udp|tcp)-(ingest|connect)-' || true); do
+      id="${c#octo-}"; id="${id#*-}"; id="${id#*-}"
+      case " $declared " in
+        *" $id "*) : ;;
+        *) drift=$((drift + 1))
+           note "$c is running but $id is not declared — its listener is still accepting data"
+           err "DRIFT  $c running, $id not in the declaration" ;;
+      esac
+    done
+  fi
+fi
+
+printf '%s' "$now_unhealthy" > "$SEEN"
+printf '%s checked=%s repaired=%s faults=%s drift=%s%s\n' \
+  "$(ts)" "$checked" "$repaired" "$faults" "$drift" "${notes:+ note=\"$notes\"}" > "$STATUS"
+
+# Faults that were repaired are not failures — that is the job. An unrepaired fault, or
+# drift, exits non-zero so it lands in `systemctl --failed`, which is the only
+# always-present signal on a pod with nothing scraping it.
+[ "$((faults - repaired))" -le 0 ] && [ "$drift" -eq 0 ] || exit 1
+exit 0

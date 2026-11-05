@@ -1,0 +1,51 @@
+#!/bin/bash
+# netbird-selfheal: keep the fabric mesh alive — it's our only remote path to this
+# box while operators are off-site. Runs every minute from /etc/cron.d.
+LOG=/var/log/netbird-selfheal.log
+STATE=/run/netbird-selfheal.fails
+ts() { date -u +%FT%TZ; }
+
+# NOTHING TO HEAL IS NOT A FAULT. This script's last resort is a REBOOT, and it cannot
+# tell "the mesh broke" from "there is no mesh here" — so on a box where netbird was
+# never enrolled, or was deliberately removed, the failure condition is permanent and it
+# reboots every ten minutes forever. That happened: four reboots on a pod that joins
+# nothing by design.
+#
+# A self-healer needs to know when the thing it heals is simply absent. If netbird is
+# not installed, or has never been enrolled, there is nothing here to keep alive and the
+# right action is none.
+if ! command -v netbird >/dev/null 2>&1; then
+  exit 0
+fi
+if ! netbird status 2>/dev/null | grep -qE "Management:|Signal:"; then
+  # Installed but never enrolled — no mesh was ever configured on this box.
+  exit 0
+fi
+
+# Healthy → reset counter, done.
+if netbird status 2>/dev/null | grep -q "Management: Connected"; then
+  echo 0 > "$STATE" 2>/dev/null
+  exit 0
+fi
+
+fails=$(cat "$STATE" 2>/dev/null || echo 0)
+fails=$((fails + 1))
+echo "$fails" > "$STATE" 2>/dev/null
+echo "$(ts) netbird NOT connected (consecutive #$fails) -> restarting netbird" >> "$LOG"
+systemctl restart netbird
+sleep 12
+
+if netbird status 2>/dev/null | grep -q "Management: Connected"; then
+  echo "$(ts) recovered after restart" >> "$LOG"
+  echo 0 > "$STATE" 2>/dev/null
+  exit 0
+fi
+
+echo "$(ts) still down after restart (consecutive #$fails)" >> "$LOG"
+# Last resort: mesh down ~{{ selfheal_reboot_after_fails | default(10) }} min despite restarts -> reboot once (netbird + WiFi
+# both auto-start on boot). Reset counter so it doesn't reboot-loop.
+if [ "$fails" -ge {{ selfheal_reboot_after_fails | default(10) }} ]; then
+  echo "$(ts) mesh down ${fails}m -> rebooting as last resort" >> "$LOG"
+  echo 0 > "$STATE" 2>/dev/null
+  /sbin/reboot
+fi

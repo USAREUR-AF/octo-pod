@@ -1,0 +1,47 @@
+# /etc/containers/systemd/octo-pen-zenoh-router.container — MANAGED BY ANSIBLE
+#
+# The pen's zenoh router as a Quadlet unit (podman migration — see
+# docs/design-podman-migration.md for the compose→quadlet mapping).
+#
+# Notify=healthy is native on Podman 5+. The explicit --sdnotify=healthy supplies
+# the same gate on Podman 4.7+. HealthCmd probes the router for the
+# sinks: systemd treats this unit as "started" only once the listener answers,
+# and the sinks order After= this unit — so a sink can no longer beat the
+# listener on a cold boot and zombie with a dead session. The sinks do
+# NOT retry a failed session; this gate is what makes that survivable.
+
+[Unit]
+Description=octo-pod pen — zenoh router
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image={{ zenoh_image }}
+ContainerName=octo-pen-zenoh-router
+Network=host
+Environment=RUST_LOG={{ zenoh_log | default('info') }}
+Volume={{ pen_state_dir }}/zenoh/config.json5:/etc/zenoh/config.json5:ro
+Volume={{ pen_state_dir }}/zenoh/tls:/etc/zenoh/tls:ro
+Volume={{ pen_state_dir }}/zenoh/rocksdb:/var/lib/zenoh/rocksdb
+Exec=-c /etc/zenoh/config.json5
+# ready == the TLS listener answers, not == the process forked. eclipse/zenoh
+# is Alpine; BusyBox nc is present (same probe the compose healthcheck used).
+Notify=healthy
+# Quadlet 4.x ignores Notify=healthy; the final Podman argument supplies the gate.
+PodmanArgs=--sdnotify=healthy
+HealthCmd=nc -z 127.0.0.1 {{ pen_listen_port }}
+HealthInterval=5s
+HealthTimeout=3s
+HealthRetries=12
+HealthStartPeriod=10s
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+# The explicit healthy notification holds startup until the probe passes.
+# Allow headroom for failed probes before systemd calls startup failed.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target default.target

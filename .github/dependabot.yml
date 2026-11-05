@@ -1,0 +1,33 @@
+# Weekly dependency updates. Commit titles follow the PR-title gate.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /arms
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  # Base images are pinned by digest in each arm's Dockerfile.
+  - package-ecosystem: docker
+    directories: ["/arms/*"]
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      actions:
+        patterns: ["*"]

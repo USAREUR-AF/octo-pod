@@ -1,0 +1,136 @@
+# ARMS — socket publishers we give identity to.
+#
+# An arm's publisher does NOT speak Zenoh and holds no credential. They send bytes at
+# a socket; WE run the listener and OUR arm holds the pen-CA cert on their behalf.
+# Stage 1 of the three-stage shape. Zenoh-native publishers go in 20-peers.yml.
+#
+# Because they hold no credential:
+#   · allow_sources IS the access control — nothing else authenticates them
+#   · the source IP is stamped into the key as provenance, so it must be static
+#   · one arm per publisher — an arm has a single key prefix
+#
+# Ids must be unique across BOTH this file and 20-peers.yml; configure-octo-pod.yml
+# asserts that. Two arms below: one proven, one declared but not yet enabled.
+
+arms:
+  # A first-party test arm. Worth keeping on every pod: it proves the whole path —
+  # socket → arm → pen → sink → upstream — without waiting on a partner.
+  - id: loopback
+    kind: udp-ingest
+    description: "Loopback test arm — proves the CAT-62 UDP path end to end"
+    cert_cn: octo-arm-loopback
+    namespace: "raw/loopback/**"
+    enabled: true
+    feed: cat62-v1                     # [A-Za-z0-9_-] only; the arm rejects slashes
+    transport: udp
+    port: 48020
+    allow_sources: "100.127.0.18"       # operator laptop sending a known test datagram
+    trust_tier: T1                     # socket + source IP only; no crypto identity
+    affiliation: { id: octo-pod, kind: first-party }
+    contact: "Platform team"
+    onboarded: "2026-01-15"
+    verified:                          # tested live; not aspirational
+      write_own_namespace: true        #   arrived on raw/loopback/cat62-v1/<src>
+      write_our_namespace: untested    #   deny path not exercised for this CN
+      lands_in_fabric: true
+    expect:
+      continuous: false                # hand-driven, so silence is normal — drift
+                                       # reports it but does not fail on it
+      schema: "ASTERIX CAT-62"         # EUROCONTROL binary; portal format is `raw`
+      max_datagram_bytes: 1200         # mesh MTU is 1280; larger fragments and is
+                                       # lost whole, with no error anywhere
+    release:
+      to_fabric: true                    # OPEN — see bridge_allow in 10-pod.yml
+    revoke: |
+      Remove cert_cn from the mtls-loopback-arm subject in
+      {{ pen_state_dir }}/zenoh/config.json5, restart octo-pen-zenoh-router, and stop
+      the arm (sudo octo-pod remove-arm loopback). Revoking the ACL alone
+      leaves the listener still accepting their datagrams.
+
+  # A partner whose address is not known yet. Declaring them now means the config is
+  # reviewed and ready; `enabled: false` means nothing is provisioned until it is.
+  - id: radar1
+    kind: udp-ingest
+    description: "Site radar vendor — radar → transform → ASTERIX CAT-62"
+    cert_cn: octo-arm-radar1
+    namespace: "raw/radar1/**"
+    enabled: false                     # flip to true once allow_sources is real
+    feed: cat62-v1
+    transport: udp
+    port: 48021                        # unique per arm; loopback holds 48020
+    # SET THIS BEFORE APPLYING. It is the only access control an arm has, and it is
+    # stamped into the key as provenance, so it must be their STATIC address. A wrong
+    # value fails quietly on the wire — the pod drops the datagrams and says nothing;
+    # only `octo-pod verify --tags drift` reports radar1 as never observed.
+    allow_sources: "TODO-radar1-static-ip"
+    trust_tier: T1
+    affiliation: { id: radar-vendor, kind: partner }
+    contact: "Vendor NOC"
+    onboarded: "2026-01-20"
+    verified:
+      write_own_namespace: untested
+      write_our_namespace: untested
+      lands_in_fabric: untested
+    expect:
+      # Ask for scan period and PEAK track count, never an average rate — an average
+      # tells you nothing about whether the link survives a busy sky.
+      scan_period_s: unknown
+      peak_tracks: unknown
+      # If they go silent on an empty sky, the feed cannot be alerted on: silence and
+      # failure look identical. Ask whether they emit a status message when idle.
+      quiet_when_no_tracks: unknown
+      schema: "ASTERIX CAT-62"
+      max_datagram_bytes: 1200
+    release:
+      to_fabric: false                   # keep shut until their data is seen and agreed
+    revoke: |
+      Remove cert_cn from the mtls-radar1-arm subject in
+      {{ pen_state_dir }}/zenoh/config.json5, restart octo-pen-zenoh-router, and stop
+      the arm (sudo octo-pod remove-arm radar1).
+
+  # THE OTHER DIRECTION. Everything above LISTENS: the sensor is programmed to send at
+  # us. A radar-one sensor is itself the server — it accepts a client on its data port and then
+  # writes at it — so nothing ever arrives at a listener pointed at one. Two servers,
+  # no connection, and it presents as a dead feed rather than as a misconfiguration.
+  #
+  # Hence `kind: tcp-connect`, and `target` INSTEAD OF `port`: the port belongs to the
+  # sensor, not to this box, so this arm binds nothing and there is no port to collide
+  # with another arm's. Declare it with:
+  #
+  #   octo-pod add-arm radar-one --dial 192.0.2.104:9000 --feed cat62-v1 --framing len32be
+  #
+  # allow_sources is weaker here than on a listening arm — we chose who to dial — but it
+  # still catches a target whose name resolves somewhere unexpected.
+  - id: radar-one
+    kind: tcp-connect
+    description: "radar-one sensor — serves its own stream, so we dial out to it"
+    cert_cn: octo-arm-radar-one
+    namespace: "raw/radar-one/**"
+    enabled: false                     # flip once the sensor is reachable from this pod
+    feed: cat62-v1
+    transport: tcp
+    target: "192.0.2.104:9000"        # the SENSOR's address and port, not ours
+    # Confirm against real bytes before trusting this. `stream` loses nothing and only
+    # gives up unit boundaries, so it is the safe first guess when the vendor is vague.
+    framing: len32be
+    allow_sources: "192.0.2.104"
+    trust_tier: T1
+    affiliation: { id: radar-vendor, kind: partner }
+    contact: "Vendor NOC"
+    onboarded: "2026-02-02"
+    verified:
+      write_own_namespace: untested
+      write_our_namespace: untested
+      lands_in_fabric: untested
+    expect:
+      # A dial-out feed is silent in two different ways — the sensor is down, or it is
+      # up and holding the connection open with nothing to say. Ask which this one does.
+      quiet_when_no_tracks: unknown
+      schema: "ASTERIX CAT-62"
+    release:
+      to_fabric: false
+    revoke: |
+      Remove cert_cn from the mtls-radar-one-arm subject in
+      {{ pen_state_dir }}/zenoh/config.json5, restart octo-pen-zenoh-router, and stop
+      the arm (sudo octo-pod remove-arm radar-one). Unlike a listening arm, stopping
+      this one also ends the outbound connection to the sensor.

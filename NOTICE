@@ -1,0 +1,21 @@
+octo-pod
+Copyright 2026 U.S. Federal Government (in countries where recognized)
+
+Portions of this work written by U.S. Federal government employees within the
+scope of their federal employment are not subject to copyright protection in the
+United States (17 U.S.C. 105) and are in the public domain there. In countries
+where copyright protection is available, those portions are released under the
+Apache License, Version 2.0. Merged contributions from private contributors are
+released under the same License. See INTENT.md.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+The arm container images also contain third-party Rust crates. Their licenses are in
+arms/THIRD_PARTY_LICENSES.md, and every image carries LICENSE, NOTICE and that file in
+/usr/share/doc/octo-pod/.
+
+This product includes the SAPIENT protobuf definitions (BSI Flex 335 v2.0), Crown
+Copyright, published by Dstl at https://github.com/dstl/SAPIENT-Proto-Files (tag
+BSI_Flex_335_v2.0_SAPIENT) under the Apache License, Version 2.0. They are vendored
+unmodified in arms/sapient-proto/proto/, with upstream's LICENCE.txt, and compiled into
+the sapient arm.

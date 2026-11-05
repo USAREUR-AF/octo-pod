@@ -1,0 +1,5 @@
+# Socket destinations: released fabric data leaves this pod through one egress arm per
+# destination, each with its own certificate, one literal address and an audit record.
+# Nothing flows until the destination is released.
+# Add with: octo-pod egress add <id> --dest udp://<ip>:<port> --key release/<lane>/<key>
+egress: []

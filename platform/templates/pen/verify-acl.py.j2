@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+# MANAGED BY ANSIBLE (templates/verify-pen-acl.py.j2) — generated from `peers`
+# and pen_firstparty_cns. Do not hand-edit.
+#
+# Proves the pen ACL enforces the declaration:
+#   for each declared peer  -> it CAN write its own namespace
+#                           -> it CANNOT write first-party namespaces
+# Exits non-zero if either expectation fails.
+import sys, time, zenoh
+
+TLS = "{{ pen_state_dir }}/zenoh/tls"
+EP  = "tls/127.0.0.1:{{ pen_listen_port }}"
+
+FIRSTPARTY_NS = [{% for ns in pen_firstparty_namespaces %}"{{ ns | regex_replace('/\*\*$', '') }}"{{ ", " if not loop.last }}{% endfor %}]
+PEERS = [
+{% for p in active_peers %}
+    {"id": "{{ p.id }}", "cert": "{{ p.id }}", "ns": "{{ p.namespace | regex_replace('/\*\*$', '') }}"},
+{% endfor %}
+]
+
+
+def sess(cert, key):
+    c = zenoh.Config()
+    c.insert_json5("mode", '"client"')
+    c.insert_json5("connect/endpoints", '["%s"]' % EP)
+    c.insert_json5("connect/exit_on_failure", '{ "client": false }')
+    c.insert_json5("connect/timeout_ms", '{ "client": -1 }')
+    c.insert_json5("scouting/multicast/enabled", "false")
+    c.insert_json5("transport/link/tls/root_ca_certificate", '"%s/ca-roots.pem"' % TLS)
+    c.insert_json5("transport/link/tls/connect_certificate", '"%s/%s"' % (TLS, cert))
+    c.insert_json5("transport/link/tls/connect_private_key", '"%s/%s"' % (TLS, key))
+    c.insert_json5("transport/link/tls/enable_mtls", "true")
+    c.insert_json5("transport/link/tls/verify_name_on_connect", "false")
+    return zenoh.open(c)
+
+
+seen, failures = [], []
+# first-party subscriber (the pod cert) watches everything we care about
+obs = sess("pod-cert.pem", "pod-key.pem")
+for ns in FIRSTPARTY_NS + [p["ns"] for p in PEERS]:
+    obs.declare_subscriber(ns + "/**", lambda s: seen.append(str(s.key_expr)))
+time.sleep(2)
+
+stamp = str(int(time.time()))
+for p in PEERS:
+    pub = sess(p["cert"] + "-cert.pem", p["cert"] + "-key.pem")
+    time.sleep(1)
+    allowed = "%s/aclverify/%s" % (p["ns"], stamp)
+    pub.put(allowed, b"allowed")
+    denied = []
+    for ns in FIRSTPARTY_NS:
+        k = "%s/aclverify/%s" % (ns, stamp)
+        pub.put(k, b"should-be-denied")
+        denied.append(k)
+    time.sleep(4)
+    pub.close()
+
+    got_allowed = any(k == allowed for k in seen)
+    got_denied = [k for k in denied if k in seen]
+    print("  %-12s write own namespace  : %s" % (p["id"], "PASS" if got_allowed else "FAIL"))
+    print("  %-12s write ours (must fail): %s" % (p["id"], "PASS (denied)" if not got_denied else "FAIL — WROTE %s" % got_denied))
+    if not got_allowed:
+        failures.append("%s cannot write its own namespace %s" % (p["id"], p["ns"]))
+    if got_denied:
+        failures.append("%s CAN write first-party namespaces %s — ACL over-grant" % (p["id"], got_denied))
+
+obs.close()
+print()
+if failures:
+    print("ACL VERIFICATION FAILED:")
+    for f in failures:
+        print("  - " + f)
+    sys.exit(1)
+print("ACL verification passed: %d peer(s) scoped correctly" % len(PEERS))

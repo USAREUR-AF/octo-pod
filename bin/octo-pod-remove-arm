@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""
+octo-pod-remove-arm — undo, in reverse, exactly what add-arm + apply created.
+
+    octo-pod remove-arm <id>          asks first
+    octo-pod remove-arm <id> --yes    for a script
+    octo-pod remove-arm <id> --keep-key
+
+WHY THIS IS NOT "edit the file and re-apply". `apply` creates and never deletes, and
+nothing brings the pen up with --remove-orphans, so dropping a publisher from the
+declaration leaves its container running and bound to its port while the regenerated
+ACL no longer grants it anything. The router then denies its writes — silently,
+because a brokerless fabric has no central denial signal to raise. Data keeps arriving
+at the pod and vanishes, `podman ps` stays green, and nothing reports a fault. That is
+the failure this whole system exists to prevent, reached by following the obvious
+procedure. So removal tears down the running thing FIRST, and edits the declaration
+after.
+
+`enabled: false` has the same hazard in a worse costume: it reads as "turned off"
+while the process is still listening and still taking traffic.
+
+WHAT IS KEPT. Both copies of the private key are deleted: the pen's, under
+/var/lib/octo-pen/zenoh/tls, and the arm's own, under /etc/octo-arm-<id>/tls, which is
+the one its container mounts. Deleting one and leaving the other revokes nothing.
+That deletion is what actually revokes the ability to publish, and it is why a stale
+ACL grant left until the next `apply` is inert rather than dangerous. The certificate is kept, so an audit record naming that CN can
+still be resolved to who it was. Removing a publisher should not make its past
+unreadable. --keep-key exists for the case where you are moving an arm rather than
+retiring it.
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ETC = Path(os.environ.get("OCTO_POD_ETC", "/etc/octo-pod"))
+PEN_STATE = Path(os.environ.get("OCTO_PEN_STATE", "/var/lib/octo-pen"))
+# Where the playbook actually puts things. These MUST match configure-octo-pod.yml,
+# and until now they did not: this file looked for the private key under a name the
+# playbook never writes, found nothing, and because both the plan line and the delete
+# were guarded by `if key.exists()`, reported a successful removal while the key it
+# exists to destroy sat on disk. A revocation verb that silently revokes nothing.
+#
+# test_templates.py::test_remove_arm_paths_match_playbook now renders the playbook's own
+# dest strings and asserts they equal what this file derives, so the two cannot drift
+# apart again without CI failing.
+ARM_PREFIXES = ("octo-udp-ingest-", "octo-tcp-ingest-", "octo-tcp-connect-")
+
+
+def die(msg):
+    print(f"\nERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def sh(cmd, timeout=60):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
+
+
+def pod_dir():
+    hv = ETC / "host_vars"
+    pods = [p for p in hv.iterdir() if p.is_dir()] if hv.is_dir() else []
+    if not pods:
+        die(f"no pod identity under {hv} — this box is not a pod yet")
+    if len(pods) > 1:
+        die(f"more than one pod under {hv}: {[p.name for p in pods]}")
+    return pods[0]
+
+
+def load(path):
+    try:
+        import yaml
+    except ImportError:
+        die("pyyaml missing — apt install python3-yaml")
+    try:
+        return yaml.safe_load(path.read_text()) or {}
+    except (OSError, Exception):  # noqa: BLE001 — a broken file must not wedge removal
+        return {}
+
+
+def running_containers():
+    _, out, _ = sh(["podman", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}"])
+    return dict(l.split("\t", 1) for l in out.splitlines() if "\t" in l)
+
+
+def strip_arm_block(text, arm_id):
+    """Delete this arm's list entry, and nothing else.
+
+    Line-based, not a YAML round-trip: safe_load/safe_dump would rewrite the whole
+    file and discard every comment in it — and those comments are where the release
+    gate is explained. add-arm appends raw text for the same reason.
+    """
+    lines = text.splitlines(keepends=True)
+    start = None
+    for i, line in enumerate(lines):
+        if re.match(rf"^\s*-\s+id:\s+{re.escape(arm_id)}\s*(#.*)?$", line):
+            start = i
+            break
+    if start is None:
+        return text, False
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        stripped = lines[j].strip()
+        if not stripped:
+            continue
+        cur = len(lines[j]) - len(lines[j].lstrip())
+        # The next sibling entry, or something dedented out of the list, ends this one.
+        if cur <= indent and (stripped.startswith("- ") or cur < indent):
+            end = j
+            break
+    return "".join(lines[:start] + lines[end:]), True
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="octo-pod remove-arm|remove-peer")
+    ap.add_argument("verb", nargs="?", choices=["arm", "peer"],
+                    help="which the caller believes it is; checked against the declaration")
+    ap.add_argument("id")
+    ap.add_argument("--yes", action="store_true", help="do not ask (for scripts)")
+    ap.add_argument("--keep-key", action="store_true",
+                    help="keep the private key — for moving an arm, not retiring it")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0:
+        die("run with sudo — this stops containers and deletes keys")
+
+    d = pod_dir()
+    # An id is declared as one or the other, never both — add-arm/add-peer reject a
+    # duplicate across BOTH files. So find it rather than making the operator tell us,
+    # and let the verb they typed be a check on what they believe they are removing.
+    arms_file, peers_file = d / "30-arms.yml", d / "20-peers.yml"
+    arm = next((a for a in (load(arms_file).get("arms") or []) if a.get("id") == args.id), None)
+    peer = next((p for p in (load(peers_file).get("peers") or []) if p.get("id") == args.id), None)
+    kind = "arm" if arm else ("peer" if peer else None)
+    entry, decl_file = (arm, arms_file) if arm else (peer, peers_file)
+    if kind and args.verb and args.verb != kind:
+        die(f"{args.id} is declared as a {kind}, not a{'n' if args.verb == 'arm' else ''} "
+            f"{args.verb}. Use: octo-pod remove-{kind} {args.id}")
+    running = running_containers()
+
+    containers = [n for n in running if any(n == p + args.id for p in ARM_PREFIXES)]
+    sink = f"octo-pen-audit-sink-{args.id}"
+    has_sink = sink in running
+    cn = (entry or {}).get("cert_cn") or f"octo-arm-{args.id}"
+    ns = (entry or {}).get("namespace") or f"raw/{args.id}/**"
+
+    # Keyed on the id, NOT on the CN: the playbook names these files {{ item.id }}-arm-*,
+    # while the CN is octo-arm-<id>. Deriving from the CN looked reasonable and matched
+    # nothing on disk.
+    key = PEN_STATE / "zenoh" / "tls" / f"{args.id}-arm-key.pem"
+    cert = PEN_STATE / "zenoh" / "tls" / f"{args.id}-arm-cert.pem"
+    csr = PEN_STATE / "ca" / f"{args.id}-arm.csr"
+    # Quadlet unit files — one per kind the arm might be, plus its audit sink.
+    # Kind is not recorded at removal time, so all three candidate names are
+    # targeted; two of them simply do not exist. The playbook writes these under
+    # /etc/containers/systemd (per-arm and per-sink renders).
+    quadlets = [Path(f"/etc/containers/systemd/octo-{k}-{args.id}.container")
+                for k in ("udp-ingest", "tcp-ingest", "tcp-connect")]
+    quadlets.append(Path(f"/etc/containers/systemd/octo-pen-audit-sink-{args.id}.container"))
+    # The arm's OWN copy of the credential, which is the one its container mounts. Mode
+    # 0640 root:<runtime>, so it is readable by anything that can run a container here.
+    # Deleting the pen's copy and leaving this one revokes nothing.
+    armdir = Path(f"/etc/octo-arm-{args.id}")
+    armkey = armdir / "tls" / "arm-key.pem"
+    # A PEER's key is minted here and handed to the partner, so the pod keeps a copy in
+    # a bundle directory. Deleting it does not revoke the partner (they hold their own),
+    # but leaving it means a retired peer's credential stays on this box where anyone
+    # with pod access can pick it up and become that partner.
+    bundle = PEN_STATE / "bundles" / args.id
+    bundlekey = bundle / "tls" / f"{cn}-key.pem"
+
+    # Stray credential material counts as something to remove. Reaping an orphan takes
+    # the container but leaves both key copies, and this verb used to answer that state
+    # with "nothing to remove", while two usable private keys sat on disk.
+    strays = [q for q in (key, armkey, bundlekey) if q.exists()]
+    if entry is None and not containers and not has_sink and not strays:
+        die(f"nothing to remove: {args.id} is not declared, no container of that name is "
+            f"running, and no key material for it is on disk")
+
+    # An orphan is a legitimate target: it is the exact state `status` reports when a
+    # declaration was removed by hand and the container was left behind.
+    print(f"\nremoving {kind or 'orphan'} {args.id} from pod {d.name}")
+    if entry is None:
+        print("  NOT DECLARED — removing leftover containers only (an orphan)")
+    print(f"  namespace   {ns}")
+    print(f"  certificate {cn}")
+    if kind == "peer":
+        print("  a peer runs on someone else's box: nothing here listens for it, so this")
+        print("  removes its identity and its audit trail, not a process.")
+    print("\nthis will:")
+    for c in containers:
+        print(f"  stop + delete container  {c}  ({running[c]})")
+    if has_sink:
+        print(f"  stop + delete container  {sink}  ({running[sink]})  — its audit trail stops here")
+    if armdir.is_dir():
+        print(f"  delete                   {armdir}  (holds this arm's copy of the key)")
+    if bundle.is_dir():
+        print(f"  delete                   {bundle}  (the partner bundle, holds a key)")
+    for label, k in (("pen", key), ("arm", armkey), ("bundle", bundlekey)):
+        if k.exists():
+            print(f"  delete PRIVATE KEY       {k}  ({label} copy)" if not args.keep_key
+                  else f"  keep private key         {k}  ({label} copy, --keep-key)")
+        elif not args.keep_key and label == ("bundle" if kind == "peer" else "pen"):
+            # Loud, but only for the copy this kind is REQUIRED to have. An arm has no
+            # bundle and a peer has no /etc/octo-arm dir, so warning on every absence
+            # would cry wolf on every correct removal. A key missing from the one place
+            # it must be is a revocation this command cannot carry out, and the operator
+            # has to know that before they believe the publisher is retired.
+            print(f"  !! NOT FOUND             {k}  ({label} copy), see the warning below")
+    if cert.exists():
+        print(f"  keep certificate         {cert}  (so past audit records still resolve)")
+    if entry is not None:
+        print(f"  remove declaration from  {decl_file}")
+
+    if not args.yes:
+        try:
+            if input("\nproceed? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("nothing was changed.")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            print("\nnothing was changed.")
+            return 0
+
+    print()
+    # 1. STOP FIRST. While the container lives it holds the port and accepts data; the
+    #    declaration is only paperwork. Stop the unit (the way it was created), then any
+    #    residue by container name, because an orphan's unit file may be long gone.
+    for c in containers + ([sink] if has_sink else []):
+        sh(["systemctl", "stop", f"{c}.service"], timeout=120)
+        if c in running_containers():
+            rc, _, err = sh(["podman", "rm", "-f", c], timeout=120)
+            print(f"  removed container {c}" if rc == 0 else f"  WARN could not remove {c}: {err}")
+        else:
+            print(f"  removed container {c}")
+
+    # 2. Revoke the ability to publish. Deleting the key is what makes the ACL grant
+    #    that survives until the next `apply` inert rather than a live permission.
+    missing = []
+    if not args.keep_key:
+        for label, k in (("pen", key), ("arm", armkey), ("bundle", bundlekey)):
+            if k.exists():
+                k.unlink()
+                print(f"  deleted private key {k}  ({label} copy)")
+            elif label == ("bundle" if kind == "peer" else "pen"):
+                missing.append(k)
+        if csr.exists():
+            csr.unlink()
+
+    # 3. Unit files. Left behind, a quadlet regenerates the container on the next
+    #    daemon-reload — a removed arm that resurrects itself at boot.
+    reloaded = False
+    for p in quadlets:
+        if p.exists():
+            p.unlink()
+            reloaded = True
+            print(f"  deleted {p}")
+    if reloaded:
+        sh(["systemctl", "daemon-reload"], timeout=60)
+    for dpath in (armdir, bundle):
+        if dpath.is_dir() and not args.keep_key:
+            shutil.rmtree(dpath, ignore_errors=True)
+            print(f"  deleted {dpath}")
+
+    # 4. The declaration, last: if anything above failed, the declaration still
+    #    describes what is on the box, which is the state everything else assumes.
+    if entry is not None:
+        text = decl_file.read_text()
+        new, found = strip_arm_block(text, args.id)
+        if found:
+            # Removing the LAST entry leaves the key with nothing under it, and
+            # `peers:` alone parses as None — not as an empty list. Ansible's
+            # default([]) only fires on undefined, so None reached a `+` and took
+            # down the whole converge. Write the empty list explicitly.
+            top = "arms" if kind == "arm" else "peers"
+            import yaml as _y
+            try:
+                still = (_y.safe_load(new) or {}).get(top)
+            except Exception:  # noqa: BLE001 — fall back to writing what we have
+                still = "?"
+            if not still and still != "?":
+                new = re.sub(rf"^{top}:\s*$", f"{top}: []", new, count=1, flags=re.M)
+            decl_file.write_text(new if new.strip() else f"{top}: []\n")
+            print(f"  removed declaration from {decl_file}")
+        else:
+            print(f"  WARN could not find the '{args.id}' block in {decl_file} — remove it by hand")
+
+    # 5. The release gate is a separate file and a separate decision, so it is reported
+    #    rather than edited. An open gate for a namespace nobody publishes is a
+    #    permission left lying around.
+    pod_file = d / "10-pod.yml"
+    if pod_file.exists() and args.id in pod_file.read_text():
+        print(f"\n  NOTE {pod_file} still mentions {args.id} — check bridge_allow;")
+        print("       a namespace left open releases whatever publishes there next.")
+
+    # The urgency differs by kind, and getting this wrong would be an untrue reassurance.
+    # An ARM's key lived on this box and has just been deleted, so the grant that
+    # survives until the next converge cannot be used by anyone. A PEER holds its own
+    # key on its own box — nothing here can revoke it — so its grant stays USABLE until
+    # the ACL is regenerated. Same leftover, two very different meanings.
+    if kind == "peer" and not args.keep_key:
+        print("\n  CONVERGE NOW. A peer holds its own private key, on its own box, so")
+        print("  nothing removed here revokes it. The ACL still grants " + cn + " write")
+        print("  access to " + ns + " and that grant is LIVE until you run:")
+        print("    octo-pod apply\n")
+    elif missing:
+        # The reassurance below is "the key is gone, so the grant cannot be used". That
+        # sentence is the whole value of this command, and printing it when we did not
+        # find the key to delete is worse than printing nothing: the operator stops
+        # looking. Say what did not happen, name the paths, and exit non-zero.
+        print("\n  REVOCATION INCOMPLETE. This command could not find:")
+        for k in missing:
+            print(f"    {k}")
+        print("  Containers and config were removed, but a private key that is somewhere")
+        print("  else is still a key. Find it before you consider this publisher retired:")
+        print(f"    sudo find / -name '*{args.id}*' -name '*key*' 2>/dev/null")
+        print("  If it genuinely does not exist, this is safe to ignore. If it does, the")
+        print("  paths above are wrong for this pod and should be reported.\n")
+        return 1
+    else:
+        print("\nThe ACL still grants this CN until you converge. The key is gone, so the")
+        print("grant cannot be used — but it should not be left describing a publisher")
+        print("that no longer exists:")
+        print("  octo-pod apply")
+        print("  octo-pod status\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
