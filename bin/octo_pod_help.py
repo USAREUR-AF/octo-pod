@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """English help source. Command fragments remain invariant across locales."""
 from octo_pod_i18n import N_
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """Exercise missing inventories and registry reads without registry credentials."""
 import copy
 import importlib.util
@@ -81,6 +83,27 @@ class ImageSboms(unittest.TestCase):
         with patch.object(sbom.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["docker"])):
             with self.assertRaises(subprocess.CalledProcessError):
                 sbom.inspect("registry.example/image:tag", "{{json .SBOM}}")
+
+    def test_a_registry_answer_that_is_not_a_digest_reads_nothing_further(self):
+        for answer in ("latest", "sha256:" + "A" * 64, ["sha256:" + "a" * 64], None):
+            with self.subTest(answer=answer), tempfile.TemporaryDirectory() as tmp:
+                with patch.object(sbom, "inspect", side_effect=[answer]) as inspect:
+                    with patch("sys.argv", ["check-image-sboms.py", "registry.example/image:tag",
+                                            "--output-dir", tmp + "/out"]):
+                        with self.assertRaisesRegex(ValueError, "invalid image digest"):
+                            sbom.main()
+                self.assertEqual(inspect.call_count, 1)
+                self.assertFalse(pathlib.Path(tmp, "out").exists())
+
+    def test_inspect_asks_buildx_for_the_template_and_parses_json(self):
+        done = subprocess.CompletedProcess([], 0, stdout='{"linux/amd64": {}}\n', stderr="")
+        with patch.object(sbom.subprocess, "run", return_value=done) as run:
+            self.assertEqual(sbom.inspect("registry.example/image:tag", "{{json .SBOM}}"),
+                             {"linux/amd64": {}})
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:4], ["docker", "buildx", "imagetools", "inspect"])
+        self.assertEqual(argv[-2:], ["--format", "{{json .SBOM}}"])
+        self.assertTrue(run.call_args.kwargs["check"])
 
     def test_workflow_generates_sboms_before_latest_promotion(self):
         workflow = yaml.safe_load((REPO / ".github/workflows/images.yml").read_text())

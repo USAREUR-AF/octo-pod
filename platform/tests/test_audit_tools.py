@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """Exercise installer refusals and remote command construction with offline stubs."""
 import hashlib
 import os
@@ -22,7 +24,12 @@ def run_checks(repo, check):
     with tempfile.TemporaryDirectory() as td:
         build=Path(td)/'source'
         shutil.copytree(repo,build,ignore=shutil.ignore_patterns('.git','target','__pycache__','dist','.venv','._*'))
-        code,out=run(['bash',str(build/'tools/build-release.sh'),'0.4.0','--repo','example/pod.name'],dict(os.environ,COPYFILE_DISABLE='1',WITH_IMAGES='0'),timeout=30)
+        # Not a git checkout, so the commit time is passed in, as a tarball build would.
+        no_epoch={k:v for k,v in os.environ.items() if k!='SOURCE_DATE_EPOCH'}
+        code,out=run(['bash',str(build/'tools/build-release.sh'),'0.4.0','--repo','example/pod.name'],dict(no_epoch,COPYFILE_DISABLE='1',WITH_IMAGES='0'),timeout=30)
+        check('a build outside git without SOURCE_DATE_EPOCH refuses rather than using the clock',
+              code!=0 and 'SOURCE_DATE_EPOCH is unset' in out,out)
+        code,out=run(['bash',str(build/'tools/build-release.sh'),'0.4.0','--repo','example/pod.name'],dict(no_epoch,COPYFILE_DISABLE='1',WITH_IMAGES='0',SOURCE_DATE_EPOCH='1700000000'),timeout=30)
         check('landing-page fixture builds actual release',code==0,out)
         stage = build/'dist/stage'
         check('1Password command and completion are not owned by octo-pod',

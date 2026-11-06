@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # octo-pod — three steps, in order, then publishers.
 #
 #   1. octo-pod bootstrap        everything needed BEFORE you can join   (once)

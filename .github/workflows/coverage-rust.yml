@@ -1,0 +1,130 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# Rust test coverage for the arms workspace, measured on every pull request and on main.
+#
+# Two measurements, because no single toolchain gives all three numbers well. Stable
+# rustc measures lines and regions. Branch coverage needs `-Z coverage-options=branch`,
+# which only nightly accepts, so a pinned nightly measures branches. Each run gets its
+# own target directory: cargo-llvm-cov includes every test binary it finds there, and a
+# stale binary from another build reports its lines as never run.
+#
+# The job fails if any number drops below its floor in THE RATCHET below. Raise a floor
+# when coverage rises. Never lower one to make a pull request pass; add the tests instead.
+#
+# Both totals count inline `#[cfg(test)]` modules as well as the code they test, which is
+# cargo-llvm-cov's default. arms/fuzz is a separate workspace and is not measured here.
+name: coverage-rust
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  coverage-rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # THE RATCHET: the lowest coverage, in percent, this workspace may report.
+      MIN_LINES: '93'
+      MIN_REGIONS: '93'
+      MIN_BRANCHES: '80'
+      # The nightly that measures branches. Pinned, so a compiler change cannot move the
+      # number without a commit that says so.
+      BRANCH_TOOLCHAIN: nightly-2026-11-05
+    defaults:
+      run:
+        working-directory: arms
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: llvm-tools-preview
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: ${{ env.BRANCH_TOOLCHAIN }}
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      - name: lines and regions (stable)
+        env:
+          CARGO_LLVM_COV_TARGET_DIR: ${{ github.workspace }}/arms/target/cov-stable
+        run: |
+          set -euo pipefail
+          cargo +stable llvm-cov --workspace --locked --no-report
+          cargo +stable llvm-cov report --lcov --output-path lcov.info
+          cargo +stable llvm-cov report --json --summary-only --output-path stable.json
+
+      - name: branches (pinned nightly)
+        env:
+          CARGO_LLVM_COV_TARGET_DIR: ${{ github.workspace }}/arms/target/cov-nightly
+        run: |
+          set -euo pipefail
+          cargo "+$BRANCH_TOOLCHAIN" llvm-cov --workspace --locked --branch --no-report
+          cargo "+$BRANCH_TOOLCHAIN" llvm-cov report --branch --json --summary-only \
+            --output-path nightly.json
+
+      - name: summary
+        run: |
+          set -euo pipefail
+          pct() { jq -r ".data[0].totals.$2 | \"\(.covered)/\(.count) \(.percent * 100 | floor / 100)\"" "$1"; }
+          {
+            echo "## Rust coverage (arms workspace)"
+            echo
+            echo "| Measure | Covered | Percent | Floor |"
+            echo "|---|---|---|---|"
+            read -r c p <<<"$(pct stable.json lines)";     echo "| Lines (stable) | $c | $p% | $MIN_LINES% |"
+            read -r c p <<<"$(pct stable.json regions)";   echo "| Regions (stable) | $c | $p% | $MIN_REGIONS% |"
+            read -r c p <<<"$(pct stable.json functions)"; echo "| Functions (stable) | $c | $p% | |"
+            read -r c p <<<"$(pct nightly.json branches)"; echo "| Branches ($BRANCH_TOOLCHAIN) | $c | $p% | $MIN_BRANCHES% |"
+            echo
+            echo "<details><summary>Lowest line coverage by file</summary>"
+            echo
+            echo "| File | Lines |"
+            echo "|---|---|"
+            jq -r '.data[0].files[]
+                   | [(.filename | sub(".*/arms/"; "")), .summary.lines.percent]
+                   | @tsv' stable.json \
+              | sort -t$'\t' -k2,2n | head -15 \
+              | awk -F'\t' '{printf "| %s | %.2f%% |\n", $1, $2}'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-coverage
+          path: |
+            arms/lcov.info
+            arms/stable.json
+            arms/nightly.json
+          retention-days: 30
+
+      - name: the ratchet
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {  # check <json> <measure> <floor>
+            local got
+            got=$(jq -r ".data[0].totals.$2.percent" "$1")
+            if awk -v g="$got" -v f="$3" 'BEGIN { exit !(g + 0 < f + 0) }'; then
+              echo "::error::$2 coverage ${got}% is below the floor of $3%"
+              fail=1
+            else
+              echo "$2 ${got}% (floor $3%)"
+            fi
+          }
+          check stable.json lines "$MIN_LINES"
+          check stable.json regions "$MIN_REGIONS"
+          check nightly.json branches "$MIN_BRANCHES"
+          exit "$fail"

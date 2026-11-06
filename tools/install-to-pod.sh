@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # install-to-pod.sh — put octo-pod on a box, from a laptop, in one command.
 #
 #   tools/install-to-pod.sh <user>@<pod-ip>

@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
 # SPDX-License-Identifier: Apache-2.0
 #
 # uplink-bridge container image (the pod's sync leg).
@@ -10,9 +11,25 @@
 # are mounted at deploy time; the image carries no embedded identity material.
 
 # upstream tag at the time this digest was pinned: latest-dev
-FROM cgr.dev/chainguard/rust@sha256:353b720c94045a0b19c2f09e9a8ec84479075b40fbfb6badc7c40884d63f3f6f AS rust-builder
+FROM cgr.dev/chainguard/rust@sha256:353b720c94045a0b19c2f09e9a8ec84479075b40fbfb6badc7c40884d63f3f6f AS chef
 USER root
+# DEPENDENCIES COMPILE IN THEIR OWN LAYER. cargo-chef reduces the workspace to its
+# manifests and Cargo.lock (recipe.json), and `cook` compiles every dependency from that
+# alone. These three stages are the same in every arm's Dockerfile, so one cached layer
+# of compiled dependencies serves every arm on a runner until a manifest or the lock
+# changes; a source-only change rebuilds this workspace's crates and nothing else. The
+# final `cargo build` is unchanged. reproducible.yml checks that a cached build produces
+# the same image as an uncached one.
+RUN cargo install --locked cargo-chef --version 0.1.78
 WORKDIR /build
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS rust-builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --locked -p uplink-bridge
 

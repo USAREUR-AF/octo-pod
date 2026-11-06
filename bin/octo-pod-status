@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """
 octo-pod-status — what this pod is doing right now, declared against actual.
 
@@ -177,7 +179,8 @@ def collect():
     claimed = set()
     for kind, items in (("arm", arms), ("peer", peers)):
         for p in items:
-            pid = p.get("id", "?")
+            # str(): a hand-written `- id: off` reads as False, and status must still draw.
+            pid = str(p.get("id", "?"))
             enabled = p.get("enabled", True)
 
             container, status = None, None

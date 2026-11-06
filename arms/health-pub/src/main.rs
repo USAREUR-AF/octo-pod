@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! health-pub — publishes this pod's health onto the fabric, so a pod's state
 //! is knowable without reaching it.
 //!
@@ -146,7 +148,15 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    run(Args::parse(), async {
+        tokio::signal::ctrl_c().await.context("waiting for ctrl-c")
+    })
+    .await
+}
+
+/// The whole publisher: open the pen session, publish a fresh reading every interval
+/// until `shutdown` resolves. `main` passes ctrl-c; a test passes its own trigger.
+async fn run(args: Args, shutdown: impl std::future::Future<Output = Result<()>>) -> Result<()> {
     let cfg = SessionConfig {
         endpoint: args.endpoint.clone(),
         cert: args.cert.clone(),
@@ -175,6 +185,7 @@ async fn main() -> Result<()> {
 
     let mut ticker = tokio::time::interval(Duration::from_secs(args.interval_secs.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
@@ -186,9 +197,9 @@ async fn main() -> Result<()> {
                     error!(error = %e, "publish failed — dropped, next tick carries the same counters");
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
+            stopped = &mut shutdown => {
                 info!("stopping");
-                return Ok(());
+                return stopped;
             }
         }
     }
@@ -196,7 +207,130 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::jitter_offset;
+    use super::*;
+    use octo_arm_common::testing::{next_sample, TestPen, ARRIVES};
+    use serde_json::Value;
+    use std::fs::File;
+    use tokio::sync::oneshot;
+
+    fn args(endpoint: &str, status_file: &std::path::Path, interval: u64) -> Args {
+        Args::try_parse_from([
+            "health-pub",
+            "--key",
+            "ops/pod/health/pod-example-01",
+            "--status-file",
+            status_file.to_str().expect("utf-8 path"),
+            "--interval-secs",
+            &interval.to_string(),
+            "--stale-after-secs",
+            "180",
+            "--endpoint",
+            endpoint,
+        ])
+        .expect("args")
+    }
+
+    fn parse(payload: &str) -> Value {
+        serde_json::from_str(payload).unwrap_or_else(|e| panic!("not JSON ({e}): {payload}"))
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("health-pub-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join("health.json")
+    }
+
+    #[test]
+    fn a_fresh_reading_is_published_as_current_with_its_age() {
+        let file = scratch("fresh");
+        std::fs::write(&file, r#"{"arms":{"udp-ingest":"running"},"repairs":3}"#).expect("write");
+        let v = parse(&payload(&args("tcp/127.0.0.1:1", &file, 60)));
+        assert_eq!(v["schema"], "octo-pod.health.v0");
+        assert_eq!(v["stale"], false);
+        assert!(v["reading_age_s"].as_u64().expect("age") <= 5);
+        assert_eq!(v["status"]["repairs"], 3);
+        assert!(v["ts"].as_u64().expect("ts") > 1_700_000_000);
+    }
+
+    #[test]
+    fn a_reading_the_writer_stopped_refreshing_is_reported_stale_not_current() {
+        let file = scratch("stale");
+        std::fs::write(&file, r#"{"ok":true}"#).expect("write");
+        let ten_minutes_ago = SystemTime::now() - Duration::from_secs(600);
+        File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(ten_minutes_ago))
+            .expect("age the file");
+        let v = parse(&payload(&args("tcp/127.0.0.1:1", &file, 60)));
+        assert_eq!(v["stale"], true);
+        assert!(v["reading_age_s"].as_u64().expect("age") >= 600);
+        // The old reading still travels, marked for what it is.
+        assert_eq!(v["status"]["ok"], true);
+    }
+
+    #[test]
+    fn a_missing_status_file_publishes_unavailable_not_nothing() {
+        let file = scratch("missing").with_file_name("never-written.json");
+        let v = parse(&payload(&args("tcp/127.0.0.1:1", &file, 60)));
+        assert_eq!(v["stale"], true);
+        assert_eq!(v["status"], Value::Null);
+        let why = v["unavailable"].as_str().expect("reason");
+        assert!(!why.is_empty() && !why.contains('"'), "{why}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_publish_reads_the_file_fresh_and_stopping_is_clean() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("ops/pod/health/**").await;
+        let file = scratch("live");
+        std::fs::write(&file, r#"{"reading":1}"#).expect("write");
+        // A one-second interval has a zero offset, so the first publish is immediate.
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(run(args(&pen.endpoint, &file, 1), async move {
+            let _ = stopped.await;
+            Ok(())
+        }));
+
+        let first = next_sample(&sub, ARRIVES).await.expect("first reading");
+        assert_eq!(first.key_expr().as_str(), "ops/pod/health/pod-example-01");
+        let body = String::from_utf8(first.payload().to_bytes().to_vec()).expect("utf-8");
+        assert_eq!(parse(&body)["status"]["reading"], 1);
+
+        std::fs::write(&file, r#"{"reading":2}"#).expect("rewrite");
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        loop {
+            let s = next_sample(&sub, ARRIVES).await.expect("next reading");
+            let body = String::from_utf8(s.payload().to_bytes().to_vec()).expect("utf-8");
+            if parse(&body)["status"]["reading"] == 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never re-read the file"
+            );
+        }
+
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_pen_fails_startup_loudly() {
+        let file = scratch("nopen");
+        let closed = format!(
+            "tcp/127.0.0.1:{}",
+            octo_arm_common::testing::free_tcp_port()
+        );
+        let err = run(args(&closed, &file, 60), async { Ok(()) })
+            .await
+            .expect_err("no pen");
+        assert!(
+            format!("{err:#}").contains("opening the pen session"),
+            "{err:#}"
+        );
+    }
 
     #[test]
     fn offset_is_within_the_interval() {

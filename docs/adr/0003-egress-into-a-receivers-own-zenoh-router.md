@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # ADR 0003: Egress Into a Receiver's Own Zenoh Router
 
 | Field | Value |

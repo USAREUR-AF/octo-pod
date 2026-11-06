@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # Synthetic inputs for the offline template tests. NOT the live pod — deliberately
 # different values, so a test that accidentally reads real host_vars fails loudly
 # instead of passing against production data.

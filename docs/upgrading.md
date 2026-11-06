@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Upgrades and rebuilds
 
 Use this guide for an existing pod. A new installation uses the

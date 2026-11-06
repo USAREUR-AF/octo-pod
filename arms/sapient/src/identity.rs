@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Who this pod is on a SAPIENT network, and the ids it stamps on what it sends.
 //!
 //! The `node_id` is minted once and kept. A node that registers under a new UUID after

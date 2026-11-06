@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! octo-egress: the pod's outbound direction.
 //!
 //! An inbound octo-pod arm gives each source its own identity, a namespace, an audit trail

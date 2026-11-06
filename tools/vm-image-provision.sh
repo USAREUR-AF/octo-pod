@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # vm-image-provision.sh: turn a fresh Ubuntu 24.04 build VM into the octo-pod golden image.
 #
 # Runs INSIDE the build VM, as root, started by tools/build-vm-image.sh. It expects the
@@ -186,7 +188,11 @@ stage_bundle() {
 
 install_octo_pod() {
   log "octo-pod package, built from this commit with the pins above"
-  (cd "${SRC}" && tools/build-release.sh >/dev/null) || die "tools/build-release.sh failed"
+  local epoch
+  epoch="$(sed -n 's/^octo_pod_commit_time: *\([0-9][0-9]*\)$/\1/p' "${BUILD}/BUILD_INFO")"
+  [[ -n "${epoch}" ]] || die "${BUILD}/BUILD_INFO has no octo_pod_commit_time; rebuild the bundle"
+  (cd "${SRC}" && SOURCE_DATE_EPOCH="${epoch}" tools/build-release.sh >/dev/null) \
+    || die "tools/build-release.sh failed"
   local deb
   deb="$(ls "${SRC}"/dist/octo-pod_*_all.deb)"
   apt-get install -y -qq "${deb}" >/dev/null || die "could not install ${deb}"
@@ -202,8 +208,12 @@ build_verify_venv() {
   VERIFY_ZENOH="$(sed -n 's/^verify_zenoh_version: *"\([^"]*\)".*/\1/p' "${GROUP_VARS}")"
   [[ -n "${VERIFY_ZENOH}" ]] || die "no verify_zenoh_version in ${GROUP_VARS}"
   log "verify's zenoh client: eclipse-zenoh ${VERIFY_ZENOH} in /opt/octo-verify/venv"
+  # Installed from a lock with every wheel's hash, so a substituted wheel fails the install.
+  local lock="${SRC}/tools/requirements/verify-zenoh.txt"
+  grep -qx "eclipse-zenoh==${VERIFY_ZENOH} \\\\" "${lock}" \
+    || die "${lock} does not pin eclipse-zenoh ${VERIFY_ZENOH}; regenerate it"
   python3 -m venv /opt/octo-verify/venv || die "could not create /opt/octo-verify/venv"
-  /opt/octo-verify/venv/bin/pip install -q --no-cache-dir "eclipse-zenoh==${VERIFY_ZENOH}" \
+  /opt/octo-verify/venv/bin/pip install -q --no-cache-dir --require-hashes -r "${lock}" \
     || die "could not install eclipse-zenoh ${VERIFY_ZENOH}"
 }
 

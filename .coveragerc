@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# Python test coverage: the CLI in bin/ and the tools that ship or gate a release.
+# platform/tests/run_with_coverage.py runs every suite under this file; read its
+# docstring before changing anything here.
+[run]
+branch = True
+parallel = True
+# The suites run most of the CLI as subprocesses. coverage starts in every Python
+# subprocess, so a script run by a test, or by a script a test runs, is measured.
+patch = subprocess
+# Tests copy bin/ and tools/ into scratch trees and run them there, so match by the
+# tail of the path, not by an absolute source directory.
+include =
+    */bin/octo-pod-*
+    */bin/octo_pod_*.py
+    */tools/*.py
+    */tools/oss/*.py
+    */tools/prove-sapient/*.py
+omit =
+    */site-packages/*
+    */lib/python3*/*
+    */platform/tests/*
+    # Translation tooling. It is private, the public export drops it, and
+    # .github/workflows/i18n.yml tests it.
+    */tools/i18n.py
+    */tools/build-docs.py
+    */tools/check-docs-i18n.py
+    # Proof harnesses: integration tests that run a real Zenoh router (and, for
+    # prove-sapient, a container under systemd). They are tests, not shipped code, like
+    # platform/tests.
+    */tools/prove-peer-access.py
+    */tools/prove-sapient/*
+
+[paths]
+# Every copy of a file counts toward the file in this repository.
+bin =
+    bin/
+    */bin/
+tools =
+    tools/
+    */tools/
+
+[report]
+show_missing = True
+skip_covered = False
+precision = 1
+exclude_also =
+    if __name__ == .__main__.:

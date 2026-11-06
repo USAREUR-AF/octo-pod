@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # Dependency policy for the arms. COPIED FROM goat's deny.toml so the fleet has one
 # license allow-list and one set of bans, not two that drift. Sync it rather than
 # editing it locally: a crate allowed here and denied there is a question nobody

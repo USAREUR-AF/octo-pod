@@ -1,20 +1,26 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Releases and support
 
 ## Release status
 
 These guides describe `main`. The published
-[0.5.0 release](https://github.com/usareur-af/octo-pod/releases/tag/octo-pod-v0.5.0)
+[0.6.0 release](https://github.com/usareur-af/octo-pod/releases/tag/octo-pod-v0.6.0)
 includes the package, container bundle, checksums and signature bundle.
 
-| Capability | 0.4.0 | 0.5.0 |
-|---|---|---|
-| Podman/Quadlet, UDP/TCP ingress, peer publishing and local audit | Included | Included |
-| Gated uplink/downlink and UDP, TCP, TCP-server and SAPIENT destinations | Included | Included |
-| Peer LAN source controls, released peer reads and `peer bundle` | Not included | Included |
-| Publishing into a partner's router with `zenoh://` | Not included | Included |
-| Strict SAPIENT registration/status fixes and reference test receiver | Not included | Included |
-| Join checks the complete management origin before image fetch and convergence | Not included | Included |
-| Uplink bridge published and pinned with the arm images | Not included | Included |
+| Capability | 0.4.0 | 0.5.0 | 0.6.0 |
+|---|---|---|---|
+| Podman/Quadlet, UDP/TCP ingress, peer publishing and local audit | Included | Included | Included |
+| Gated uplink/downlink and UDP, TCP, TCP-server and SAPIENT destinations | Included | Included | Included |
+| Peer LAN source controls, released peer reads and `peer bundle` | Not included | Included | Included |
+| Publishing into a partner's router with `zenoh://` | Not included | Included | Included |
+| Strict SAPIENT registration/status fixes and reference test receiver | Not included | Included | Included |
+| Join checks the complete management origin before image fetch and convergence | Not included | Included | Included |
+| Uplink bridge published and pinned with the arm images | Not included | Included | Included |
+| Reproducible builds, signed image provenance, SLSA release provenance and an approved, signed release tag | Not included | Not included | Included |
 
 The image pins in `platform/group_vars/all/10-infrastructure.yml` are the images built for
 the current release. A change to arm code reaches a package only after the images are

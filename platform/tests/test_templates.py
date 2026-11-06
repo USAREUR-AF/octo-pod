@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """
 Offline tests for the generated pen config. No pod, no network, no docker.
 
@@ -2312,6 +2314,13 @@ def check_image_carries_what_the_playbooks_install():
     check("verify's zenoh client, the pen and the arms run one zenoh version",
           None not in versions and len(set(versions)) == 1,
           f"verify {versions[0]}, pen {versions[1]}, arms {versions[2]}")
+    # The image installs verify's client from a hashed lock; it must pin the same version.
+    lock = (HERE.parent.parent / "tools" / "requirements" / "verify-zenoh.txt").read_text()
+    locked = re.search(r"^eclipse-zenoh==([0-9.]+) \\$", lock, re.M)
+    check("the verify-zenoh lock pins verify_zenoh_version, with hashes",
+          locked is not None and pin is not None and locked.group(1) == pin.group(1)
+          and "--hash=sha256:" in lock,
+          f"lock {locked.group(1) if locked else None}, group_vars {pin.group(1) if pin else None}")
 
 
 def check_declare_set_firewall():

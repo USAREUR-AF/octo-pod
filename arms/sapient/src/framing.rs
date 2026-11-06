@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! SAPIENT frame extraction — a 4-byte length prefix whose BYTE ORDER IS DISCOVERED.
 //!
 //! The standard fixes the prefix at four bytes and says nothing an implementation can be

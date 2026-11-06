@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # tcp-ingest — octo-pod arm #2. Thin binary: TCP wire protocol + framing
 # only; session/keying/gating/stats come from octo-arm-common.
 #
@@ -27,6 +29,10 @@ tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+octo-arm-common = { workspace = true, features = ["test-support"] }
+zenoh = { workspace = true }
 
 [lints]
 workspace = true

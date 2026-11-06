@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! One SAPIENT message body, as three consumers read it:
 //!
 //! - the sapient arm's session (`sapient/src/session.rs`): `wire::decode`, then the fields

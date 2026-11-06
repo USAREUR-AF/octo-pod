@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every file states its copyright and license, in its own header or in REUSE.toml
+# (REUSE Specification 3.3). A new file without either fails this check.
+name: reuse
+
+on:
+  # Every pull request, so `reuse` always reports and can be a required check.
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Supersede an in-flight run for the same ref, but never on main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  reuse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: install reuse (pinned by hash)
+        run: python3 -m pip install --quiet --require-hashes -r tools/requirements/reuse.txt
+      - name: every file has copyright and license information
+        run: reuse lint

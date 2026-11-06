@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # octo-pod
 
 <!-- badges: the public repository's live status. The documentation book leaves this block out. -->

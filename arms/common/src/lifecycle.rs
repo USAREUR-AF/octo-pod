@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Lifecycle records: what a writing arm publishes on `<label>-session/<peer-ip>`.
 //!
 //! One flat JSON object per transition. Every writing arm carries `event`, `label`,

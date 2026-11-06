@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Where an egress arm may deliver: the one destination it was declared with.
 //!
 //! Three shapes, the mirror of the inbound arms, because a consumer connects the way it

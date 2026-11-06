@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # octo-pod: engineering principles
 
 **Scope:** the Podman-based appliance, 0.4.0 and later.

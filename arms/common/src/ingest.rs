@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The shared ingest path: gate → provenance key → queue → publish → count.
 //!
 //! Arms hand every unit of wire data (datagram, frame, line) to [`Ingestor::ingest`]
@@ -188,5 +190,150 @@ impl Ingestor {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{next_sample, TestPen, ARRIVES, QUIET};
+    use std::sync::atomic::Ordering;
+
+    async fn ingestor(pen: &TestPen, allow: &str) -> Arc<Ingestor> {
+        let session = pen.client().open().await.expect("open");
+        Arc::new(Ingestor::new(
+            Arc::new(session),
+            "raw/octo",
+            SourceAllowlist::from_csv(allow),
+        ))
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("socket address")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_allowed_unit_is_published_under_label_and_source_ip_unchanged() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let ing = ingestor(&pen, "192.0.2.").await;
+        let _drain = ing.spawn_drain();
+
+        ing.ingest("tracks", &addr("192.0.2.50:4000"), b"\x01\x02payload")
+            .await;
+
+        let sample = next_sample(&sub, ARRIVES).await.expect("published");
+        // Provenance is the source IP only; the source port never reaches the key.
+        assert_eq!(sample.key_expr().as_str(), "raw/octo/tracks/192-0-2-50");
+        assert_eq!(sample.payload().to_bytes().as_ref(), b"\x01\x02payload");
+        assert_eq!(*sample.encoding(), Encoding::APPLICATION_OCTET_STREAM);
+        assert_eq!(ing.stats.received.load(Ordering::Relaxed), 1);
+        assert_eq!(ing.stats.queued.load(Ordering::Relaxed), 1);
+        assert_eq!(ing.stats.dropped_source.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_outside_the_allowlist_is_counted_and_never_published() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let ing = ingestor(&pen, "192.0.2., 2001:db8:1:").await;
+        let _drain = ing.spawn_drain();
+
+        // 2001:db8:10::1 starts with "2001:db8:1" but not with the declared "2001:db8:1:".
+        // Both are documentation addresses (RFC 3849), unlike an IPv4 near-miss of
+        // "192.0.2.", which would have to leave 192.0.2.0/24.
+        ing.ingest("tracks", &addr("[2001:db8:10::1]:4000"), b"spoof")
+            .await;
+        ing.ingest("tracks", &addr("198.51.100.7:4000"), b"other")
+            .await;
+
+        assert!(next_sample(&sub, QUIET).await.is_none());
+        assert_eq!(ing.stats.received.load(Ordering::Relaxed), 2);
+        assert_eq!(ing.stats.dropped_source.load(Ordering::Relaxed), 2);
+        assert_eq!(ing.stats.queued.load(Ordering::Relaxed), 0);
+        assert!(ing.outbox.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicit_encoding_reaches_the_pen() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let ing = ingestor(&pen, "").await;
+        let _drain = ing.spawn_drain();
+
+        ing.ingest_with_encoding(
+            "cot",
+            &addr("[2001:db8::7]:9"),
+            b"<event/>",
+            Encoding::TEXT_XML,
+        )
+        .await;
+
+        let sample = next_sample(&sub, ARRIVES).await.expect("published");
+        assert_eq!(sample.key_expr().as_str(), "raw/octo/cot/2001-db8--7");
+        assert_eq!(*sample.encoding(), Encoding::TEXT_XML);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shared_gate_uses_its_own_allowlist_but_the_same_queue_and_counters() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let peer_gate = ingestor(&pen, "192.0.2.").await;
+        let own_gate = Arc::new(Ingestor::sharing(&peer_gate, SourceAllowlist::default()));
+        assert!(Arc::ptr_eq(&peer_gate.stats, &own_gate.stats));
+        assert!(Arc::ptr_eq(&peer_gate.outbox, &own_gate.outbox));
+        let _drain = peer_gate.spawn_drain();
+
+        // The box's own record has no vouched-for source; the open gate passes it.
+        own_gate
+            .ingest("lifecycle", &addr("203.0.113.9:1"), b"up")
+            .await;
+        // The peer gate still refuses the same address.
+        peer_gate
+            .ingest("tracks", &addr("203.0.113.9:1"), b"no")
+            .await;
+
+        let sample = next_sample(&sub, ARRIVES).await.expect("own record");
+        assert_eq!(sample.key_expr().as_str(), "raw/octo/lifecycle/203-0-113-9");
+        assert!(next_sample(&sub, QUIET).await.is_none());
+        assert_eq!(own_gate.stats.received.load(Ordering::Relaxed), 2);
+        assert_eq!(own_gate.stats.dropped_source.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_drain_counts_a_pen_outage_and_resumes_when_the_pen_returns() {
+        let pen = TestPen::start().await;
+        let port = pen.port();
+        let ing = ingestor(&pen, "").await;
+        let _drain = ing.spawn_drain();
+
+        pen.session.close().await.expect("stop the pen");
+        drop(pen);
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        while ing.stats.pen_outages.load(Ordering::Relaxed) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "outage never noticed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let pen = TestPen::start_on(port).await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        // Keep offering until the client has reconnected and the drain resumed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let sample = loop {
+            ing.ingest("tracks", &addr("192.0.2.1:1"), b"after").await;
+            if let Some(s) = next_sample(&sub, Duration::from_millis(500)).await {
+                break s;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "drain never resumed"
+            );
+        };
+        assert_eq!(sample.payload().to_bytes().as_ref(), b"after");
+        assert_eq!(ing.stats.pen_outages.load(Ordering::Relaxed), 1);
+        assert!(ing.stats.forwarded.load(Ordering::Relaxed) >= 1);
     }
 }

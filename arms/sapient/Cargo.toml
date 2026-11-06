@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # sapient — octo-pod session arm: BSI Flex 335 v2.0 over TCP.
 #
 # The second arm that holds a session and writes to its peer. A SAPIENT node cannot be
@@ -57,3 +59,4 @@ workspace = true
 
 [dev-dependencies]
 sapient-receiver = { path = "../sapient-receiver" }
+octo-arm-common = { workspace = true, features = ["test-support"] }

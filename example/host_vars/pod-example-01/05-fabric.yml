@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # THE FABRIC THIS POD JOINS — mesh, upstream, updates. From the token.
 #
 # Every value here names a host belonging to ONE deployment. That is the whole reason

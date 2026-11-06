@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # build-vm-image.sh: build the octo-pod golden VM image on an LXD host, from this commit.
 #
 #   tools/build-vm-image.sh --host <ssh-target> --manifest <packages.manifest> \
@@ -120,6 +122,9 @@ make_bundle() {
   {
     printf 'image: %s\n' "${IMAGE_ALIAS}"
     printf 'octo_pod_commit: %s\n' "$(git -C "${REPO}" rev-parse HEAD)"
+    # The archive carries no .git, and tools/build-release.sh takes every timestamp from
+    # the commit, so the commit time travels with it.
+    printf 'octo_pod_commit_time: %s\n' "$(git -C "${REPO}" log -1 --format=%ct)"
   } > "${TMP}/build/BUILD_INFO"
   # No extended attributes: macOS tar would otherwise carry its provenance xattrs, which
   # mean nothing on the host and make GNU tar warn about every file.

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """Render what the SAPIENT egress proof runs, from the platform's own templates.
 
   router-released.json5  the pen ACL with the destination released

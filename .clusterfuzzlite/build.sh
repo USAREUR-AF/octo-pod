@@ -1,4 +1,5 @@
 #!/bin/bash -eu
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
 # SPDX-License-Identifier: Apache-2.0
 #
 # ClusterFuzzLite build: compile every fuzz target in arms/fuzz with the sanitizer the

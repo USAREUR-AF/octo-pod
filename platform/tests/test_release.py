@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """
 What ends up on a pod. No network, no docker, no dpkg — this stages the release payload
 and asserts on the tree.
@@ -70,6 +72,141 @@ def release_docs_checks():
     gate = next(s["run"] for s in steps if s.get("name") == "the release is complete and verifiable")
     check("a site that was built but not published fails the release",
           'dist/octo-pod-docs-${v}.tar.gz' in gate and "documentation site was built but is not in the release" in gate)
+
+
+def release_reproducible_checks():
+    """The same commit builds to the same bytes, and CI proves it on every build change."""
+    import shutil
+    import yaml
+    print("\nreproducible builds: tools/build-release.sh, images.yml, reproducible.yml")
+    build = (REPO / "tools" / "build-release.sh").read_text()
+    check("no archive is written by a bare tar -czf",
+          "tar -czf" not in build, "use reproducible_tgz")
+    check("every tarball goes through the one reproducible writer",
+          build.count("reproducible_tgz \"$") == 3)
+    for flag in ("--sort=name", '--mtime="@$SOURCE_DATE_EPOCH"', "--owner=0 --group=0 --numeric-owner",
+                 "gzip -9n"):
+        check(f"tarballs use {flag}", flag in build)
+    check("timestamps come from the commit, never from the clock",
+          "git -C \"$REPO\" log -1 --format=%ct" in build and "export SOURCE_DATE_EPOCH" in build)
+    check("the package is xz on one thread, the same on every builder",
+          "-Zxz" in build and "--threads-max=1" in build)
+
+    images = yaml.safe_load((REPO / ".github/workflows/images.yml").read_text())
+    steps = images["jobs"]["build"]["steps"]
+    built = next(s for s in steps if s.get("id") == "build")
+    check("published images rewrite every layer timestamp to the commit time",
+          "rewrite-timestamp=true" in built["with"]["outputs"])
+    check("published images take SOURCE_DATE_EPOCH from the commit",
+          any("SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" in s.get("run", "") for s in steps))
+    pin = re.compile(r"image=moby/buildkit:v[0-9.]+@sha256:[0-9a-f]{64}")
+    buildx = next(s for s in steps if s.get("uses", "").startswith("docker/setup-buildx-action@"))
+    images_kit = buildx.get("with", {}).get("driver-opts", "")
+    check("images.yml pins BuildKit by digest", bool(pin.fullmatch(images_kit)), images_kit)
+
+    repro = yaml.safe_load((REPO / ".github/workflows/reproducible.yml").read_text())
+    rsteps = repro["jobs"]["reproducible-image"]["steps"]
+    rbuildx = next(s for s in rsteps if s.get("uses", "").startswith("docker/setup-buildx-action@"))
+    check("reproducible.yml builds with the same BuildKit images.yml publishes with",
+          rbuildx.get("with", {}).get("driver-opts") == images_kit)
+    runs = " ".join(s.get("run", "") for s in repro["jobs"]["reproducible"]["steps"])
+    check("CI builds the release twice and proves the comparison can fail",
+          "tools/check-reproducible.sh" in runs and "--plant" in runs)
+
+    bundle = (REPO / "tools" / "build-airgap-bundle.sh").read_text()
+    check("the bundle's tool images are pinned by digest",
+          all(re.search(rf'^{v}="sha256:[0-9a-f]{{64}}"', bundle, re.M)
+              for v in ("SKOPEO_DIGEST", "REGISTRY_DIGEST")))
+
+    # Live, where the tools exist: two builds of HEAD in fresh checkouts, then a planted
+    # one-second difference that the comparison must catch.
+    gnu = any(shutil.which(t) and "GNU tar" in subprocess.run([t, "--version"], capture_output=True,
+                                                             text=True).stdout
+              for t in ("gtar", "tar"))
+    inside_git = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"],
+                                capture_output=True).returncode == 0
+    if not (gnu and inside_git):
+        print("  NOTE  live reproducibility check skipped: needs GNU tar and a git checkout")
+        return
+    script = str(REPO / "tools" / "check-reproducible.sh")
+    r = subprocess.run([script], capture_output=True, text=True)
+    check("HEAD built twice produces identical release artifacts", r.returncode == 0,
+          (r.stdout + r.stderr)[-600:])
+    r = subprocess.run([script, "--plant"], capture_output=True, text=True)
+    check("a planted timestamp difference is caught", r.returncode == 0 and "caught" in r.stdout,
+          (r.stdout + r.stderr)[-600:])
+
+
+def release_signed_tag_checks():
+    """A release starts only from an annotated tag that GitHub verifies as signed.
+
+    Runs the workflow's own step against a stub `gh` that returns canned API responses,
+    so an edit that weakens a refusal fails here.
+    """
+    import json
+    import os
+    import shutil
+    import yaml
+    print("\nrelease signed tag: .github/workflows/release.yml")
+    wf = yaml.safe_load((REPO / ".github" / "workflows" / "release.yml").read_text())
+    steps = wf["jobs"]["build"]["steps"]
+    name = "the release tag is signed and GitHub verifies it"
+    step = next((s for s in steps if s.get("name") == name), None)
+    check("the build job checks the release tag's signature", step is not None)
+    if step is None:
+        return
+    check("the tag check runs on a tag push only, so a dry run is unaffected",
+          step.get("if") == "github.event_name == 'push'")
+    order = [s.get("name") or s.get("id") or s.get("uses", "") for s in steps]
+    check("the tag check runs before anything is built or signed",
+          order.index(name) < order.index("build")
+          and order.index(name) < order.index("Sign SHA256SUMS (keyless, sigstore OIDC)"), str(order))
+    if shutil.which("jq") is None:
+        check("jq is installed, to run the tag check", False, "install jq")
+        return
+
+    commit = "c" * 40
+    tag_sha = "t" * 40
+
+    def run(ref_type, verified, target, target_type="commit"):
+        ref = {"object": {"type": ref_type, "sha": tag_sha if ref_type == "tag" else commit}}
+        tag = {"tag": "octo-pod-v9.9.9", "tagger": {"name": "A Maintainer"},
+               "object": {"type": target_type, "sha": target},
+               "verification": {"verified": verified, "reason": "valid" if verified else "unsigned"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = pathlib.Path(tmp)
+            (bindir / "ref.json").write_text(json.dumps(ref))
+            (bindir / "tag.json").write_text(json.dumps(tag))
+            stub = bindir / "gh"
+            stub.write_text(
+                "#!/bin/sh\n"
+                'case "$2" in\n'
+                f'  */git/ref/tags/octo-pod-v9.9.9) cat "{bindir}/ref.json" ;;\n'
+                f'  */git/tags/{tag_sha}) cat "{bindir}/tag.json" ;;\n'
+                '  *) echo "unexpected: $*" >&2; exit 1 ;;\n'
+                "esac\n")
+            stub.chmod(0o755)
+            env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}",
+                       GITHUB_REPOSITORY="example/octo-pod", GITHUB_REF_NAME="octo-pod-v9.9.9",
+                       GITHUB_SHA=commit)
+            return subprocess.run(["bash", "-c", step["run"]], capture_output=True, text=True, env=env)
+
+    r = run("tag", True, commit)
+    check("a signed, verified tag on the built commit is accepted", r.returncode == 0,
+          (r.stdout + r.stderr).strip())
+    r = run("commit", True, commit)
+    check("a lightweight tag is refused", r.returncode == 1 and "lightweight tag" in r.stdout,
+          (r.stdout + r.stderr).strip())
+    r = run("tag", False, commit)
+    check("an annotated tag GitHub does not verify is refused",
+          r.returncode == 1 and "does not verify the signature" in r.stdout and "unsigned" in r.stdout,
+          (r.stdout + r.stderr).strip())
+    r = run("tag", True, "d" * 40)
+    check("a verified tag on another commit is refused",
+          r.returncode == 1 and "does not point at the commit" in r.stdout, (r.stdout + r.stderr).strip())
+    r = run("tag", True, tag_sha, target_type="tag")
+    check("a verified tag that points at another tag is refused",
+          r.returncode == 1 and "does not point at the commit" in r.stdout, (r.stdout + r.stderr).strip())
 
 
 def release_provenance_checks():
@@ -226,10 +363,11 @@ def main():
 
         # THE ONE THAT MATTERS. A release goes to every site at once, so anything
         # credential-shaped in it is published to the whole fleet.
-        secrets = [f for f in rel
-                   if f.endswith((".pem", ".key", ".p12", ".jks"))
-                   or pathlib.Path(f).name in (".env", "setup-key", "id_rsa")]
-        check("no credential material in the payload", not secrets, str(secrets))
+        credential_files = [f for f in rel
+                            if f.endswith((".pem", ".key", ".p12", ".jks"))
+                            or pathlib.Path(f).name in (".env", "setup-key", "id_rsa")]
+        check("no credential material in the payload", not credential_files,
+              str(credential_files))
 
         # Build noise and local state.
         junk = [f for f in rel
@@ -286,8 +424,10 @@ def main():
           all(d in depends for d in ("podman (>= 4.7)", "skopeo", "nftables", "openssl",
                                      "ansible-core", "bash-completion")), depends)
 
+    release_signed_tag_checks()
     release_provenance_checks()
     release_docs_checks()
+    release_reproducible_checks()
 
     # NOTICES. The arm images ship LICENSE, NOTICE and the third-party notices; the image
     # build context is arms/, so arms/ holds checked copies of the first two.
@@ -316,6 +456,12 @@ def main():
           deny_ids == osv_ids, f"deny {sorted(deny_ids)} osv {sorted(osv_ids)}")
     check("every osv-scanner ignore has a reason and an expiry date",
           all(e.get("reason") and e.get("ignoreUntil") for e in osv_entries))
+    # The Python locks carry their own triage file, read by osv-scanner, Scorecard and
+    # the pip-audit step. The same rule: every entry explains itself and expires.
+    py_osv = REPO / "tools" / "requirements" / "osv-scanner.toml"
+    py_entries = tomllib.loads(py_osv.read_text()).get("IgnoredVulns", []) if py_osv.is_file() else []
+    check("every Python lock ignore has a reason and an expiry date",
+          all(e.get("reason") and e.get("ignoreUntil") for e in py_entries))
     ci_text = (REPO / ".github" / "workflows" / "ci.yml").read_text()
     audit_ids = set(re.findall(r"--ignore (RUSTSEC-\d{4}-\d{4})", ci_text))
     check("cargo-audit ignores only advisories deny.toml explains",

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The SAPIENT wire frame: a 4-byte little-endian length prefix, then that many bytes of
 //! a serialized SapientMessage. This is the one framing the pod's sapient arm emits
 //! (`framing::ByteOrder::Le` there), so a receiver that reads le32 reads the pod exactly.
@@ -63,6 +65,21 @@ mod tests {
         assert_eq!(got.as_deref(), Some(&b"hello sapient"[..]));
         // A second read past the one frame is a clean end, not an error.
         assert_eq!(read_frame(&mut cur).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_zero_length_frame() {
+        // An empty SapientMessage is not a message anyone sent; a zero prefix is a desync.
+        let mut cur = Cursor::new(0u32.to_le_bytes().to_vec());
+        let err = read_frame(&mut cur).await.unwrap_err().to_string();
+        assert!(err.contains("frame length 0"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_body_shorter_than_its_prefix_is_an_error() {
+        let mut bytes = 8u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"four");
+        assert!(read_frame(&mut Cursor::new(bytes)).await.is_err());
     }
 
     #[tokio::test]

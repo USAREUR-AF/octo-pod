@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 <a id="supply-posture-what-a-pod-is-allowed-to-reach-for"></a>
 
 # Supply posture: permitted artifact sources

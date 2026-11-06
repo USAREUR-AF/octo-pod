@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # cargo-about's input for THIRD_PARTY_LICENSES.md, the notices every arm image ships.
 # The accepted list is deny.toml's [licenses].allow; test_release.py checks they agree.
 accepted = [

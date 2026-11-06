@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+name: reproducible
+# The same commit, built twice, must produce the same bytes. Each check also plants a
+# one-second difference in the commit time and requires the comparison to notice, so a
+# comparison that cannot fail does not pass. docs/reproducible-builds.md has the detail
+# and the steps anyone can run against a published release.
+on:
+  pull_request:
+    paths:
+      - 'tools/build-release.sh'
+      - 'tools/check-reproducible.sh'
+      - 'tools/build-airgap-bundle.sh'
+      - 'arms/**'
+      - '.github/workflows/reproducible.yml'
+      - '.github/workflows/images.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/build-release.sh'
+      - 'tools/check-reproducible.sh'
+      - 'tools/build-airgap-bundle.sh'
+      - 'arms/**'
+      - '.github/workflows/reproducible.yml'
+      - '.github/workflows/images.yml'
+  # Weekly as well: the runner's tar, gzip and dpkg change without a commit here.
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproducible:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      # A fixed stand-in for the documentation site: what is under test is how the
+      # release packages a site, not how mdBook renders one.
+      - name: a documentation site to package
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/site"
+          cp docs/*.md "$RUNNER_TEMP/site/"
+          printf '<!doctype html><title>octo-pod</title>\n' > "$RUNNER_TEMP/site/index.html"
+
+      - name: release artifacts and the udp-ingest binary, built twice
+        run: tools/check-reproducible.sh --docs "$RUNNER_TEMP/site" --arm udp-ingest
+
+      - name: the comparison catches a planted timestamp
+        run: tools/check-reproducible.sh --docs "$RUNNER_TEMP/site" --plant
+
+  reproducible-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # The same BuildKit images.yml publishes with. Bump both together.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+
+      # Built as images.yml builds it (commit time, rewritten layer timestamps), without
+      # the attestations, which record the build time by design. The image manifest is
+      # what must match: its digest covers the config and every layer.
+      - name: the udp-ingest image, built twice without cache
+        run: |
+          set -euo pipefail
+          sde="$(git log -1 --format=%ct)"
+          build() {  # build <name> <source date epoch> [extra buildx args]
+            local name="$1" epoch="$2"; shift 2
+            SOURCE_DATE_EPOCH="$epoch" docker buildx build "$@" --platform linux/amd64 \
+              --provenance=false --sbom=false -f arms/udp-ingest/Dockerfile \
+              --output "type=oci,dest=$RUNNER_TEMP/$name.tar,rewrite-timestamp=true" arms
+            mkdir -p "$RUNNER_TEMP/$name"
+            tar -xf "$RUNNER_TEMP/$name.tar" -C "$RUNNER_TEMP/$name"
+            jq -r '.manifests[0].digest' "$RUNNER_TEMP/$name/index.json"
+          }
+          describe() {  # describe <name>
+            local m
+            m="$(jq -r '.manifests[0].digest' "$RUNNER_TEMP/$1/index.json")"
+            jq -c '{config: .config.digest, layers: [.layers[].digest]}' \
+              "$RUNNER_TEMP/$1/blobs/sha256/${m#sha256:}"
+          }
+          one="$(build first "$sde" --no-cache)"
+          two="$(build second "$sde" --no-cache)"
+          if [ "$one" != "$two" ]; then
+            echo "::error::udp-ingest built twice from one commit: $one and $two"
+            describe first; describe second
+            exit 1
+          fi
+          echo "udp-ingest image manifest, both builds: $one"
+          # The cache changes nothing. A file the image never copies changes the build
+          # context, so this build reuses the compiled-dependency layer from the builds
+          # above and runs the final `cargo build` again over it. It must produce the
+          # image the uncached builds produced.
+          touch arms/.cache-probe
+          cached="$(build cached "$sde")"
+          rm arms/.cache-probe
+          if [ "$cached" != "$one" ]; then
+            echo "::error::udp-ingest built over cached dependencies differs: $cached, uncached $one"
+            describe first; describe cached
+            exit 1
+          fi
+          echo "built over cached dependencies, the same image: $cached"
+          # The planted difference: the same commit with the clock one second later,
+          # cache allowed. A comparison that cannot see this proves nothing.
+          planted="$(build planted "$((sde + 1))")"
+          if [ "$planted" = "$one" ]; then
+            echo "::error::a planted timestamp did not change the image manifest"
+            exit 1
+          fi
+          echo "planted timestamp caught: $planted"

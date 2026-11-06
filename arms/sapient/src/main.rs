@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! sapient — octo-pod session arm: BSI Flex 335 v2.0 over TCP.
 //!
 //! A SAPIENT connection has two roles. The **ASM** is the sensor side: it connects,
@@ -209,8 +211,23 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     octo_arm_common::init_tracing();
-    let args = Args::parse();
+    let code = run(Args::parse(), async {
+        tokio::signal::ctrl_c().await.context("waiting for ctrl-c")
+    })
+    .await?;
+    if code != 0 {
+        std::process::exit(code.into());
+    }
+    Ok(())
+}
 
+/// Exit code for a `sapient://` declaration the arm refuses to run with.
+const REFUSED: u8 = 2;
+
+/// The whole arm, until `shutdown` resolves. `Ok(REFUSED)` is a declaration it will not
+/// serve (nothing opened); an error is a fault for the supervisor to restart.
+#[allow(clippy::too_many_lines)] // one linear setup; splitting it hides the order
+async fn run(args: Args, shutdown: impl std::future::Future<Output = Result<()>>) -> Result<u8> {
     let role = Role::parse(&args.role)?;
     let framing = match args.framing.trim() {
         "" => None,
@@ -255,7 +272,7 @@ async fn main() -> Result<()> {
             ) {
                 let _ = hook.event("refused", serde_json::json!({ "reason": why }));
             }
-            std::process::exit(2);
+            return Ok(REFUSED);
         }
     };
     let audit = match &egress_plan {
@@ -411,15 +428,13 @@ async fn main() -> Result<()> {
         Some(ingress.outbox.clone()),
     );
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("waiting for ctrl-c")?;
+    shutdown.await?;
     info!("shutdown signal received");
     stats.abort();
     drain.abort();
     peer.abort();
     publisher.abort();
-    Ok(())
+    Ok(0)
 }
 
 /// Subscribe to the relay key and hand each sample to the session, stamped with when and
@@ -545,6 +560,355 @@ mod tests {
             .and_then(|a| a.get_help())
             .map(|h| h.to_string())
             .unwrap_or_default()
+    }
+
+    use octo_arm_common::testing::{free_tcp_port, next_sample, TestPen, ARRIVES, QUIET};
+    use prost::Message;
+    use sapient::proto::v2::{sapient_message::Content, DetectionReport, SapientMessage};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    const SENSOR: &str = "00000000-0000-4000-8000-00000000bbbb";
+    const KEY: &str = "894aee26d8146f54a0e949eb66acc40c/sensors/radar1/sapient/detections";
+
+    fn scratch(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("sapient-arm-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.to_string_lossy().into_owned()
+    }
+
+    fn args(name: &str, extra: &[&str]) -> Args {
+        let state = scratch(name);
+        let mut argv = vec![
+            "sapient".to_string(),
+            "--state-dir".into(),
+            format!("{state}/state"),
+            "--audit-dir".into(),
+            format!("{state}/audit"),
+            "--status-interval-s".into(),
+            "1".into(),
+        ];
+        argv.extend(extra.iter().map(ToString::to_string));
+        Args::try_parse_from(argv).unwrap()
+    }
+
+    fn start(args: Args) -> (oneshot::Sender<()>, tokio::task::JoinHandle<Result<u8>>) {
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(run(args, async move {
+            let _ = stopped.await;
+            Ok(())
+        }));
+        (stop, task)
+    }
+
+    fn registration() -> SapientMessage {
+        let mut m = sapient_receiver::json::decode(include_str!(
+            "../../sapient-receiver/tests/vectors/true/Registration.FollowObject.json"
+        ))
+        .unwrap();
+        m.node_id = Some(SENSOR.into());
+        m
+    }
+
+    fn detection() -> SapientMessage {
+        SapientMessage {
+            node_id: Some(SENSOR.into()),
+            content: Some(Content::DetectionReport(DetectionReport {
+                report_id: Some("01J00000000000000000000000".into()),
+                object_id: Some("01J00000000000000000000001".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    async fn send(sock: &mut TcpStream, msg: &SapientMessage) {
+        sock.write_all(&wire::encode(msg, framing::ByteOrder::Le))
+            .await
+            .unwrap();
+    }
+
+    async fn recv(sock: &mut TcpStream) -> SapientMessage {
+        let mut hdr = [0u8; 4];
+        tokio::time::timeout(ARRIVES, sock.read_exact(&mut hdr))
+            .await
+            .expect("a frame in time")
+            .unwrap();
+        let mut body = vec![0u8; u32::from_le_bytes(hdr) as usize];
+        sock.read_exact(&mut body).await.unwrap();
+        SapientMessage::decode(body.as_slice()).unwrap()
+    }
+
+    async fn dial(port: u16) -> TcpStream {
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        loop {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+                return s;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listener never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contradictory_or_incomplete_declarations_are_refused_at_startup() {
+        for (extra, why) in [
+            (
+                &["--target", "192.0.2.1:48000", "--listen", "48000"][..],
+                "not both",
+            ),
+            (&[][..], "give --target"),
+            (
+                &["--listen", "48000", "--role", "asm"][..],
+                "implies the DMM role",
+            ),
+            (
+                &["--listen", "48000", "--role", "client"][..],
+                "implies the DMM role",
+            ),
+            (
+                &["--target", "192.0.2.1:48000", "--role", "both"][..],
+                "both",
+            ),
+            (
+                &["--target", "192.0.2.1:48000", "--framing", "middle"][..],
+                "middle",
+            ),
+            (
+                &["--target", "192.0.2.1:48000", "--node-type", "TOASTER"][..],
+                "TOASTER",
+            ),
+        ] {
+            let err = run(args("refuse", extra), async { Ok(()) })
+                .await
+                .expect_err(why);
+            assert!(format!("{err:#}").contains(why), "{extra:?}: {err:#}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn as_a_dmm_it_acknowledges_a_sensor_and_captures_every_stream_on_the_pen() {
+        let pen = TestPen::start().await;
+        let data = pen.subscribe("raw/octo/sapient/**").await;
+        let mirror = pen.subscribe("raw/octo/sapient-egress/**").await;
+        let records = pen.subscribe("raw/octo/sapient-session/**").await;
+        let port = free_tcp_port();
+        let (stop, task) = start(args(
+            "dmm",
+            &[
+                "--listen",
+                &port.to_string(),
+                "--role",
+                "dmm",
+                "--endpoint",
+                &pen.endpoint,
+                // The gate admits the sensor's address; the arm's own records bypass it.
+                "--allow-sources",
+                "127.0.0.",
+            ],
+        ));
+
+        let mut sensor = dial(port).await;
+        send(&mut sensor, &registration()).await;
+        let ack = recv(&mut sensor).await;
+        assert_eq!(wire::registration_ack_of(&ack).map(|a| a.0), Some(true));
+        assert_eq!(ack.destination_id.as_deref(), Some(SENSOR));
+
+        // Inbound: the sensor's frame, raw, keyed by its address.
+        let s = next_sample(&data, ARRIVES).await.expect("inbound frame");
+        assert_eq!(s.key_expr().as_str(), "raw/octo/sapient/127-0-0-1");
+        assert!(wire::is_registration(
+            &wire::decode(&s.payload().to_bytes()).unwrap()
+        ));
+        // The mirror: exactly what went on the wire, length prefix included.
+        let m = next_sample(&mirror, ARRIVES).await.expect("egress mirror");
+        let wire_bytes = m.payload().to_bytes();
+        assert_eq!(
+            u32::from_le_bytes(wire_bytes[..4].try_into().unwrap()) as usize,
+            wire_bytes.len() - 4
+        );
+        assert!(wire::registration_ack_of(&wire::decode(&wire_bytes[4..]).unwrap()).is_some());
+        // Lifecycle, as JSON.
+        let r = next_sample(&records, ARRIVES)
+            .await
+            .expect("session record");
+        assert_eq!(*r.encoding(), Encoding::APPLICATION_JSON);
+        let _: serde_json::Value = serde_json::from_slice(&r.payload().to_bytes()).unwrap();
+
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn as_a_sensor_it_registers_heartbeats_and_relays_only_what_its_role_may_say() {
+        let pen = TestPen::start().await;
+        let dmm = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = dmm.local_addr().unwrap().to_string();
+        let (stop, task) = start(args(
+            "asm",
+            &[
+                "--target",
+                &target,
+                "--role",
+                "asm",
+                "--framing",
+                "len32le",
+                "--relay-key",
+                "ops/relay/sapient",
+                "--endpoint",
+                &pen.endpoint,
+            ],
+        ));
+
+        let (mut conn, _) = tokio::time::timeout(ARRIVES, dmm.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let reg = recv(&mut conn).await;
+        assert!(wire::is_registration(&reg));
+        let ours = reg.node_id.clone().expect("the arm's node id");
+        send(
+            &mut conn,
+            &wire::registration_ack(SENSOR, Some(ours.clone()), true),
+        )
+        .await;
+
+        // A refused kind first (an ASM may not send a RegistrationAck), then a detection.
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        let relayed = loop {
+            for msg in [wire::registration_ack(SENSOR, None, true), detection()] {
+                pen.session
+                    .put("ops/relay/sapient", msg.encode_to_vec())
+                    .await
+                    .unwrap();
+            }
+            let got = recv(&mut conn).await;
+            assert!(
+                wire::registration_ack_of(&got).is_none(),
+                "a relayed RegistrationAck reached the controller"
+            );
+            if matches!(got.content, Some(Content::DetectionReport(_))) {
+                break got;
+            }
+            assert!(
+                matches!(got.content, Some(Content::StatusReport(_))),
+                "unexpected {}",
+                wire::content_name(&got)
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "detection never relayed"
+            );
+        };
+        // On the wire the message is the arm's: its node id, not the source's.
+        assert_eq!(relayed.node_id.as_deref(), Some(ours.as_str()));
+        assert!(relayed.timestamp.is_some());
+
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn as_an_egress_destination_it_relays_released_keys_and_writes_nothing_to_the_pen() {
+        let pen = TestPen::start().await;
+        let captured = pen.subscribe("raw/octo/**").await;
+        let dmm = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = dmm.local_addr().unwrap().to_string();
+        let a = args(
+            "egress",
+            &[
+                "--target",
+                &target,
+                "--role",
+                "asm",
+                "--framing",
+                "len32le",
+                "--egress-keys",
+                KEY,
+                "--allow-dest",
+                &target,
+                "--endpoint",
+                &pen.endpoint,
+                "--arm-id",
+                "c2-sapient",
+            ],
+        );
+        let audit_dir = a.audit_dir.clone();
+        let (stop, task) = start(a);
+
+        let (mut conn, _) = tokio::time::timeout(ARRIVES, dmm.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let reg = recv(&mut conn).await;
+        send(
+            &mut conn,
+            &wire::registration_ack(SENSOR, reg.node_id.clone(), true),
+        )
+        .await;
+
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        loop {
+            pen.session
+                .put(format!("downlink/{KEY}"), detection().encode_to_vec())
+                .await
+                .unwrap();
+            if matches!(
+                recv(&mut conn).await.content,
+                Some(Content::DetectionReport(_))
+            ) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never relayed");
+        }
+        // Nothing the session saw, sent or recorded went back onto the pen.
+        assert!(next_sample(&captured, QUIET).await.is_none());
+
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 0);
+        let audit = std::fs::read_to_string(
+            std::path::Path::new(&audit_dir).join("c2-sapient-egress.ndjson"),
+        )
+        .unwrap();
+        let kinds: Vec<String> = audit
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["kind"].to_string())
+            .collect();
+        for kind in ["\"start\"", "\"session\"", "\"sent\""] {
+            assert!(
+                kinds.iter().any(|k| k == kind),
+                "no {kind} line in {kinds:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sapient_destination_outside_its_allow_list_exits_2_having_opened_nothing() {
+        let a = args(
+            "refused-dest",
+            &[
+                "--target",
+                "192.0.2.10:48000",
+                "--role",
+                "asm",
+                "--egress-keys",
+                KEY,
+                "--allow-dest",
+                "192.0.2.11:48000",
+            ],
+        );
+        let audit_dir = a.audit_dir.clone();
+        assert_eq!(run(a, async { Ok(()) }).await.unwrap(), REFUSED);
+        let audit =
+            std::fs::read_to_string(std::path::Path::new(&audit_dir).join("sapient-egress.ndjson"))
+                .unwrap();
+        assert_eq!(audit.lines().count(), 1);
+        assert!(audit.contains("\"kind\":\"refused\""), "{audit}");
     }
 
     /// `--help` is what an operator reads at the box. A stray line once opened the relay

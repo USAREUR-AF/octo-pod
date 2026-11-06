@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The SAPIENT test receiver's protobuf JSON decoder (`sapient_receiver::json::decode`)
 //! and the reference-rule validator behind it (`validate::violations`).
 //!

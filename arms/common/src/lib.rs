@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! octo-arm-common — the shared body every octo-pod arm plugs into.
 //!
 //! An arm is a thin binary that owns exactly one thing: its wire protocol
@@ -27,6 +29,8 @@ pub mod outbox;
 pub mod session;
 pub mod source;
 pub mod stats;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 pub use framing::{FrameBuf, Framing};
 pub use ingest::Ingestor;

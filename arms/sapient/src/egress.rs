@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Egress mode: this arm as a `sapient://` destination of the pod's egress.
 //!
 //! Declared with fabric keys (`SAPIENT_EGRESS_KEYS`), the arm is one of the pod's egress

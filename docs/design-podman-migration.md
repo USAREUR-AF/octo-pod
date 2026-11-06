@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 <a id="podmanquadlet-migration-one-container-runtime-across-the-estate"></a>
 
 # Podman/Quadlet migration: one container runtime across deployments

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # bash completion for octo-pod.  Installed to /usr/share/bash-completion/completions.
 #
 # WHAT IS WORTH COMPLETING, and it is not mainly the verbs. The verbs are on one help

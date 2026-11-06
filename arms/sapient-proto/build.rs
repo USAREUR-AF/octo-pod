@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Compile the vendored BSI Flex 335 v2.0 definitions into Rust types.
 //!
 //! protox rather than protoc: it is a pure-Rust compiler, so nothing but cargo is needed

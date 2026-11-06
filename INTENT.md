@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Licensing intent
 
 The intent is that this software and documentation ("Project") should be treated as if it is licensed under the license associated with the Project ("License") in the [LICENSE](LICENSE) file. However, because the Project was written by United States (U.S.) Federal government employees, it is not that simple.

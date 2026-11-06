@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Release pattern
 
 This page describes how a change moves from a commit to a running pod, which gate
@@ -21,29 +26,35 @@ status: enforced by the platform, automated, done by hand, or not yet in place.
 3. **Merge.** Pull requests are squash-merged. History on `main` is linear, and force
    pushes and deletion are refused.
 4. **Images.** After a merge that changes `arms/`, `images.yml` builds every arm for
-   amd64 and arm64, attaches an SBOM and build provenance, publishes one multi-arch
-   manifest per arm, and checks that both platform SBOMs are present.
-5. **Pin.** The new image digests are recorded in
-   `platform/group_vars/all/10-infrastructure.yml` through a pull request, which passes
-   the same checks as step 2.
-6. **Tag.** A release starts from a tag named `octo-pod-v<version>`. Only maintainers
-   can create, move, or delete tags.
-7. **Release.** `release.yml` checks that the tag matches `VERSION`, builds the package
-   and the carried image bundle, refuses a bundle that does not carry every pinned
-   digest, signs `SHA256SUMS` with a keyless Sigstore certificate issued to this
-   repository's release workflow, verifies that signature the way a pod will, and
-   publishes the release.
-8. **Install.** `tools/install-to-pod.sh` downloads the release, verifies the signature
+   amd64 and arm64, attaches an SBOM and build provenance, signs a provenance
+   attestation for each multi-arch manifest, publishes one manifest per arm, and checks
+   that both platform SBOMs are present.
+5. **Pin.** `tools/pin-images.sh` records the new image digests in
+   `platform/group_vars/all/10-infrastructure.yml`, but only digests that `images.yml`
+   signed on `main`. The pin reaches `main` through a pull request, which passes the same
+   checks as step 2 and the `signed-pins` check.
+6. **Tag.** A release starts from a signed, annotated tag named `octo-pod-v<version>`,
+   created with `git tag -s` by a maintainer whose signing key is registered on GitHub.
+   Only maintainers can create, move, or delete tags.
+7. **Approve.** The release job waits in the `release` environment until a release
+   approver other than the person who pushed the tag approves it.
+8. **Release.** `release.yml` refuses a tag that is lightweight, that GitHub does not
+   verify as signed, or that does not match `VERSION`. It then builds the package and
+   the carried image bundle, refuses a bundle that does not carry every pinned digest,
+   signs `SHA256SUMS` with a keyless Sigstore certificate issued to this repository's
+   release workflow, verifies that signature the way a pod will, publishes the release,
+   and attaches SLSA provenance for every file that `SHA256SUMS` lists.
+9. **Install.** `tools/install-to-pod.sh` downloads the release, verifies the signature
    on `SHA256SUMS`, checks each file against it, and only then copies the package to the
    pod. It checks the hash again before `dpkg` reads the file. The checks have no skip
    option.
-9. **Bring up.** On the pod: `bootstrap` prepares the host and loads the carried
+10. **Bring up.** On the pod: `bootstrap` prepares the host and loads the carried
    images, `init` or `join` gives the pod its identity, `check` and `apply` run the
    digest-pinned services, and `verify` and `verify-flowing` prove that the pod works
    and that data moves.
-10. **Run.** Certificates renew on the pod and supported service faults are repaired.
+11. **Run.** Certificates renew on the pod and supported service faults are repaired.
     Neither changes the pod's declaration.
-11. **Upgrade.** `octo-pod upgrade` verifies the release signature before it switches
+12. **Upgrade.** `octo-pod upgrade` verifies the release signature before it switches
     versions, and keeps the previous version for rollback.
 
 ## Who signs, and who trusts it
@@ -90,15 +101,18 @@ sha256sum -c --ignore-missing SHA256SUMS
 | Image builds on pull requests, CodeQL | Run on pull requests; not required |
 | Tag creation | Limited to maintainers |
 | Image build, SBOM, provenance, multi-arch | Automated after merge |
-| Image digest pins | Updated by hand through a pull request |
-| Signatures on the images themselves | Not yet in place |
+| Signed provenance attestation on each image | Automated after merge |
+| Image digest pins signed by `images.yml` on `main` (`signed-pins`) | Runs on every pull request; not yet required |
+| Signed, verified release tag | Enforced by the release workflow |
+| Approval before a release, by a second person | Enforced by the `release` environment; administrators can bypass |
 | Release signing and self-verification | Automated |
-| Approval before a release | Tag permission only |
+| SLSA provenance for every release file | Automated |
 | Signature and checksum check on install and upgrade | Enforced by the tools |
+| Image provenance check when a pod pulls from a registry | Not yet in place |
 
 ## Planned
 
-- Sign each image with cosign and verify the signature when a pod pulls from a registry.
-- Open the pin pull request from `images.yml` instead of copying digests by hand.
-- Require the `catalogs` check on every pull request.
-- Require an approval before the release workflow publishes.
+- Verify each image's provenance when a pod pulls from a registry.
+- Open the pin pull request from `images.yml` instead of running `tools/pin-images.sh` by
+  hand.
+- Require the `signed-pins` check on every pull request.

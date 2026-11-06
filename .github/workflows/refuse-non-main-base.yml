@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 name: refuse-non-main-base
 
 # Every pull request targets main. A pull request stacked on another branch lands in a

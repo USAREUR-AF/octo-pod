@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! zenoh-egress-arm: deliver released downlink keys into a partner's OWN Zenoh router,
 //! instead of a raw socket.
 //!
@@ -163,7 +165,17 @@ fn plan(args: &Args) -> Result<Plan, String> {
 #[tokio::main]
 async fn main() -> ExitCode {
     octo_arm_common::init_tracing();
-    let args = Args::parse();
+    ExitCode::from(
+        arm(Args::parse(), async {
+            tokio::signal::ctrl_c().await.context("waiting for ctrl-c")
+        })
+        .await,
+    )
+}
+
+/// Plan, then run until `shutdown` resolves. Returns the exit code: 0 stopped, 1 failed
+/// (for the supervisor to restart), [`REFUSED`] for a declaration it will not serve.
+async fn arm(args: Args, shutdown: impl std::future::Future<Output = anyhow::Result<()>>) -> u8 {
     let plan = match plan(&args) {
         Ok(p) => p,
         Err(why) => {
@@ -172,20 +184,24 @@ async fn main() -> ExitCode {
             if let Ok(audit) = AuditLog::open(Path::new(&args.audit_dir), &args.id, &args.prefix) {
                 let _ = audit.event("refused", json!({ "reason": why }));
             }
-            return ExitCode::from(REFUSED);
+            return REFUSED;
         }
     };
-    match run(args, plan).await {
-        Ok(()) => ExitCode::SUCCESS,
+    match run(args, plan, shutdown).await {
+        Ok(()) => 0,
         Err(e) => {
             error!(error = %format!("{e:#}"), "zenoh-egress-arm stopped");
-            ExitCode::FAILURE
+            1
         }
     }
 }
 
 #[allow(clippy::too_many_lines)] // one linear setup; splitting it hides the order
-async fn run(args: Args, plan: Plan) -> anyhow::Result<()> {
+async fn run(
+    args: Args,
+    plan: Plan,
+    shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
     let audit = Arc::new(
         AuditLog::open(Path::new(&args.audit_dir), &args.id, &plan.dest.to_string())
             .context("opening the audit record")?,
@@ -279,7 +295,9 @@ async fn run(args: Args, plan: Plan) -> anyhow::Result<()> {
                     Ok(()) => {
                         seq += 1;
                         Stats::bump(&stats.forwarded);
-                        if audit.sent(seq, &fabric, &external, &item.payload).is_err() {
+                        // `pen_key` is where the bytes were read. Where they went is
+                        // the line's destination (`<endpoint>#<prefix>`) plus the fabric key.
+                        if audit.sent(seq, &fabric, &item.key, &item.payload).is_err() {
                             counters.audit_errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -293,7 +311,7 @@ async fn run(args: Args, plan: Plan) -> anyhow::Result<()> {
     };
     tokio::select! {
         () = drain => {}
-        r = tokio::signal::ctrl_c() => { r.context("waiting for ctrl-c")?; info!("shutdown signal received"); }
+        r = shutdown => { r?; info!("shutdown signal received"); }
     }
     stats_task.abort();
     drop(subscribers);
@@ -359,6 +377,175 @@ mod tests {
             "/etc/octo-pod/c2-root-ca.pem",
         ])
         .unwrap()
+    }
+
+    use octo_arm_common::testing::{free_tcp_port, next_sample, TestPen, ARRIVES, QUIET};
+    use serde_json::Value;
+    use tokio::sync::oneshot;
+
+    const PAYLOAD: &[u8] = b"{\"track\":7}";
+
+    fn scratch(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("zenoh-egress-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.to_string_lossy().into_owned()
+    }
+
+    fn audit_lines(dir: &str) -> Vec<Value> {
+        std::fs::read_to_string(Path::new(dir).join("c2-egress.ndjson"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every audit line is JSON"))
+            .collect()
+    }
+
+    /// The real arm between a pen and a partner router, both on loopback.
+    fn live(pen: &str, partner: &str, dir: &str) -> Args {
+        Args::try_parse_from([
+            "zenoh-egress-arm",
+            "--id",
+            "c2",
+            "--keys",
+            KEY,
+            "--prefix",
+            "c2",
+            "--allow-prefix",
+            "c2",
+            "--pen-endpoint",
+            pen,
+            "--partner-endpoint",
+            partner,
+            "--partner-cert",
+            "/unused/leg.crt",
+            "--partner-key",
+            "/unused/leg.key",
+            "--partner-root-ca",
+            "/unused/root.pem",
+            "--audit-dir",
+            dir,
+            "--stats-secs",
+            "1",
+        ])
+        .unwrap()
+    }
+
+    fn start(args: Args) -> (oneshot::Sender<()>, tokio::task::JoinHandle<u8>) {
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(arm(args, async move {
+            let _ = stopped.await;
+            Ok(())
+        }));
+        (stop, task)
+    }
+
+    type Sub =
+        zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<zenoh::sample::Sample>>;
+
+    async fn publish_until_delivered(
+        pen: &TestPen,
+        partner: &Sub,
+        within: Duration,
+    ) -> zenoh::sample::Sample {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            pen.session
+                .put(format!("downlink/{KEY}"), PAYLOAD.to_vec())
+                .encoding(zenoh::bytes::Encoding::APPLICATION_JSON)
+                .await
+                .unwrap();
+            if let Some(s) = next_sample(partner, Duration::from_millis(250)).await {
+                return s;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never delivered");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_released_sample_lands_under_the_granted_prefix_and_nothing_else_does() {
+        let (pen, partner) = (TestPen::start().await, TestPen::start().await);
+        let theirs = partner.subscribe("**").await;
+        let dir = scratch("live");
+        let (stop, task) = start(live(&pen.endpoint, &partner.endpoint, &dir));
+
+        let s = publish_until_delivered(&pen, &theirs, ARRIVES).await;
+        assert_eq!(s.key_expr().as_str(), format!("c2/{KEY}"));
+        assert_eq!(s.payload().to_bytes().as_ref(), PAYLOAD);
+        assert_eq!(*s.encoding(), zenoh::bytes::Encoding::APPLICATION_JSON);
+
+        // A downlink key this partner was not released, and a pen key outside downlink/.
+        while next_sample(&theirs, Duration::from_millis(200))
+            .await
+            .is_some()
+        {}
+        for key in [
+            "downlink/894aee26d8146f54a0e949eb66acc40c/sensors/radar2/asterix/data",
+            KEY,
+        ] {
+            pen.session.put(key, b"no".to_vec()).await.unwrap();
+        }
+        assert!(next_sample(&theirs, QUIET).await.is_none());
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+        let lines = audit_lines(&dir);
+        assert_eq!(lines[0]["kind"], "start");
+        assert_eq!(lines[0]["partner_prefix"], "c2");
+        let sent = lines
+            .iter()
+            .find(|l| l["kind"] == "sent")
+            .expect("a sent line");
+        assert_eq!(sent["fabric_key"], KEY);
+        // Where the bytes were read, not where they went (regression for 721885c).
+        assert_eq!(sent["pen_key"], format!("downlink/{KEY}"));
+        assert_eq!(sent["destination"], format!("{}#c2", partner.endpoint));
+        assert_eq!(
+            sent["payload_hash"],
+            octo_egress::audit::payload_hash(PAYLOAD)
+        );
+        let summary = lines
+            .iter()
+            .find(|l| l["kind"] == "summary")
+            .expect("a summary");
+        assert!(summary["sent"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partner_that_is_down_at_start_is_redialled_until_it_answers() {
+        let pen = TestPen::start().await;
+        let port = free_tcp_port();
+        let dir = scratch("late");
+        let (stop, task) = start(live(&pen.endpoint, &format!("tcp/127.0.0.1:{port}"), &dir));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let partner = TestPen::start_on(port).await;
+        let theirs = partner.subscribe("**").await;
+        let s = publish_until_delivered(&pen, &theirs, octo_egress::session::OPEN_RETRY + ARRIVES)
+            .await;
+        assert_eq!(s.key_expr().as_str(), format!("c2/{KEY}"));
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prefix_outside_the_allow_list_exits_2_and_records_why() {
+        let dir = scratch("refused");
+        let mut a = live("tcp/127.0.0.1:1", "tcp/127.0.0.1:1", &dir);
+        a.allow_prefix = "someone-else".into();
+        assert_eq!(arm(a, async { Ok(()) }).await, REFUSED);
+        let lines = audit_lines(&dir);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["kind"], "refused");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pen_that_will_not_open_exits_1_for_the_supervisor() {
+        let dir = scratch("nopen");
+        let nowhere = format!("tcp/127.0.0.1:{}", free_tcp_port());
+        assert_eq!(
+            arm(live(&nowhere, &nowhere, &dir), async { Ok(()) }).await,
+            1
+        );
     }
 
     #[test]

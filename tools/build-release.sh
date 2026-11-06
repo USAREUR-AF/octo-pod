@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # Build what a pod installs from. Run in a clone; writes dist/.
 #
 #   tools/build-release.sh                 version from ./VERSION
@@ -7,6 +9,12 @@
 #   tools/build-release.sh --repo O/N      the repository whose release workflow signs it
 #                                          (default: $GITHUB_REPOSITORY, set in Actions)
 #   tools/build-release.sh --docs D        also package the built documentation site at D
+#
+# REPRODUCIBLE. Two builds of the same commit produce the same bytes, wherever and
+# whenever they run: every timestamp is the commit time (SOURCE_DATE_EPOCH, from git
+# unless set), archive entries are sorted, owners are root and modes are normalized.
+# tools/check-reproducible.sh proves it; docs/reproducible-builds.md shows how anyone
+# rebuilds a published release and compares it with SHA256SUMS.
 #
 # TWO ARTIFACTS FROM ONE TREE:
 #   octo-pod_<v>_all.deb    for a pod that can reach apt. dpkg owns /opt/octo-pod, so
@@ -131,13 +139,61 @@ if [ -n "$STAGE_ONLY" ]; then
   exit 0
 fi
 
+# ---- reproducibility ----------------------------------------------------------
+# THE COMMIT TIME, not the build time, for every timestamp in every artifact. A caller
+# may set SOURCE_DATE_EPOCH (the reproducible-builds.org convention); otherwise it is
+# the time of the commit being built. No commit and no value is an error, not a fallback
+# to "now": a build that cannot be reproduced must not look like one that can.
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+  SOURCE_DATE_EPOCH="$(git -C "$REPO" log -1 --format=%ct 2>/dev/null || true)"
+fi
+[[ "${SOURCE_DATE_EPOCH:-}" =~ ^[0-9]+$ ]] \
+  || { echo "SOURCE_DATE_EPOCH is unset and $REPO is not a git checkout; set it to the commit time" >&2; exit 2; }
+export SOURCE_DATE_EPOCH
+
+# GNU tar, for --sort=name and --mtime. On macOS it is gtar (brew install gnu-tar).
+GNUTAR=""
+for t in gtar tar; do
+  if command -v "$t" >/dev/null 2>&1 && "$t" --version 2>/dev/null | grep -q 'GNU tar'; then
+    GNUTAR="$t"; break
+  fi
+done
+[ -n "$GNUTAR" ] || { echo "GNU tar is required for a reproducible archive (macOS: brew install gnu-tar)" >&2; exit 2; }
+
+# Normalize what the archivers read: the checkout's own mtimes and the builder's umask
+# would otherwise reach the .deb, whose tar dpkg-deb writes from the tree as it is.
+# Modes keep only the executable bit's meaning: 755 for directories and executables,
+# 644 for everything else. Symlinks are timestamped themselves, not followed.
+normalize() {  # normalize <dir>...
+  chmod -R u+rwX,go+rX,go-w "$@"
+  python3 - "$SOURCE_DATE_EPOCH" "$@" <<'PY'
+import os, sys
+t = int(sys.argv[1])
+for top in sys.argv[2:]:
+    for root, dirs, files in os.walk(top):
+        for name in dirs + files:
+            os.utime(os.path.join(root, name), (t, t), follow_symlinks=False)
+    os.utime(top, (t, t), follow_symlinks=False)
+PY
+}
+
+# One way to make every tarball: sorted entries, the commit time, root ownership,
+# normalized modes, and gzip without the input name or a timestamp in its header.
+reproducible_tgz() {  # reproducible_tgz <out.tar.gz> <dir> <member>...
+  local out="$1" dir="$2"; shift 2
+  "$GNUTAR" --sort=name --format=gnu --mtime="@$SOURCE_DATE_EPOCH" \
+    --owner=0 --group=0 --numeric-owner --mode=u+rwX,go+rX,go-w \
+    -C "$dir" -cf - "$@" | gzip -9n > "$out"
+}
+
 mkdir -p "$DIST"
 
 # ---- tarball: unpacks INTO a directory, no wrapping component ----------------
 # `tar -C … .` so the upgrade path can unpack straight into /opt/octo-pod-<v> without
 # guessing at a top-level directory name.
 TAR="$DIST/octo-pod-$VERSION.tar.gz"
-tar -czf "$TAR" -C "$PKGROOT" .
+normalize "$PKGROOT"
+reproducible_tgz "$TAR" "$PKGROOT" .
 ( cd "$DIST" && shasum -a 256 "$(basename "$TAR")" > "$(basename "$TAR").sha256" )
 echo "built $TAR"
 
@@ -190,7 +246,16 @@ fi
 
 if command -v dpkg-deb >/dev/null 2>&1; then
   DEB="$DIST/octo-pod_${VERSION}_all.deb"
-  dpkg-deb --root-owner-group --build "$STAGE" "$DEB" >/dev/null
+  normalize "$STAGE"
+  # dpkg-deb takes the ar and tar timestamps from SOURCE_DATE_EPOCH and sorts its
+  # entries. xz, single-threaded: the distribution default differs between Debian (xz)
+  # and Ubuntu (zstd), and threaded xz splits blocks differently from single-threaded,
+  # so a one-core verifier would get different bytes.
+  deb_args=(--root-owner-group -Zxz)
+  if dpkg-deb --help 2>/dev/null | grep -q -- '--threads-max'; then
+    deb_args+=(--threads-max=1)
+  fi
+  dpkg-deb "${deb_args[@]}" --build "$STAGE" "$DEB" >/dev/null
   ( cd "$DIST" && shasum -a 256 "$(basename "$DEB")" > "$(basename "$DEB").sha256" )
   echo "built $DEB"
 else
@@ -219,7 +284,8 @@ if [ "$WITH_IMAGES" = 1 ]; then
     || { echo "image bundle failed — a release without one is still valid, but pods" >&2
          echo "that cannot hold a credential will have nothing to install from." >&2
          exit 1; }
-  ( cd "$IMGDIR" && tar -czf "$DIST/octo-pod-images-$VERSION.tar.gz" images )
+  normalize "$IMGDIR/images"
+  reproducible_tgz "$DIST/octo-pod-images-$VERSION.tar.gz" "$IMGDIR" images
   ( cd "$DIST" && shasum -a 256 "octo-pod-images-$VERSION.tar.gz" > "octo-pod-images-$VERSION.tar.gz.sha256" )
   rm -rf "$IMGDIR"
   echo "built $DIST/octo-pod-images-$VERSION.tar.gz"
@@ -232,7 +298,8 @@ fi
 if [ -n "$DOCS_DIR" ]; then
   DOCSTAGE="$(mktemp -d)"
   cp -R "$DOCS_DIR" "$DOCSTAGE/octo-pod-docs-$VERSION"
-  tar -czf "$DIST/octo-pod-docs-$VERSION.tar.gz" -C "$DOCSTAGE" "octo-pod-docs-$VERSION"
+  normalize "$DOCSTAGE/octo-pod-docs-$VERSION"
+  reproducible_tgz "$DIST/octo-pod-docs-$VERSION.tar.gz" "$DOCSTAGE" "octo-pod-docs-$VERSION"
   rm -rf "$DOCSTAGE"
   ( cd "$DIST" && shasum -a 256 "octo-pod-docs-$VERSION.tar.gz" > "octo-pod-docs-$VERSION.tar.gz.sha256" )
   echo "built $DIST/octo-pod-docs-$VERSION.tar.gz"

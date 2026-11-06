@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """Failure-path tests for pod shell commands; temporary files and stubbed commands only."""
 import os
 from pathlib import Path
@@ -52,9 +54,13 @@ def run_checks(repo, check):
             code,out=run(join+[flag],env)
             check(f'join {flag} missing value',code not in (0,124) and 'needs a value' in out,out)
         secret='synthetic-key-do-not-print'
-        for args in [['--setup-key='+secret],['--typo='+secret],[secret]]:
+        # Name each case: a label built from the arguments would print the credential
+        # itself for the bare-argument case, in a test that exists to keep it unprinted.
+        for case,args in [('--setup-key',['--setup-key='+secret]),('--typo',['--typo='+secret]),
+                          ('as a bare argument',[secret])]:
             code,out=run(join+args,env)
-            check('join never echoes rejected credential '+args[0].split('=')[0],code!=0 and secret not in out,out)
+            check('join never echoes rejected credential '+case,code!=0 and secret not in out,
+                  out.replace(secret,'<credential>'))
         code,out=run(join+['--setup-key='+secret],env)
         check('join accepts equals form before checking required fields','unknown option' not in out,out)
         # A quoted token path is data, not Python source; invalid pod names write nothing.

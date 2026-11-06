@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# verify's zenoh client, installed in the golden image by tools/vm-image-provision.sh.
+# Must equal verify_zenoh_version in platform/group_vars/all/10-infrastructure.yml;
+# test_templates checks it.
+eclipse-zenoh==1.9.0

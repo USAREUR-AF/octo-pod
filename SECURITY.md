@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Security Policy
 
 octo-pod operates at the edge of a data fabric: it terminates sensor feeds, holds a fabric
@@ -132,6 +137,9 @@ sha256sum -c --ignore-missing SHA256SUMS
 
 Check the signature first. The signature makes the hash list trustworthy; a hostile file
 can carry its own hash list.
+
+You can also rebuild a release from its tag and compare your files with `SHA256SUMS`. See
+[Reproducible Builds](docs/reproducible-builds.md).
 
 From the next release, each release also includes SLSA build provenance,
 `octo-pod-<version>.intoto.jsonl`. It records the source repository, the tag and the

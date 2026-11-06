@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # ClusterFuzzLite on pull requests: build the fuzz targets in arms/fuzz with
 # AddressSanitizer, then fuzz them for five minutes in all. A crash fails the job, and the
 # input that caused it is uploaded as an artifact. To run a target yourself, see

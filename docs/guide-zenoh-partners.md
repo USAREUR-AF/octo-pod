@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Working With Zenoh-Native Partners
 
 How to connect a partner system that already implements Zenoh to an octo-pod: let it publish

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The downlink gate: which fabric keys may come down onto the pen.
 //!
 //! The mirror of the uplink bridge's `bridge_allow`. Upstream, `bridge_allow` names the pen

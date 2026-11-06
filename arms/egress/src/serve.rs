@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Serving consumers that dial the pod: a `tcp-server://` destination.
 //!
 //! Many consumers do not listen for data; they dial the sensor. A track correlator's radar-one input is a TCP

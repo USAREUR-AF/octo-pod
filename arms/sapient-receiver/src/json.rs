@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Descriptor-based protobuf JSON decoding. No hand-maintained JSON/wire schema.
 use anyhow::Result;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};

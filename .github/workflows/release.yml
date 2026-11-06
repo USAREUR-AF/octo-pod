@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # Build what pods install from, on a tag.
 #
 # A pod does not clone this repository. It installs a package or a release tarball, and
@@ -50,12 +52,18 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # A RELEASE NEEDS A SECOND PERSON. Tag runs wait in the protected `release`
+    # environment until a release approver other than the person who pushed the tag
+    # approves. Dry runs from workflow_dispatch create no release, so they use
+    # `release-dry-run`, which asks no one.
+    environment: ${{ github.event_name == 'push' && 'release' || 'release-dry-run' }}
     outputs:
       version: ${{ steps.v.outputs.version }}
       # Every artifact SHA256SUMS lists, base64-encoded, for the provenance job below.
       subjects: ${{ steps.subjects.outputs.subjects }}
     permissions:
       contents: write        # to create the release and attach artifacts
+      actions: read          # to read the release environment's protection rules
       id-token: write        # what makes keyless cosign work; nothing else needs it
       # To READ the arm images while building the bundle. images.yml pushed them from
       # this repository, so they are linked to it and GITHUB_TOKEN can read them with
@@ -64,6 +72,53 @@ jobs:
       # publishes releases, and nothing it does should be able to move an image tag.
       packages: read
     steps:
+      # FAIL CLOSED. If the `release` environment did not exist, GitHub would create it
+      # on first use with no protection and run this job without anyone approving. So
+      # the job checks its own gate: refuse to release unless the environment requires a
+      # reviewer and does not let the person who pushed the tag approve their own release.
+      - name: a second person must approve this release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gate=$(gh api "repos/${GITHUB_REPOSITORY}/environments/release" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | first // empty')
+          if [ -z "$gate" ]; then
+            echo "::error::the release environment requires no reviewer; refusing to release"
+            exit 1
+          fi
+          if [ "$(jq -r '.prevent_self_review' <<<"$gate")" != true ]; then
+            echo "::error::the release environment lets the tagger approve their own release; refusing"
+            exit 1
+          fi
+          echo "the release environment requires a reviewer other than ${GITHUB_ACTOR}"
+      # A SIGNED TAG. The tag names what is released, so it must be an annotated tag
+      # signed by a maintainer's key and verified by GitHub against that maintainer's
+      # account, and it must point at the commit this run builds. A lightweight tag, an
+      # unsigned tag or a signature GitHub cannot verify stops the release here.
+      - name: the release tag is signed and GitHub verifies it
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
+          if [ "$(jq -r '.object.type' <<<"$ref")" != tag ]; then
+            echo "::error::${GITHUB_REF_NAME} is a lightweight tag. Create release tags with git tag -s, signed by a key registered on your GitHub account."
+            exit 1
+          fi
+          tag=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$(jq -r '.object.sha' <<<"$ref")")
+          if [ "$(jq -r '.verification.verified' <<<"$tag")" != true ]; then
+            echo "::error::GitHub does not verify the signature on ${GITHUB_REF_NAME} ($(jq -r '.verification.reason' <<<"$tag")). Sign release tags with git tag -s, using a key registered on your GitHub account."
+            exit 1
+          fi
+          if [ "$(jq -r '.object.type' <<<"$tag")" != commit ] \
+            || [ "$(jq -r '.object.sha' <<<"$tag")" != "$GITHUB_SHA" ]; then
+            echo "::error::${GITHUB_REF_NAME} does not point at the commit this run builds (${GITHUB_SHA})."
+            exit 1
+          fi
+          echo "${GITHUB_REF_NAME} is signed by $(jq -r '.tagger.name' <<<"$tag"), and GitHub verifies the signature"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: version — the tag and the tree agree
@@ -113,12 +168,16 @@ jobs:
       # ships the documentation that matches it, listed in SHA256SUMS and covered by the
       # same signature and provenance as everything else. A copy of the repository
       # without tools/build-docs.py skips this step and releases without it.
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: (startsWith(github.ref, 'refs/tags/octo-pod-v') || inputs.build_docs) && hashFiles('tools/build-docs.py') != ''
+        with:
+          tool: mdbook@0.5.4
+          fallback: none
       - name: documentation site
         id: docs
         if: (startsWith(github.ref, 'refs/tags/octo-pod-v') || inputs.build_docs) && hashFiles('tools/build-docs.py') != ''
         run: |
           set -euo pipefail
-          cargo install --locked mdbook --version 0.5.4
           cargo install --locked mdbook-i18n-helpers --version 0.4.0
           python3 tools/build-docs.py --out "$RUNNER_TEMP/docs"
           echo "dir=$RUNNER_TEMP/docs" >> "$GITHUB_OUTPUT"
@@ -195,7 +254,7 @@ jobs:
           octo-pod version
 
       - name: dependencies for the payload tests
-        run: pip install --quiet -r platform/tests/requirements.txt
+        run: pip install --quiet --require-hashes -r platform/tests/requirements.txt
 
       - name: release artifact contents
         run: python3 tests/test_release.py
@@ -589,7 +648,8 @@ jobs:
   #
   # Referenced by TAG, not by commit SHA: the generator proves its own identity from the
   # tag it was called at, and a SHA reference fails that check. OpenSSF Scorecard's
-  # pinning check exempts this reusable workflow for that reason.
+  # pinning check still counts it as unpinned; that deduction is accepted, because a SHA
+  # reference would break the provenance this job exists to produce.
   provenance:
     needs: [build]
     if: startsWith(github.ref, 'refs/tags/octo-pod-v')
