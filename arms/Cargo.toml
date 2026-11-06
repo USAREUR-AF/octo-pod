@@ -24,7 +24,7 @@ repository = "https://github.com/usareur-af/octo-pod"
 octo-arm-common = { path = "common" }
 sapient-proto = { path = "sapient-proto" }
 octo-egress = { path = "egress" }
-zenoh = { version = "=1.9.0", features = ["unstable"] }
+zenoh = { version = "=1.10.2", features = ["unstable"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
