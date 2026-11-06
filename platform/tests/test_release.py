@@ -314,6 +314,27 @@ def release_lost_asset_checks():
           (r.stdout + r.stderr + str(uploads)).strip())
 
 
+def trivy_checks():
+    """The image scan never publishes its findings: counts in the log, details only in
+    code scanning, no artifact, and Trivy pinned by digest."""
+    import yaml
+    print("\nimage scan: .github/workflows/trivy.yml")
+    path = REPO / ".github" / "workflows" / "trivy.yml"
+    text = path.read_text()
+    wf = yaml.safe_load(text)
+    scan = wf["jobs"]["scan"]
+    check("Trivy runs from an image pinned by digest",
+          bool(re.search(r"aquasec/trivy@sha256:[0-9a-f]{64}", scan["env"]["TRIVY"])), scan["env"]["TRIVY"])
+    check("no workflow artifact carries the findings", "upload-artifact" not in text)
+    uploads = [s for s in scan["steps"] if "upload-sarif" in s.get("uses", "")]
+    check("full findings go only to code scanning, and only on a public repository",
+          len(uploads) == 1 and uploads[0].get("if") == "github.event.repository.visibility == 'public'",
+          str(uploads))
+    run = next(s["run"] for s in scan["steps"] if s.get("id") == "scan")
+    check("the scan writes its findings to files, not to the log",
+          "--format json --output" in run and "--format table" not in run and ">/dev/null" in run)
+
+
 def release_provenance_checks():
     """The release's provenance describes exactly what the signed manifest lists.
 
@@ -530,6 +551,7 @@ def main():
                                      "ansible-core", "bash-completion")), depends)
 
     release_signed_tag_checks()
+    trivy_checks()
     release_lost_asset_checks()
     release_sigstore_keys_checks()
     release_provenance_checks()
