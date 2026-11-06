@@ -1,4 +1,0 @@
-# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
-# SPDX-License-Identifier: Apache-2.0
-# The security job: static analysis of the languages cargo cannot see.
-semgrep==1.184.0

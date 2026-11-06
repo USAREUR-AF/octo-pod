@@ -281,19 +281,36 @@ jobs:
       # CLI, the Dockerfiles and these workflows. `--error` fails the job on ERROR
       # severity only — the mutable-action-tag warnings are a known fleet-wide item
       # (pin actions to SHA, supply-chain doc P2) and would otherwise drown the signal.
+      #
+      # SEMGREP RUNS FROM SEMGREP'S OWN IMAGE, pinned by digest, not from pip. Installed
+      # with pip, its whole dependency tree sat in this repository's locks, and semgrep
+      # pins exact versions of some of those (mcp, opentelemetry-api) that carry
+      # advisories it has not moved past yet. Those packages are semgrep's, not
+      # octo-pod's: they run only here, never in a release or on a pod. The image is
+      # semgrep's own build of the same release. Bump the version and the digest
+      # together: `crane digest semgrep/semgrep:<version>`.
       - name: semgrep
+        env:
+          SEMGREP_IMAGE: semgrep/semgrep@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed   # 1.184.0
         run: |
-          pip install --quiet --require-hashes -r tools/requirements/semgrep.txt
           PACKS="--config p/security-audit --config p/secrets --config p/dockerfile
                  --config p/python --config p/ci --config p/command-injection"
+          # The checkout is mounted read-only. The container runs as another user, so git
+          # is told the mount is safe, or semgrep could not list the tracked files.
+          run_semgrep() {
+            docker run --rm -v "$PWD:/src:ro" -w /src \
+              -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
+              -e SEMGREP_ENABLE_VERSION_CHECK=0 \
+              "$SEMGREP_IMAGE" semgrep "$@"
+          }
           # Report everything so warnings stay visible in the log...
           # shellcheck disable=SC2086
-          semgrep $PACKS --metrics=off . || true
+          run_semgrep $PACKS --metrics=off . || true
           # ...but fail only on ERROR. The WARNING set is dominated by mutable action
           # tags (`@v4`), which is a real issue and a known fleet-wide one — supply-chain
           # doc P2, fixed by SHA-pinning via Dependabot, not by blocking every PR here.
           # shellcheck disable=SC2086
-          semgrep $PACKS --severity=ERROR --error --metrics=off --quiet .
+          run_semgrep $PACKS --severity=ERROR --error --metrics=off --quiet .
 
       # History as well as the worktree: a credential that was committed and then
       # removed is still published. This repo nearly shipped a real site address.

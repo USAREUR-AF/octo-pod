@@ -19,7 +19,6 @@ reason for each pin:
 | `tools/requirements/ansible.in` | `tools/requirements/ansible.txt` | `ci.yml` offline job |
 | `tools/requirements/coverage.in` | `tools/requirements/coverage.txt` | `coverage-python.yml` |
 | `tools/requirements/pip-audit.in` | `tools/requirements/pip-audit.txt` | `ci.yml` security job |
-| `tools/requirements/semgrep.in` | `tools/requirements/semgrep.txt` | `ci.yml` security job |
 | `tools/requirements/verify-zenoh.in` | `tools/requirements/verify-zenoh.txt` | `tools/vm-image-provision.sh` |
 
 ## Update a Lock
@@ -29,7 +28,7 @@ resolution is universal, so one lock serves Linux runners, the image build and a
 developer's machine:
 
 ```zsh
-uv pip compile --universal --generate-hashes --python-version 3.12 --no-header tools/requirements/semgrep.in -o tools/requirements/semgrep.txt
+uv pip compile --universal --generate-hashes --python-version 3.12 --no-header tools/requirements/pip-audit.in -o tools/requirements/pip-audit.txt
 ```
 
 Run it from the directory that holds the `.in` file when the input includes another file
