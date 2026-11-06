@@ -9,28 +9,6 @@
 # Every entry expires: on that date the scanners report it again, and someone has to
 # re-check the reason or remove the entry. platform/tests/test_release.py requires a
 # reason and an expiry on each.
-
-[[IgnoredVulns]]
-id = "GHSA-xcq7-p3pf-p88h"
-ignoreUntil = 2027-02-06
-reason = "opentelemetry-api 1.37.0 in semgrep.txt: semgrep 1.184.0 requires ~=1.37.0, so 1.45.1 cannot be installed with it. The flaw is quadratic parsing of an inbound W3C tracestate header in TraceState.from_header. semgrep runs in CI as a command-line client with --metrics=off and parses no inbound HTTP. Remove when semgrep allows 1.45.1."
-
-[[IgnoredVulns]]
-id = "GHSA-84m7-p3x7-pcfv"
-ignoreUntil = 2027-02-06
-reason = "mcp 1.29.0 in semgrep.txt: semgrep 1.184.0 requires mcp==1.29.0 exactly. The flaw is session accumulation in the StreamableHTTP server transport, in the MCP SDK. CI runs only semgrep scan, which starts no MCP server or client. Remove when semgrep allows mcp 1.30.0."
-
-[[IgnoredVulns]]
-id = "GHSA-5h93-6whr-6q8j"
-ignoreUntil = 2027-02-06
-reason = "mcp 1.29.0 in semgrep.txt: semgrep 1.184.0 requires mcp==1.29.0 exactly. The flaw is HTTP client transports following cross-origin redirects with custom headers, in the MCP SDK. CI runs only semgrep scan, which starts no MCP server or client. Remove when semgrep allows mcp 1.30.0."
-
-[[IgnoredVulns]]
-id = "GHSA-rwrf-2pqf-9j8j"
-ignoreUntil = 2027-02-06
-reason = "mcp 1.29.0 in semgrep.txt: semgrep 1.184.0 requires mcp==1.29.0 exactly. The flaw is the client fetching server-chosen $ref URLs while validating tool results, in the MCP SDK. CI runs only semgrep scan, which starts no MCP server or client. Remove when semgrep allows mcp 1.30.0."
-
-[[IgnoredVulns]]
-id = "GHSA-w4fh-qvv9-3v23"
-ignoreUntil = 2027-02-06
-reason = "mcp 1.29.0 in semgrep.txt: semgrep 1.184.0 requires mcp==1.29.0 exactly. The flaw is server bearer-token authentication accepting tokens for another resource server, in the MCP SDK. CI runs only semgrep scan, which starts no MCP server or client. Remove when semgrep allows mcp 1.30.0."
+#
+# No entries today. The five that were here belonged to semgrep's dependencies, and
+# semgrep now runs from its own image in ci.yml instead of from a lock in this directory.
