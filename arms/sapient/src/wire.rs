@@ -309,7 +309,11 @@ pub fn declared_status_interval(msg: &SapientMessage) -> Option<Duration> {
     if !secs.is_finite() || secs <= 0.0 || secs > MAX_DECLARED_INTERVAL_SECS {
         return None;
     }
-    Duration::try_from_secs_f64(secs).ok()
+    // A positive value under a nanosecond converts to a zero Duration, which is no
+    // interval either.
+    Duration::try_from_secs_f64(secs)
+        .ok()
+        .filter(|d| !d.is_zero())
 }
 
 /// The longest heartbeat period a peer may declare and have it reported: one day.
@@ -674,6 +678,10 @@ mod tests {
             (registration::TimeUnits::Seconds, -5.0),
             (registration::TimeUnits::Seconds, 0.0),
             (registration::TimeUnits::Days, 2.0),
+            // Positive, but under a nanosecond: it becomes a zero Duration. Found by the
+            // sapient_message fuzz target, which saw a value of 5.19e-24 seconds.
+            (registration::TimeUnits::Seconds, 5.192_109_3e-24),
+            (registration::TimeUnits::Nanoseconds, 0.4),
         ];
         for (units, value) in poisoned {
             let mut msg = registration(&cfg());

@@ -6,9 +6,9 @@ How decisions are made in this project.
 
 octo-pod is a site appliance that brings sensor feeds onto a GOAT data fabric and
 delivers released fabric data to systems that can't join it. Decisions favor: nothing
-leaves a site unless it is declared twice, one identity per purpose, generic scaffolding
+leaves a site unless it is declared twice, one identity per purpose, shared implementation
 with site values supplied at deployment, a host that converges itself, and failures that
-are loud rather than silent.
+produce explicit error reports.
 
 ## Decision-Making
 

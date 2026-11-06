@@ -18,12 +18,13 @@ import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "bin"))
 
 # The scripts insist on root because /etc/octo-pod is root-owned. Answer that check in
 # the child, then run the script exactly as `octo-pod` would, so its own sys.exit code is
 # the code the test sees.
 SHIM = ("import os, runpy, sys; os.geteuid = lambda: 0; p = sys.argv[1]; "
-        "sys.argv = sys.argv[1:]; runpy.run_path(p, run_name='__main__')")
+        "sys.argv = sys.argv[1:]; sys.path.insert(0, os.path.dirname(p)); runpy.run_path(p, run_name='__main__')")
 
 # podman holds its containers in a state file: `ps` lists it, `rm -f` takes one out.
 PODMAN = """#!/bin/sh
@@ -318,7 +319,7 @@ def check_declare_refusal(repo, check):
         interpreter = scratch.root / "stubs/python3"
         interpreter.write_text(f"#!{sys.executable}\n" +
                                "import os, runpy, sys\nos.geteuid = lambda: 1000\n" +
-                               "sys.argv = sys.argv[1:]\nrunpy.run_path(sys.argv[0], run_name='__main__')\n")
+                               "sys.argv = sys.argv[1:]\nsys.path.insert(0, os.path.dirname(sys.argv[0]))\nrunpy.run_path(sys.argv[0], run_name='__main__')\n")
         interpreter.chmod(0o755)
         result = subprocess.run(
             ["bash", str(pathlib.Path(repo) / "bin/octo-pod"), "add-arm", "fixture-arm",

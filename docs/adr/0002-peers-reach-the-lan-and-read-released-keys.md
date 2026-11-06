@@ -25,7 +25,7 @@ identity's access.
   interface and to the pod's own containers. A partner on the site LAN that dialed the pen
   was dropped before TLS, which presents as a timeout on the partner's side. Arms and
   `tcp-server://` destinations already had a LAN path, scoped to declared `allow_sources`;
-  peers had none.
+  peers had no LAN path.
 - The pen ACL granted a peer write on `raw/<id>/**` and nothing else. The only way to get
   fabric data to an outside system was an egress destination, which delivers to a socket.
   A partner that already speaks Zenoh would need a socket shim on its side just to receive

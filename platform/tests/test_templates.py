@@ -34,6 +34,7 @@ except ImportError:                                          # pragma: no cover
 
 HERE = pathlib.Path(__file__).resolve().parent
 PLATFORM = HERE.parent
+sys.path.insert(0, str(PLATFORM.parent / "bin"))
 FAILURES = []
 
 
@@ -944,7 +945,7 @@ def check_firewall(ctx):
     print("\nfirewall — templates/host/octo-firewall.nft.j2")
     fctx = dict(ctx, lan_iface="eth1", firewall_wan_iface="eth0",
                 mgmt_ssh_sources=["192.0.2.14/32"],
-                fabric_host_pins=[{"ip": "100.127.0.10", "names": "zenoh.example.invalid"}])
+                fabric_host_pins=[{"ip": "100.127.0.8", "names": "zenoh.example.invalid"}])
     rules = render("host/octo-firewall.nft.j2", fctx)
     lines = [l.strip() for l in rules.splitlines() if l.strip() and not l.strip().startswith("#")]
 
@@ -1028,7 +1029,7 @@ def check_firewall(ctx):
                   host not in rules)
 
     check("the fabric router, at its pin, over the mesh only",
-          'oifname "wt0" ip daddr 100.127.0.10 tcp dport 7447 accept' in lines)
+          'oifname "wt0" ip daddr 100.127.0.8 tcp dport 7447 accept' in lines)
     disc = render("host/octo-firewall.nft.j2", dict(fctx, firewall_mesh_tcp_ports=[443, 10000, 33073],
                                                      firewall_mesh_udp_ports=[443, 3478, 33073]))
     check("the mesh's control plane and relays: the ports the agent was assigned, on the WAN leg",
@@ -1050,14 +1051,14 @@ def check_firewall(ctx):
     check("no management opening over the mesh unless its name resolved to a mesh address",
           mgmt == [], str(mgmt))
     mrules = render("host/octo-firewall.nft.j2",
-                    dict(fctx, firewall_mesh_mgmt_ips=["100.127.0.18", "100.127.0.19"]))
+                    dict(fctx, firewall_mesh_mgmt_ips=["100.127.0.16", "100.127.0.17"]))
     check("management's mesh addresses: its control ports, to those addresses only, over the mesh",
-          'oifname "wt0" ip daddr { 100.127.0.18, 100.127.0.19 } tcp dport { 443 } accept' in mrules)
+          'oifname "wt0" ip daddr { 100.127.0.16, 100.127.0.17 } tcp dport { 443 } accept' in mrules)
     mdisc = render("host/octo-firewall.nft.j2",
-                   dict(fctx, firewall_mesh_mgmt_ips=["100.127.0.18"],
+                   dict(fctx, firewall_mesh_mgmt_ips=["100.127.0.16"],
                         firewall_mesh_tcp_ports=[443, 10000, 33073]))
     check("management's mesh addresses take the control ports the agent was assigned",
-          'oifname "wt0" ip daddr { 100.127.0.18 } tcp dport { 443, 10000, 33073 } accept' in mdisc)
+          'oifname "wt0" ip daddr { 100.127.0.16 } tcp dport { 443, 10000, 33073 } accept' in mdisc)
     mname = render("host/octo-firewall.nft.j2",
                    dict(fctx, firewall_mesh_mgmt_ips=["mgmt.example.invalid"]))
     check("a management name never reaches a rule (nft would resolve it at boot)",
@@ -1124,7 +1125,7 @@ def check_peer_reads(ctx):
     check("india's bundle names its released read as the downlink/ key it subscribes to",
           "downlink/1d18de66e8a09a5e68170b3b3de6563b/sensors/sensor2/**" in india
           and "You have no read access" not in india)
-    check("india's bundle says which addresses it must dial from", "100.127.0.25, 100.127.0.26" in india)
+    check("india's bundle says which addresses it must dial from", "100.127.0.23, 100.127.0.24" in india)
     alpha = render("peer/bundle-README.md.j2", dict(base, item=by_id["alpha"]))
     check("alpha's bundle (no allow_sources, no reads) dials the mesh and claims no read access",
           '"tls/100.127.0.1:7447"' in alpha and "You have no read access" in alpha)
@@ -1481,13 +1482,13 @@ def check_firewall_mesh_mgmt_addresses():
     def agent(url):
         return {"rc": 0, "stdout": json.dumps({"management": {"url": url, "connected": True}})}
 
-    got = evaluate(agent("https://100.127.0.18:443"))
-    check("the agent's management resolves inside the mesh range: that address", got == ["100.127.0.18"],
+    got = evaluate(agent("https://100.127.0.16:443"))
+    check("the agent's management resolves inside the mesh range: that address", got == ["100.127.0.16"],
           str(got))
     got = evaluate(agent("https://192.0.2.7:443"))
     check("the agent's management resolves outside the mesh range: no opening", got == [], str(got))
-    got = evaluate({"rc": 1, "stdout": ""}, mgmt_host="100.127.0.22")
-    check("no agent status yet: netbird_mgmt_host is resolved instead", got == ["100.127.0.22"], str(got))
+    got = evaluate({"rc": 1, "stdout": ""}, mgmt_host="100.127.0.20")
+    check("no agent status yet: netbird_mgmt_host is resolved instead", got == ["100.127.0.20"], str(got))
     got = evaluate(agent("https://mgmt.example.invalid:443"))
     check("a name that does not resolve: no opening, and the play carries on", got == [], str(got))
     got = evaluate({"rc": 1, "stdout": ""})
@@ -1532,7 +1533,7 @@ def check_firewall_apply(fctx):
         print("  SKIP  needs bash 4.7 or later (the pod has 5.2)")
         return
     jq = shutil.which("jq")
-    mgmt, relay, router = "mgmt.example.invalid/443", "relay.example.invalid/33073", "100.127.0.10/7447"
+    mgmt, relay, router = "mgmt.example.invalid/443", "relay.example.invalid/33073", "100.127.0.8/7447"
 
     def run(joined, open_, connected="true", with_jq=True, previous="old ruleset\n", relays="present",
             before=None, after=None):
@@ -2000,17 +2001,17 @@ def check_egress_cli():
         def unchanged():
             return all((pod / n).read_text() == t for n, t in before.items())
 
-        code, out = run("release", "recv1", "--slot", str(slot), "--router-ip", "100.127.0.10")
+        code, out = run("release", "recv1", "--slot", str(slot), "--router-ip", "100.127.0.8")
         check("release --slot with no fingerprint to check the bundle against is refused, "
               "and changes nothing", code != 0 and "--ca-fingerprint" in out and unchanged(), out)
-        code, out = run("release", "recv1", "--slot", str(slot), "--router-ip", "100.127.0.10",
+        code, out = run("release", "recv1", "--slot", str(slot), "--router-ip", "100.127.0.8",
                         "--ca-fingerprint", GOAT_KEY_FINGERPRINT)
         check("release --slot with another goatnet's fingerprint is refused, and changes nothing",
               code != 0 and "not the" in out and unchanged(), out)
         code, out = run("release", "recv1", "--ca-fingerprint", signer.fingerprint)
         check("--ca-fingerprint without --slot is refused, and changes nothing",
               code != 0 and "--slot" in out and unchanged(), out)
-        code, out = run("release", "recv1", "--slot", str(slot), "--router-ip", "100.127.0.10",
+        code, out = run("release", "recv1", "--slot", str(slot), "--router-ip", "100.127.0.8",
                         "--ca-fingerprint", signer.fingerprint)
         podyml = (pod / "10-pod.yml").read_text()
         fabric = yaml.safe_load((pod / "05-fabric.yml").read_text())
@@ -2024,7 +2025,7 @@ def check_egress_cli():
         check("release --slot fills the endpoint from the signed profile, not NOTES.md, and "
               "pins the router",
               fabric.get("fabric_endpoint") == "tls/zenoh.example.invalid:7447"
-              and fabric.get("fabric_host_pins") == [{"ip": "100.127.0.10", "names": "zenoh.example.invalid"}],
+              and fabric.get("fabric_host_pins") == [{"ip": "100.127.0.8", "names": "zenoh.example.invalid"}],
               str(fabric))
         check("release --slot names the fabric CA root, not the portal's CA",
               "fabric-ca-root.pem" in out and "goat-cli-ca" not in out, out)
@@ -2530,7 +2531,11 @@ def check_watchdog_drift(ctx):
 
     print("\nwatchdog - declaration drift, read from real container names")
     stubs_body = {
-        "podman": 'case "$1" in ps) for n in $STUB_PS; do echo "$n"; done ;; esac\nexit 0\n',
+        # A real podman writes one name per write and dies of SIGPIPE when the reader has
+        # gone. The pause makes that deterministic: `grep -q` has exited by the second
+        # name, so a `podman ps | grep -q` under pipefail fails on a container it found.
+        "podman": ('case "$1" in ps) for n in $STUB_PS; do echo "$n" || exit 141; '
+                   '/bin/sleep 0.2; done ;; esac\nexit 0\n'),
         "systemctl": "exit 0\n", "curl": "exit 0\n", "ss": "exit 0\n", "sleep": "exit 0\n",
     }
 

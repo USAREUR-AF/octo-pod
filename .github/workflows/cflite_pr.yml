@@ -1,0 +1,46 @@
+# ClusterFuzzLite on pull requests: build the fuzz targets in arms/fuzz with
+# AddressSanitizer, then fuzz them for five minutes in all. A crash fails the job, and the
+# input that caused it is uploaded as an artifact. To run a target yourself, see
+# "Fuzzing" in CONTRIBUTING.md.
+#
+# Only changes that can change a target's result run it: the arms, the build image and
+# this file.
+name: ClusterFuzzLite PR fuzzing
+on:
+  pull_request:
+    paths:
+      - 'arms/**'
+      - '.clusterfuzzlite/**'
+      - '.github/workflows/cflite_pr.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # Read the corpus that the weekly batch run keeps as a workflow artifact.
+      actions: read
+    steps:
+      - name: Build the fuzz targets
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Rust targets support AddressSanitizer only.
+          sanitizer: address
+      - name: Fuzz the targets
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 300
+          mode: code-change
+          sanitizer: address
+          output-sarif: false

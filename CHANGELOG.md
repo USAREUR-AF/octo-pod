@@ -6,6 +6,43 @@ Notable changes to octo-pod. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Each tagged release carries the documentation site, `octo-pod-docs-<version>.tar.gz`,
+  where this repository carries its builder. `SHA256SUMS` lists it, so it is signed and
+  covered by the provenance like every other artifact. `tools/build-release.sh --docs`
+  packages a built site, and a manual release run can build it with `build_docs`.
+- Every release carries SLSA Build Level 3 provenance (`octo-pod-<version>.intoto.jsonl`)
+  for each artifact the signed `SHA256SUMS` lists, and the release workflow verifies it
+  from the published release with `slsa-verifier`.
+- `SHA256SUMS.sigstore.json`: the manifest signature in the standard Sigstore bundle
+  format. Pods and the installer keep using `SHA256SUMS.cosign-bundle`.
+- `docs/images.md` lists every container image a pod runs, with its role, source and
+  digest. `tools/gen-images-doc.py` generates it from the pins, and CI fails if it is
+  stale.
+- An OpenSSF Scorecard workflow, and status badges in the README.
+
+### Fixed
+
+- The watchdog no longer reports a running arm as declaration drift at random, and can no
+  longer mistake a listening pen router for a silent one. It read `podman ps` and `ss`
+  through `grep -q` under `pipefail`, where grep exits on its first match and the writer
+  dies of SIGPIPE, so the pipeline failed because the name was found. It now reads each
+  list once and matches against it. The installer's `rsync --help` check had the same
+  fault.
+
+### Security
+
+- The uplink bridge pins Zenoh transport compression off, as every other arm already
+  does, so the lz4_flex decompress path (RUSTSEC-2026-0041) stays unreachable on the leg
+  that faces the external fabric. Upgrading Zenoh does not fix this advisory: no release
+  moves to the fixed lz4_flex yet.
+- The test dependencies require Jinja2 3.1.6 or later (PYSEC-2026-1471 through 1475).
+  octo-pod uses neither the sandbox nor the `xmlattr` filter those advisories affect.
+- CI checks the Python dependencies with `pip-audit`. `arms/osv-scanner.toml` records the
+  five triaged Rust advisories, each with its reason and an expiry date, for osv-scanner
+  and OpenSSF Scorecard, and a test keeps it in step with `arms/deny.toml`.
+
 ## [0.5.0] - 2026-11-05
 
 Every image is rebuilt from this release's source and pinned by digest, the uplink bridge
@@ -79,7 +116,7 @@ without the migration. Don't point a Docker-era pod's `octo_repo_url` at a mirro
 - `octo-pod top`, a live read-only view: rates, drops, queue and consumers per arm, bridge
   and egress destination, read from the stats lines the containers already log, plus
   declarations, mesh peers and a problems list. `--once` and `--json` print a snapshot.
-- `octo-pod get`, `describe`, `logs` and `certs`, read-only views in kubectl's shapes: a
+- `octo-pod get`, `describe`, `logs` and `certs`, read-only views using kubectl’s command structure: a
   row per arm, peer, destination, bridge, mesh peer, problem or certificate (`-o wide`,
   `-o json`); one item in full with its declaration redacted; one item's logs, from the
   unit's journal once it has stopped; and every certificate's expiry, the slot
@@ -94,7 +131,7 @@ without the migration. Don't point a Docker-era pod's `octo_repo_url` at a mirro
 - Egress: a pod delivers released fabric data to systems that can't join the fabric, as
   UDP or TCP pushes or as a TCP server the system dials, through two release gates.
 - A deny-by-default host firewall rendered from the declarations, with an automatic
-  restore if a change cuts the pod off.
+  restore if a change disconnects the pod.
 - A golden VM image built from committed source, for amd64 and arm64.
 - `octo-pod remote` for workstation-side install, key minting and deprovisioning.
 
@@ -130,7 +167,7 @@ without the migration. Don't point a Docker-era pod's `octo_repo_url` at a mirro
 - `octo-pod status` reports a stopped uplink bridge on a pod that also runs the downlink
   bridge; any running container named `*bridge*` used to stand in for it. `top` shows a
   bridge the pod needs as NOT RUNNING instead of leaving its row out.
-- `octo-pod top` survives a container log line that is not UTF-8 or carries a malformed
+- `octo-pod top` continues processing after a container log line that is not UTF-8 or carries a malformed
   number or date, and `--once` shows escape and control characters instead of passing
   them to the terminal.
 - `octo-pod status` no longer opens a file outside the pen's TLS directory when a

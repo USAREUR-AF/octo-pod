@@ -1,0 +1,32 @@
+# Triaged advisories for arms/Cargo.lock, read by osv-scanner and by the OpenSSF
+# Scorecard Vulnerabilities check, which runs osv-scanner.
+#
+# These are the same decisions as the [advisories] ignore list in deny.toml, where each
+# one is explained in full. platform/tests/test_release.py fails if the two lists
+# differ. Every entry expires: on that date the scanners report it again, and someone
+# has to re-check the reason or remove the entry.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+ignoreUntil = 2027-05-05
+reason = "rsa: no RSA private-key operation is reachable. Leaf keys are EC P-256 and zenoh pubkey auth is not configured."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0041"
+ignoreUntil = 2027-05-05
+reason = "lz4_flex: every arm session disables zenoh transport compression, so the decompress path is unreachable. No zenoh release moves to the fixed lz4_flex yet."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+ignoreUntil = 2027-05-05
+reason = "paste: unmaintained notice, not a vulnerability. Build-time procedural macro only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"
+ignoreUntil = 2027-05-05
+reason = "rustls-pemfile: unmaintained notice, not a vulnerability. Transitive through zenoh; re-check whenever zenoh is bumped."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0449"
+ignoreUntil = 2027-05-05
+reason = "unsafe-libyaml: unmaintained notice, not a vulnerability. Arms build zenoh config in code and never load a YAML config file."

@@ -35,7 +35,7 @@ peers:
     description: "test peer with a released read, over the LAN"
     cert_cn: octo-peer-india
     namespace: "raw/india/**"
-    allow_sources: "100.127.0.25, 100.127.0.26"
+    allow_sources: "100.127.0.23, 100.127.0.24"
     read_keys:
       - "1d18de66e8a09a5e68170b3b3de6563b/sensors/sensor2/**"
     enabled: true
@@ -67,7 +67,7 @@ arms:
     feed: cat62-v1
     transport: udp
     port: 48030
-    allow_sources: "100.127.0.9"
+    allow_sources: "100.127.0.7"
     trust_tier: T1
   # The dial-out shape. It owns no port on this box — the port is the sensor's — so it
   # carries `target` instead, and must render TCP_CONNECT_FEEDS rather than a listener.
@@ -79,9 +79,9 @@ arms:
     enabled: true
     feed: cat62-v1
     transport: tcp
-    target: "100.127.0.25:7005"
+    target: "100.127.0.23:7005"
     framing: len32be
-    allow_sources: "100.127.0.25"
+    allow_sources: "100.127.0.23"
     trust_tier: T1
   - id: charlie
     description: "test arm, DISABLED — must not appear in any output"
@@ -121,8 +121,8 @@ egress:
     description: "test egress, released"
     cert_cn: octo-egress-echo
     enabled: true
-    dest: "udp://100.127.0.29:4001"
-    allow_dest: "100.127.0.29:4001"
+    dest: "udp://100.127.0.27:4001"
+    allow_dest: "100.127.0.27:4001"
     keys:
       - "1d18de66e8a09a5e68170b3b3de6563b/sensors/radar1/asterix/data"
     release:
@@ -131,8 +131,8 @@ egress:
     description: "test egress, declared but shut"
     cert_cn: octo-egress-foxtrot
     enabled: true
-    dest: "tcp://100.127.0.30:4100"
-    allow_dest: "100.127.0.30:4100"
+    dest: "tcp://100.127.0.28:4100"
+    allow_dest: "100.127.0.28:4100"
     keys:
       - "release/REL-TEST/sensor-b/radar/cat062"
     release:

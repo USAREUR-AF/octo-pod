@@ -117,9 +117,16 @@ fi
 # ---------------------------------------------------------------- the router
 # Running but not listening is the same class of fault as a zombie sink, and it takes
 # every arm down with it — they reconnect on their own once the port is back.
-if podman ps --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | grep -q '^octo-pen-zenoh-router$'; then
+#
+# READ ONCE, THEN MATCH. `podman ps | grep -q` looks obvious and is wrong under pipefail:
+# grep -q exits on its first match, podman dies of SIGPIPE writing the next name, and the
+# pipeline reports failure BECAUSE the container was found. That made a running arm look
+# like drift, and could make a listening router look silent and get it restarted.
+running="$(podman ps --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
+listening="$(ss -tln 2>/dev/null || true)"
+if grep -qx 'octo-pen-zenoh-router' <<<"$running"; then
   checked=$((checked + 1))
-  if ! ss -tln 2>/dev/null | grep -q ":${PEN_PORT}\b"; then
+  if ! grep -q ":${PEN_PORT}\b" <<<"$listening"; then
     faults=$((faults + 1))
     now_unhealthy="$now_unhealthy octo-pen-zenoh-router"
     if was_unhealthy octo-pen-zenoh-router; then
@@ -165,7 +172,7 @@ PY
 )"
   if [ -n "${declared:-}" ]; then
     for id in $declared; do
-      podman ps --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | grep -q -- "-${id}\$" || {
+      grep -q -- "-${id}\$" <<<"$running" || {
         drift=$((drift + 1)); note "$id is declared but has no container — apply has not run"
         err "DRIFT  $id declared, nothing running for it"; }
     done

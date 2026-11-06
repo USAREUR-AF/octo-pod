@@ -75,12 +75,12 @@ verification when it is supplied), and use a tested host snapshot for recovery r
 than relying on the old `--rollback`. Record the actual installed upgrader and signer in
 the migration plan before running it.
 
-`upgrade` never goes backwards on its own. Versions are ordered the way dpkg orders them,
+`upgrade` never installs an older version automatically. Versions are ordered the way dpkg orders them,
 so a prerelease such as `0.4.0~lab2` sorts below `0.4.0`, and a `LATEST` at or below the
-running version is nothing to do. To go to an older version on purpose, name it:
+running version requires no update. To go to an older version on purpose, name it:
 `sudo octo-pod upgrade --to <version> --allow-downgrade`.
 
-`/etc/octo-pod` is never touched by installing or upgrading. Where releases come from is
+Installation and upgrades never modify `/etc/octo-pod`. Where releases come from is
 `octo_repo_url` in the pod's `05-fabric.yml`.
 
 To pin an exact artifact, add `--expect-sha256 <64-hex>` with a digest you got from
@@ -89,8 +89,8 @@ and the signed manifest are still verified, and the tarball, `.deb` or (with `--
 image bundle must match your digest as well. Without cosign, `upgrade` refuses.
 
 cosign checks the signature against sigstore's trust root, which it downloads and caches
-in `/root/.sigstore`. Until a release ships that trust root with the pod, the pod needs
-HTTPS to `tuf-repo-cdn.sigstore.dev`, or a cache warmed by one online cosign run as root.
+in `/root/.sigstore`. Until a release includes that trust root on the pod, the pod needs
+HTTPS to `tuf-repo-cdn.sigstore.dev`, or a cache populated by one online cosign run as root.
 A pod with neither can't verify any release, and `upgrade` refuses with cosign's TUF or
 connection error.
 
@@ -116,5 +116,5 @@ tools/deprovision-pod.sh <user>@<pod-ip>
 ```
 
 Type the address when it asks. Keeps the carried image bundle for reinstallation.
-Add `--wipe-stage` to drop that too. Cuts the pod's mesh peer if you hold a NetBird admin
+Add `--wipe-stage` to delete that bundle too. Removes the pod’s mesh peer if you hold a NetBird admin
 token; `--keep-peer` skips that.

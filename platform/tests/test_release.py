@@ -40,6 +40,101 @@ def check(label, condition, detail=""):
         FAILURES.append(label)
 
 
+def release_docs_checks():
+    """A release can carry the documentation site, signed like every other artifact."""
+    import yaml
+    print("\nrelease documentation site: tools/build-release.sh --docs")
+    build = REPO / "tools" / "build-release.sh"
+    with tempfile.TemporaryDirectory() as tmp:
+        r = subprocess.run([str(build), "9.9.9", "--docs", tmp], capture_output=True, text=True)
+    check("--docs refuses a directory that is not a built site, before building anything",
+          r.returncode == 2 and "not a built documentation site" in r.stderr, r.stderr.strip())
+    text = build.read_text()
+    check("the site is signed only when this run was given --docs, never a stale file",
+          'if [ -n "$DOCS_DIR" ]; then ARTIFACTS+=("octo-pod-docs-$VERSION.tar.gz"); fi' in text)
+    wf = yaml.safe_load((REPO / ".github" / "workflows" / "release.yml").read_text())
+    steps = wf["jobs"]["build"]["steps"]
+    docs = next((s for s in steps if s.get("id") == "docs"), {})
+    check("the site is built only where the builder exists, on a tag or when asked",
+          "hashFiles('tools/build-docs.py')" in docs.get("if", "")
+          and "refs/tags/octo-pod-v" in docs.get("if", "") and "inputs.build_docs" in docs.get("if", ""))
+    order = [s.get("id") or s.get("name") for s in steps]
+    check("the site is built before the release, so SHA256SUMS lists it",
+          "docs" in order and "build" in order and order.index("docs") < order.index("build"))
+    b = next(s for s in steps if s.get("name") == "build")
+    check("the build passes the site to build-release.sh",
+          b.get("env", {}).get("DOCS_DIR") == "${{ steps.docs.outputs.dir }}" and '--docs "$DOCS_DIR"' in b["run"])
+    publish = next(s for s in steps if s.get("id") == "publish")
+    check("the site is published with the release",
+          "dist/octo-pod-docs-*.tar.gz" in publish["with"]["files"].split())
+    gate = next(s["run"] for s in steps if s.get("name") == "the release is complete and verifiable")
+    check("a site that was built but not published fails the release",
+          'dist/octo-pod-docs-${v}.tar.gz' in gate and "documentation site was built but is not in the release" in gate)
+
+
+def release_provenance_checks():
+    """The release's provenance describes exactly what the signed manifest lists.
+
+    Runs the workflow's own subjects step against a synthetic dist/ rather than reading
+    it, so an edit that changes the subject list or its encoding fails here.
+    """
+    import base64
+    import os
+    import yaml
+    print("\nrelease provenance: .github/workflows/release.yml")
+    wf = yaml.safe_load((REPO / ".github" / "workflows" / "release.yml").read_text())
+    jobs = wf["jobs"]
+    build_steps = jobs["build"]["steps"]
+    step = next((s for s in build_steps if s.get("id") == "subjects"), None)
+    check("the build job produces provenance subjects", step is not None)
+    if step is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        dist = pathlib.Path(tmp) / "dist"
+        dist.mkdir()
+        manifest = ("a" * 64 + "  octo-pod-9.9.9.tar.gz\n"
+                    + "b" * 64 + "  octo-pod_9.9.9_all.deb\n"
+                    + "c" * 64 + "  octo-pod-images-9.9.9.tar.gz\n")
+        (dist / "SHA256SUMS").write_text(manifest)
+        out = pathlib.Path(tmp) / "github_output"
+        out.touch()
+        # GNU base64 takes -w0; the BSD one on a developer Mac does not wrap by default.
+        script = step["run"]
+        if subprocess.run(["base64", "-w0"], input=b"", capture_output=True).returncode != 0:
+            script = script.replace("base64 -w0", "base64")
+        r = subprocess.run(["bash", "-c", script], cwd=tmp, capture_output=True, text=True,
+                           env=dict(os.environ, GITHUB_OUTPUT=str(out)))
+        check("the subjects step runs", r.returncode == 0, r.stderr.strip())
+        line = next((ln for ln in out.read_text().splitlines() if ln.startswith("subjects=")), "")
+        decoded = base64.b64decode(line.partition("=")[2] or "").decode()
+        check("the subjects are exactly the signed manifest, every artifact it lists",
+              decoded == manifest, repr(decoded[:120]))
+    check("the build job exports the subjects and version to the provenance job",
+          jobs["build"].get("outputs", {}).get("subjects", "").endswith("steps.subjects.outputs.subjects }}")
+          and "version" in jobs["build"].get("outputs", {}))
+    prov = jobs.get("provenance", {})
+    uses = prov.get("uses", "")
+    check("provenance comes from the SLSA generic generator, referenced by a release tag",
+          re.fullmatch(r"slsa-framework/slsa-github-generator/\.github/workflows/"
+                       r"generator_generic_slsa3\.yml@v\d+\.\d+\.\d+", uses) is not None, uses)
+    check("provenance runs only for a tag, after the build",
+          prov.get("needs") == ["build"] and "refs/tags/octo-pod-v" in prov.get("if", ""))
+    check("the provenance asset is named <name>.intoto.jsonl and attached to the release",
+          prov.get("with", {}).get("provenance-name", "").endswith(".intoto.jsonl")
+          and prov.get("with", {}).get("upload-assets") is True)
+    check("only the provenance job holds the write scopes it needs",
+          prov.get("permissions") == {"actions": "read", "id-token": "write", "contents": "write"})
+    verify = jobs.get("provenance-verified", {})
+    vrun = "\n".join(s.get("run", "") for s in verify.get("steps", []))
+    check("published provenance is verified from the release, for tarball and package",
+          set(verify.get("needs", [])) == {"build", "provenance"}
+          and "gh release download" in vrun and "slsa-verifier verify-artifact" in vrun
+          and "--source-tag" in vrun and "octo-pod_${V}_all.deb" in vrun)
+    gate = next(s["run"] for s in build_steps if s.get("name") == "the release is complete and verifiable")
+    check("the standard Sigstore bundle is a required, verified release asset",
+          "SHA256SUMS.sigstore.json LATEST" in gate and "--new-bundle-format --bundle SHA256SUMS.sigstore.json" in gate)
+
+
 def main():
     version = (REPO / "VERSION").read_text().strip()
     print(f"\nrelease payload — tools/build-release.sh ({version})")
@@ -191,6 +286,9 @@ def main():
           all(d in depends for d in ("podman (>= 4.7)", "skopeo", "nftables", "openssl",
                                      "ansible-core", "bash-completion")), depends)
 
+    release_provenance_checks()
+    release_docs_checks()
+
     # NOTICES. The arm images ship LICENSE, NOTICE and the third-party notices; the image
     # build context is arms/, so arms/ holds checked copies of the first two.
     print("\nnotices: what every arm image carries")
@@ -203,6 +301,25 @@ def main():
                           .split("accepted = [", 1)[1].split("]", 1)[0])
     check("cargo-about accepts exactly the licenses cargo-deny allows",
           sorted(allow) == sorted(accepted), f"deny {sorted(allow)} about {sorted(accepted)}")
+
+    # ONE SET OF ADVISORY DECISIONS. deny.toml explains each ignored advisory,
+    # osv-scanner.toml carries the same set to osv-scanner and OpenSSF Scorecard, and
+    # the CI cargo-audit step names the vulnerabilities among them. A decision recorded
+    # in one place and not the others is a scanner silently disagreeing with the review.
+    import tomllib
+    deny = tomllib.loads((REPO / "arms" / "deny.toml").read_text())
+    deny_ids = set(deny.get("advisories", {}).get("ignore", []))
+    osv = tomllib.loads((REPO / "arms" / "osv-scanner.toml").read_text())
+    osv_entries = osv.get("IgnoredVulns", [])
+    osv_ids = {e.get("id") for e in osv_entries}
+    check("osv-scanner.toml ignores exactly the advisories deny.toml explains",
+          deny_ids == osv_ids, f"deny {sorted(deny_ids)} osv {sorted(osv_ids)}")
+    check("every osv-scanner ignore has a reason and an expiry date",
+          all(e.get("reason") and e.get("ignoreUntil") for e in osv_entries))
+    ci_text = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+    audit_ids = set(re.findall(r"--ignore (RUSTSEC-\d{4}-\d{4})", ci_text))
+    check("cargo-audit ignores only advisories deny.toml explains",
+          audit_ids and audit_ids <= deny_ids, f"audit {sorted(audit_ids)}")
     tpl = (REPO / "arms" / "THIRD_PARTY_LICENSES.md").read_text()
     check("the third-party notices are generated and list licenses",
           tpl.startswith("# Third-Party Licenses") and tpl.count("\n## ") > 0)
@@ -265,7 +382,7 @@ def main():
 
         got = signer("repository=example/octo-pod\n")
         check("the pod trusts the release workflow of the repository that built it",
-              got == r"^https://github\.com/example/octo-pod/\.github/workflows/release\.yml"
+              got == r"^https://github\.com/(?i:example/octo-pod)/\.github/workflows/release\.yml"
                      r"@refs/tags/octo-pod-v", got)
         got = signer("repository=evil/.*\n")
         check("a malformed repository in RELEASE names no signer", got == "", got)

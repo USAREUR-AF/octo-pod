@@ -12,9 +12,9 @@ field acceptance.
 
 ## Context and scope
 
-A pod is one box at one site. Sensors on the local network, mostly radars, emit bytes
-at a socket. They speak no security protocol, hold no credential, and will never be
-changed to.
+A pod is one device at one site. Sensors on the local network, mostly radars, emit bytes
+at a socket. They implement no security protocol, hold no credential, and will not be
+modified to do so.
 
 The pod runs at a site with limited connectivity and remote operator access. The design
 prioritizes local capture, bounded resource use and recovery without local intervention.
@@ -37,8 +37,8 @@ The pod does five things:
   provenance on forwarded data.
 - **Local autonomy.** Capture and retention work with no upstream connectivity, no mesh
   membership and no operator present.
-- **Unattended operation.** The pod survives reboots, outages, certificate expiry and
-  partial failure without anyone reaching it.
+- **Unattended operation.** The pod recovers from reboots, outages, certificate expiry and
+  partial failure without local intervention.
 - **Safe convergence.** Re-running convergence preserves the declared intent. Changes
   can be previewed before application; retiring or rebuilding a pod is a separate action.
 - **Verifiable software supply.** A pod can prove what it is running came from this
@@ -89,7 +89,7 @@ shared fabric → downlink bridge → pen router as downlink/K → egress arm �
 ```
 
 A pod that captures and retains, and publishes nothing, is a **complete and legitimate
-state**, not a half-installed one. That shape governs the whole system.
+state**. The system supports this configuration without requiring upstream publication.
 
 See [ADR 0001](adr/0001-edge-appliance-and-translation-boundary.md) for the package,
 dependency and session boundaries, and the [deployment guide](deployment.md#install-or-update) for
@@ -99,8 +99,8 @@ installation and updates.
 
 The fabric and host contract constrain the implementation:
 
-- **The fabric is Zenoh.** The pod publishes into an existing fabric, so it speaks Zenoh.
-  What was chosen is how to live with its properties, not whether to use it.
+- **The fabric is Zenoh.** The pod publishes into an existing fabric using Zenoh.
+  The design must therefore account for Zenoh’s properties.
 - **The host is amd64 or arm64 Debian/Ubuntu-family Linux with systemd, Podman 4.7 or later and skopeo.**
   Ubuntu 24.04 is the documented package path. Ubuntu-based Jetsons were the original
   target, not the only supported hardware. Their RTC problem still matters under *Time*.
@@ -115,10 +115,10 @@ Each decision states what was chosen, why, what was rejected, and what the choic
 
 ### A CLI wrapping Ansible, rather than extending the fleet CLI
 
-**Decision.** octo-pod is its own thin bash CLI over Ansible with `connection=local`.
+**Decision.** octo-pod is its own small bash CLI over Ansible with `connection=local`.
 
-**Why.** `goat`, the fleet CLI, is a control surface for the fabric: it talks to the
-portal, mints slots, enrols machines. It runs on an operator's workstation and reaches
+**Why.** `goat`, the fleet CLI, is a control surface for the fabric: it calls the
+portal API, issues slots and enrols machines. It runs on an operator's workstation and reaches
 outward. octo-pod does the opposite job: it converges the box it is running on. The
 inventory is literally `pod ansible_connection=local`. There is no control node and
 nothing reaching in, because a pod is frequently behind someone else's NAT with no route
@@ -126,9 +126,9 @@ back.
 
 **Alternatives considered.**
 
-| Option | Why it lost |
+| Option | Reason rejected |
 |---|---|
-| Add pod verbs to `goat` | Couples two lifecycles. Pod convergence would ship on the fabric CLI's cadence, and the fabric CLI's portal and auth code would land on a border appliance with no business holding it. |
+| Add pod verbs to `goat` | Couples two lifecycles. Pod convergence would be released on the fabric CLI’s schedule, and the appliance would receive portal and authentication code it does not need. |
 | Write convergence in Rust | Reimplements what Ansible already does, including `--check --diff`, the part that matters most, because it lets an operator read what a run *would* change. |
 
 The two tools are also used by different people at different moments. The operator running
@@ -136,8 +136,8 @@ The two tools are also used by different people at different moments. The operat
 `octo-pod apply` is at a site, possibly on a phone tether, and should need credentials to
 nothing.
 
-**Cost accepted.** The CLI is deliberately thin bash rather than a program. It prints every
-command it runs, so nothing it does is a black box you cannot reproduce by hand.
+**Cost accepted.** The CLI uses a small bash wrapper. It prints every command it runs,
+so an operator can inspect and reproduce each operation manually.
 
 ### Ansible, rather than Puppet, Salt, Nix or shell
 
@@ -145,18 +145,18 @@ command it runs, so nothing it does is a black box you cannot reproduce by hand.
 
 **Alternatives considered.**
 
-| Option | Why it lost |
+| Option | Reason rejected |
 |---|---|
-| **Puppet** | Needs an agent plus a master. A pod behind NAT cannot be pulled by a master, and installing an agent to converge a box that can converge itself is a dependency for nothing. |
-| **Nix** | Genuinely better immutability. Loses on adoption cost: the hardware ships Ubuntu-based images, the fleet's tooling is apt-shaped, and the people who will maintain this do not write Nix. |
+| **Puppet** | Needs an agent plus a master. A pod behind NAT cannot be pulled by a master, and installing an agent to converge a box that can converge itself is an unnecessary dependency. |
+| **Nix** | Provides stronger immutability, but adoption would require replacing Ubuntu/apt tooling and training maintainers in Nix. |
 | **Plain shell** | No idempotence, no dry run, no diff, and idempotence is the property the entire operating model rests on. |
 
-**Cost accepted, honestly.** Ansible is slow, its error messages are poor, and YAML is a
-weak language for conditionals. Those were judged cheaper than the alternatives' costs.
+**Cost accepted.** Ansible is slow, its error messages are poor, and YAML is a
+weak language for conditionals. These costs were judged lower than those of the alternatives.
 
 ### Two layers: platform and identity
 
-**Decision.** The software is one layer, replaced wholesale on upgrade. The pod's own
+**Decision.** The software is one layer, replaced in full on upgrade. The pod's own
 declaration is another, which an upgrade cannot touch.
 
 **Why.** They change for different reasons and must change independently. An upgrade
@@ -167,12 +167,12 @@ Adding a sensor must not require a software release.
 and lose nothing an operator configured? Yes, and that is what makes unattended upgrades
 safe.
 
-**The corollary took a while to see.** Nothing that names a deployment belongs in the
+**Configuration consequence.** Deployment-specific values must not be stored in the
 shared layer. Five values (mesh host, upstream endpoint, DNS pins, portal, package repo)
-were sitting in `group_vars`, meaning every site that received the software also received
-the addresses of a fabric it was not part of. They now live in the pod's own
+were stored in `group_vars`, meaning every site that received the software also received
+the addresses of a fabric it was not part of. They are now stored in the pod’s own
 `05-fabric.yml`, and a test named *"the platform layer names no deployment"* fails if one
-comes back.
+is reintroduced.
 
 ### One arm process per publisher
 
@@ -188,13 +188,13 @@ radius, and an audit trail that can say which sensor produced what.
 **Decision.** The pod runs its own CA and issues one leaf per publisher.
 
 **Why.** The ACL scopes by certificate CN. One shared credential would make every publisher
-indistinguishable to both the policy and the audit trail, which defeats the point of the
-appliance, attribution.
+indistinguishable to both the policy and the audit trail, which prevents the
+appliance from providing attribution.
 
 The CA is pod-local rather than fleet-central because a pod must be able to onboard a
 sensor with no route to anywhere.
 
-**Cost accepted.** Pod-local certificates mean nothing outside the pod. This is correct:
+**Cost accepted.** Pod-local certificates are not trusted outside the pod. This is correct:
 what leaves the pod is authorised by the upstream slot, an entirely separate credential
 minted off-box.
 
@@ -223,8 +223,8 @@ frames them for TCP. These are session operations, not sensor-format mappings.
 
 1. **Onboarding is not blocked on a specification.** A vendor who cannot tell you their
    message format can still be captured today and decoded later.
-2. **The trust boundary stays thin.** A parser is attack surface; not decoding means the
-   arm has almost none.
+2. **Payload parsing is limited.** Each parser adds attack surface; byte arms avoid
+   decoding sensor payloads.
 
 **Cost accepted.** Capture does not establish semantic validity. SAPIENT envelope/type
 checks do not validate the meaning of a detection. Typed decoding and mappings belong in
@@ -232,22 +232,22 @@ the producer or an external translator; adding them to an arm would change the b
 
 ### Rust for the arms
 
-**Decision.** The arms are Rust; trust behaviour lives in one shared crate.
+**Decision.** The arms are Rust; trust behaviour is implemented in one shared crate.
 
-**Why.** An arm parses attacker-influenced bytes off a socket, on a box nobody can reach,
+**Why.** An arm parses attacker-influenced bytes from a socket, on a host with limited remote access,
 with a length-prefixed framing mode where a bad length is a plausible input. That is
 precisely where memory-safety bugs become remote compromise. Rust also produces a single
 static binary with no runtime, which suits a container that should be nothing but the
 program.
 
 Everything defining trust behaviour (session setup, the allowlist gate, key grammar,
-counters) lives in `common/` so the arms cannot drift on the parts that must be
+counters) is implemented in `common/` so the arms cannot drift on the parts that must be
 identical.
 
 ### Bounded buffering, and deliberate data loss
 
-**Decision.** A small queue sits between the socket and the session. It discards rather
-than grows.
+**Decision.** A bounded queue connects the socket and the session. It discards messages
+rather than increasing without limit.
 
 **Why not durability.** This is a live stream. A track from six seconds ago is not
 valuable, it is misleading: replaying a backlog into a live picture after a reconnect is
@@ -255,14 +255,14 @@ worse than having dropped it.
 
 **Why it exists at all.** Two reasons. The socket loop never blocks on the network, so a
 stall cannot push loss into the kernel buffer where nothing counts it. And an outage
-becomes visible. Before this, `Session::put` returned success into a dead session, so the
+becomes visible. Before this, `Session::put` returned success into an inactive session, so the
 "forwarded" counter was counting data that never left the box.
 
 **Three bounds, each for a different failure:**
 
 | Bound | Protects against |
 |---|---|
-| **age** | staleness. Freshness beats completeness |
+| **age** | staleness. Freshness takes priority over completeness |
 | **count** | a burst growing the queue without limit |
 | **bytes** | memory exhaustion. Item count is not a memory bound. A few hundred 16 MB frames is gigabytes, and being OOM-killed is worse than losing data. |
 
@@ -274,7 +274,7 @@ Everything dropped is counted, so the cost of an outage is measured rather than 
 
 **Why.** `apply` is level-triggered and correct, but only runs when a human runs it.
 Everything between two runs was unwatched, including a known failure where an audit sink
-is up, green in `podman ps`, and subscribing nothing.
+is running according to `podman ps` but receives no subscribed data.
 
 The split is exact:
 
@@ -284,22 +284,22 @@ The split is exact:
 | **declaration drift**: the desired state itself moved | reported; a human applies it |
 
 A watchdog that applied configuration would restart the router and disturb every arm on the
-pod because somebody edited a file, which is a 3am outage waiting to happen. The kubelet restarts a
-crashed pod; it does not roll your Deployment because a YAML changed.
+pod because somebody edited a file, which could cause an unattended outage. The kubelet restarts a
+crashed pod; it does not update a Deployment merely because a YAML file was edited.
 
 Adding the watchdog let a fan-out be deleted: an Ansible handler used to restart *every*
-audit sink whenever the ACL changed. A sink's liveness is now the sink's own business.
+audit sink whenever the ACL changed. Each sink’s liveness is now managed independently.
 
 ### Convergence in both directions
 
 **Decision.** `apply` refuses when a running publisher is no longer declared.
 
-**Why.** Creating from a declaration is the easy half. Deleting an arm from `30-arms.yml`
+**Why.** Creating resources is only part of convergence. Deleting an arm from `30-arms.yml`
 regenerated the ACL without its grant, regenerated the router config, reported `ok`, and
 left the container running with a valid certificate, still bound to its port and still
 publishing.
 
-That is the worst shape a convergence bug takes. Every artifact agrees the publisher is
+This leaves the running state inconsistent with every generated artifact. Every artifact agrees the publisher is
 gone, the operator believes they revoked it, and it is still there.
 
 **Measured.** Removing a declaration by hand and sending to the port that no longer had
@@ -315,15 +315,15 @@ human decision, so the default names the exact remedy and `-e reap_orphans=true`
 deliberate act that applies it.
 
 **What reaping does not do.** It stops containers. Both copies of the private key stay on
-disk, still signed by the pod's CA. That is survivable rather than safe: the regenerated
+disk, still signed by the pod's CA. This leaves residual key material: the regenerated
 ACL no longer grants the CN, and the router reloads it before anything reconnects, so the
 credential is inert. It is not a retirement, and the message says so. `remove-arm` is the
 verb that removes the key.
 
 ### Revocation is a file on disk, not a policy
 
-**Decision.** `remove-arm` deletes both copies of a publisher's private key, and fails
-loudly if it cannot find one where it expects it.
+**Decision.** `remove-arm` deletes both copies of a publisher's private key, and reports an error
+if it cannot find a key at its expected path.
 
 **Why.** A brokerless fabric has no revocation list to publish and no broker to enforce
 one. The ACL is regenerated from the declaration, but it is read once at router startup,
@@ -343,8 +343,8 @@ runtime, which is the copy the arm actually mounts.
 
 The header comment asserted the opposite, in italics, for months.
 
-**The fix that matters is not the path.** Correcting the string takes a minute and would
-drift again the next time either side is renamed. The two sides are in different
+**The fix that matters is not the path.** Correcting only the string would allow another
+mismatch when either side is renamed. The two sides are in different
 languages, in different directories, written weeks apart, and nothing read both. So a
 test now does: it extracts every per-publisher path the playbook writes, including the
 ones openssl produces inside a shell block off a `${out}` prefix, evaluates the CLI's own
@@ -355,10 +355,10 @@ writes is exactly the original bug and is invisible from the CLI side.
 **A guard that names one file cannot express a two-file invariant.** The certificate mint
 was `creates:`-guarded on the certificate. Removal deliberately keeps the certificate so
 old audit records still resolve. Re-adding the same id therefore found the certificate,
-skipped the mint, and failed placing a key that was never generated. Guarding on the key
-instead only moves the hole: this script writes the key first, so an interruption between
+skipped certificate generation, and failed to copy a key that had not been generated.
+Guarding on the key alone leaves another failure case: this script writes the key first, so an interruption between
 the two openssl calls would leave a key whose guard blocks the certificate forever. The
-guard now lives in the script and requires both files, non-empty, which is the only
+guard is now implemented in the script and requires both files, non-empty, which is the only
 condition that means the identity is complete.
 
 ### The pod publishes its own health
@@ -367,8 +367,8 @@ condition that means the identity is complete.
 jittered by its own identity. The privileged half runs on the host; the publisher is a
 container that reads one file.
 
-**Why.** Everything the pod does to keep itself alive is invisible. A watchdog restarts a
-dead sink, a timer renews an expiring certificate, selfheal re-enrols a dropped agent. From anywhere else, a pod that has repaired itself four hundred times looks exactly
+**Why.** The pod’s automatic recovery actions are not visible remotely. A watchdog restarts a
+failed sink, a timer renews an expiring certificate, selfheal re-enrols a dropped agent. From anywhere else, a pod that has repaired itself four hundred times looks exactly
 like one that never had a problem. The only way to learn a pod's state was to reach it,
 and a pod that cannot be reached is the one worth knowing about.
 
@@ -379,17 +379,17 @@ network, and its entire grant on the fabric is `put` on one key.
 
 **Alternatives considered.**
 
-| Option | Why it lost |
+| Option | Reason rejected |
 |---|---|
-| **Define a new envelope, topic and reader** | The first draft of the design did this, and independently reproduced a reveal-only shape, a five-state grading and a denominator argument that all already exist in the fleet's environment health surface. Arriving at the same answer separately is reassuring about the reasoning and a waste of a build. |
-| **Central scraping** | A mesh-enrolled pod is reachable, so this is not impossible, but it cannot reach a pod that never joined, it adds a listener to a border appliance, and it inverts the load direction so one curious reader creates work on every pod at once. |
+| **Define a new envelope, topic and reader** | The first draft of the design did this, and independently reproduced a reveal-only shape, a five-state grading and a denominator argument that all already exist in the fleet's environment health surface. Arriving at the same answer separately is reassuring about the reasoning and duplicated implementation work. |
+| **Central scraping** | A mesh-enrolled pod is reachable, so this is not impossible, but it cannot reach a pod that never joined, it adds a listener to a border appliance, and it inverts the load direction so one reader’s query creates work on every pod at once. |
 | **Reuse the audit sinks** | They already observe everything, but they observe *sensor data*. Mixing appliance telemetry into that namespace means a consumer of tracks receives health. |
-| **Publish only on change** | Cheapest and wrong: silence would mean both "nothing changed" and "the pod is gone". A heartbeat is what makes absence detectable. |
+| **Publish only on change** | Uses fewer messages but cannot distinguish failure: silence would mean both "nothing changed" and "the pod is gone". A heartbeat is what makes absence detectable. |
 
-**Cost accepted.** One key per pod is a real charge against the fabric's cardinality
+**Cost accepted.** One key per pod consumes part of the fabric’s key-count
 budget, the tree walk is O(N) in keys, measured at 227 ms for 15k. That is why it is one
 key and not one per metric, and why the design says never to subscribe fleet-wide. A pod
-with no upstream slot still cannot publish at all; that shape is unserved and named as an
+with no upstream slot still cannot publish at all; that configuration is unsupported by the publisher and named as an
 open question in [`design-pod-health.md`](design-pod-health.md).
 
 ### Releases and packages, not `git clone`
@@ -402,15 +402,15 @@ in another country on four counts: it needs repository credentials per site; `gi
 neither atomic nor reversible; a merge conflict is unresolvable by someone who does not use
 git; and there is no version to name in a support request.
 
-Rollback is flipping the symlink back, because the previous release is still on disk.
+Rollback restores the previous symlink target, because the previous release is still on disk.
 
 **No apt repository, deliberately.** A repo is a second distribution channel to build, sign
 and host, with its own metadata layout, while a `.deb` installed by file already gives the
 two things worth having: dependency installation, and dpkg owning `/opt/octo-pod`.
 
-**A near miss worth recording.** One variable, `octo_repo_url`, was serving both the release
-file surface and an apt `sources.list` line. Pointed at the release surface, apt looks for
-`dists/<suite>/…`, 404s, and a broken apt source fails *every* apt operation on the box,
+**Previous distribution error.** One variable, `octo_repo_url`, was serving both the release
+file surface and an apt `sources.list` line. When configured with the release URL, apt requests
+`dists/<suite>/…`, receives HTTP 404, and a broken apt source fails *every* apt operation on the box,
 including the installs provisioning itself depends on. They are now separate variables, and
 the apt one is empty because nothing publishes a repository.
 
@@ -422,17 +422,17 @@ The clone still exists, for developers. `upgrade` refuses to run in one and says
 `SHA256SUMS`, verified on the pod.
 
 **Why public.** Otherwise a pod cannot fetch the software until it has joined the mesh, and
-it cannot join the mesh until it has the software. Making it public means *where it came
-from proves nothing*, so the trust has to travel with the artifact.
+it cannot join the mesh until it has the software. Public download access does not establish authenticity; the artifact
+must include a verifiable signature.
 
 **Why keyless.** OIDC to a short-lived certificate. There is no private key to store, steal
-or rotate, and what an operator verifies is the workflow identity. A signing key sitting in
+or rotate, and what an operator verifies is the workflow identity. A signing key stored in
 CI would be the highest-privilege credential in the system, because it installs as root on
 every pod.
 
 **A flaw found by review, recorded because it was subtle.** The first version had an
-`--unverified` flag for bring-up, which left `LATEST`, `SHA256SUMS` and the artifact all
-controlled by the same server, so the hash check passed vacuously and a hostile mirror got
+`--unverified` flag for initial setup, which left `LATEST`, `SHA256SUMS` and the artifact all
+controlled by the same server, so the hash check passed vacuously and a malicious mirror could execute code as
 root at the next `apply`. It was replaced by `--expect-sha256`, which takes a digest from
 *outside* the channel being verified. That flag then skipped the signature in its turn,
 and on `--images` compared the digest to nothing, so any 64 hex characters unpacked an
@@ -452,7 +452,7 @@ is on the pod.
 It uses the existing certificate as the specification for its replacement (same CN, SAN,
 EKU, key type), so it cannot diverge from what `apply` would mint, and it picks up arms
 added long after it was written. Anything the pod's CA did not sign is skipped, which is how
-the upstream slot certificate, which genuinely needs an operator, is left alone.
+the upstream slot certificate, which requires an operator, is not modified.
 
 ### The singleton router
 
@@ -462,8 +462,8 @@ the upstream slot certificate, which genuinely needs an operator, is left alone.
 routers can peer), but it doubles the audit surface, requires the ACL to be identical across
 both, and introduces split-brain questions on a box in a field.
 
-**The judgement:** make the restart *invisible*, so arms ride it out and resume by
-themselves, rather than make it impossible. Revisit only if the gap proves to cost something real.
+**The judgement:** let arms reconnect and resume automatically after a router restart.
+Revisit this decision if measured interruptions are unacceptable.
 
 ---
 
@@ -483,8 +483,8 @@ Two layers, the same pattern the fleet already uses:
 1. **Persist the clock to disk** and restore it *before the network*, advancing only, so it
    is a no-op on hardware with a real RTC.
 2. **Let chrony refine it**, with stepping bounded to the first few updates. An
-   unauthenticated source is needed to bootstrap from 1970, but must not be able to walk a
-   running pod's clock, because that clock governs certificate validity.
+   unauthenticated source is needed to bootstrap from 1970, but must not be able to repeatedly shift a
+   running pod’s clock, because that clock governs certificate validity.
 
 Certificate renewal refuses to run when the clock is implausible. Signing then would date
 every replacement to the epoch, turning a wrong clock into permanently broken trust across
@@ -492,8 +492,8 @@ every certificate at once.
 
 ### Security
 
-The pod holds no registry credential and no repository credential, deliberately: it is the
-thing that gets stolen, and it must yield only what it was already running.
+The pod holds no registry credential and no repository credential, deliberately: the
+host may be stolen, and it must expose only the software it already runs.
 
 Authorisation is per-publisher and scoped by certificate CN. The ACL is generated, never
 hand-edited, because it is read once at startup and silent in every failure mode.
@@ -502,9 +502,9 @@ hand-edited, because it is read once at startup and silent in every failure mode
 
 Zenoh is brokerless: an unobserved publish is gone, not queued. That is why every namespace
 that can be written has an audit sink watching it: a namespace with no subscriber is a
-namespace where data silently evaporates.
+namespace where published data is discarded without observation.
 
-Faults surface without anyone connecting to the box: unrepaired faults exit non-zero so a
+Faults are reported without an operator connecting to the host: unrepaired faults exit non-zero so a
 failed systemd unit is visible in `systemctl --failed`, which is the only always-present
 signal on a host with no metrics scraper.
 
@@ -517,7 +517,7 @@ signal on a host with no metrics scraper.
 | **Kubernetes** | The patterns are right: declarative desired state, level-triggered reconciliation, liveness probes, immutable pinned artifacts. They are used. The platform is not: a control plane on a border appliance with no operator is the opposite of what the constraint asks for. |
 | **Auto-apply on drift** | See *Repair, never apply*. |
 | **Decoding or schema validation at the arm** | See *Capture-first*. |
-| **Durable spooling to disk** | Turns a six-second blip into a disk-full failure on a box nobody can reach, for data that is not valuable by the time it would be replayed. |
+| **Durable spooling to disk** | Turns a six-second interruption into a disk-full failure on a box nobody can reach, for data that is not valuable by the time it would be replayed. |
 | **Mesh-only distribution of the software** | Elegant, since revoking the peer revokes updates, but it cannot bootstrap a box that has not joined yet. |
 
 ---
@@ -527,7 +527,7 @@ signal on a host with no metrics scraper.
 - **A pod with no upstream slot still cannot report.** Health now leaves a pod that holds
   a slot. A pod without one has no outward path at all, which is a supported shape and
   invisible by construction. The design calls for a locally retained record so such a pod
-  is legible on first visit; that half is not built.
+  can be inspected on the first visit; that half is not built.
 - **No hardware watchdog.** A hung kernel never runs the software self-heal.
 - **No ingress shaping.** A flood from a permitted source is absorbed by dropping, but not
   shaped.

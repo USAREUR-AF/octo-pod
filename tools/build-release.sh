@@ -6,6 +6,7 @@
 #   tools/build-release.sh --stage-only D  assemble the tree at D and stop (tests use this)
 #   tools/build-release.sh --repo O/N      the repository whose release workflow signs it
 #                                          (default: $GITHUB_REPOSITORY, set in Actions)
+#   tools/build-release.sh --docs D        also package the built documentation site at D
 #
 # TWO ARTIFACTS FROM ONE TREE:
 #   octo-pod_<v>_all.deb    for a pod that can reach apt. dpkg owns /opt/octo-pod, so
@@ -26,6 +27,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE_ONLY=""
 VERSION=""
+DOCS_DIR=""
 RELEASE_REPO="${GITHUB_REPOSITORY:-}"
 
 # A value-taking flag with nothing after it must say so, not die on an unbound $2.
@@ -35,6 +37,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --stage-only) need_value "$@"; STAGE_ONLY="$2"; shift 2 ;;
     --with-images) WITH_IMAGES=1; shift ;;
+    --docs)       need_value "$@"; DOCS_DIR="$2"; shift 2 ;;
     --repo)       need_value "$@"; RELEASE_REPO="$2"; shift 2 ;;
     -h|--help)    sed -n '2,12p' "$0"; exit 0 ;;
     *)            VERSION="$1"; shift ;;
@@ -50,6 +53,11 @@ fi
 # reached LATEST every pod refused every upgrade until another release replaced it.
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(~[a-z]+[0-9]+)?$ ]] \
   || { echo "version '$VERSION' is not X.Y.Z or X.Y.Z~<word><N>" >&2; exit 2; }
+# --docs takes a documentation site that is already built. Refuse anything that is not
+# one before building anything else.
+if [ -n "$DOCS_DIR" ] && [ ! -f "$DOCS_DIR/index.html" ]; then
+  echo "--docs $DOCS_DIR is not a built documentation site (no index.html)" >&2; exit 2
+fi
 
 # What a pod needs, and nothing else. Listed positively: a deny-list would ship whatever
 # lands in the repo next.
@@ -71,8 +79,8 @@ PAYLOAD=(bin platform example README.md LICENSE NOTICE VERSION)
 # Keep the README's operator guides available offline, without copying all of
 # docs/ (design files and local editor backups are not release payload).
 EXTRA_FILES=(tools/build-airgap-bundle.sh
-             tools/install-to-pod.sh tools/mint-key.sh tools/deprovision-pod.sh
-             CHANGELOG.md docs/deployment.md docs/operations.md docs/upgrading.md
+             tools/install-to-pod.sh tools/mint-key.sh tools/deprovision-pod.sh docs/images.md
+             CHANGELOG.md docs/deployment.md docs/operations.md docs/upgrading.md docs/faq.md
              docs/release-status.md docs/guide-zenoh-partners.md docs/mac-airgap-images.md)
 
 WITH_IMAGES="${WITH_IMAGES:-0}"
@@ -217,10 +225,24 @@ if [ "$WITH_IMAGES" = 1 ]; then
   echo "built $DIST/octo-pod-images-$VERSION.tar.gz"
 fi
 
+# THE DOCUMENTATION SITE, packaged so each release carries the documentation that
+# matches it. It is listed in SHA256SUMS only when --docs was given to THIS run, never
+# because a file of that name is left in dist/ from an earlier build: an artifact the
+# signature covers must be one this build produced.
+if [ -n "$DOCS_DIR" ]; then
+  DOCSTAGE="$(mktemp -d)"
+  cp -R "$DOCS_DIR" "$DOCSTAGE/octo-pod-docs-$VERSION"
+  tar -czf "$DIST/octo-pod-docs-$VERSION.tar.gz" -C "$DOCSTAGE" "octo-pod-docs-$VERSION"
+  rm -rf "$DOCSTAGE"
+  ( cd "$DIST" && shasum -a 256 "octo-pod-docs-$VERSION.tar.gz" > "octo-pod-docs-$VERSION.tar.gz.sha256" )
+  echo "built $DIST/octo-pod-docs-$VERSION.tar.gz"
+fi
+
 ARTIFACTS=()
 if [ -f "$DIST/octo-pod-$VERSION.tar.gz" ];    then ARTIFACTS+=("octo-pod-$VERSION.tar.gz"); fi
 if [ -f "$DIST/octo-pod_${VERSION}_all.deb" ]; then ARTIFACTS+=("octo-pod_${VERSION}_all.deb"); fi
 if [ -f "$DIST/octo-pod-images-$VERSION.tar.gz" ]; then ARTIFACTS+=("octo-pod-images-$VERSION.tar.gz"); fi
+if [ -n "$DOCS_DIR" ]; then ARTIFACTS+=("octo-pod-docs-$VERSION.tar.gz"); fi
 ( cd "$DIST" && shasum -a 256 "${ARTIFACTS[@]}" > SHA256SUMS )
 printf '%s\n' "$VERSION" > "$DIST/LATEST"
 
@@ -255,7 +277,7 @@ installs one of these once; every version after that comes from
 <h2>Verify before you install</h2>
 <pre>cosign verify-blob \\
   --bundle SHA256SUMS.cosign-bundle \\
-  --certificate-identity-regexp '^https://github\\.com/${SIGNER_REPO}/\\.github/workflows/release\\.yml@refs/tags/octo-pod-v' \\
+  --certificate-identity-regexp '^https://github\\.com/(?i:${SIGNER_REPO})/\\.github/workflows/release\\.yml@refs/tags/octo-pod-v' \\
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
   SHA256SUMS
 

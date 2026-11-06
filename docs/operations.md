@@ -12,7 +12,7 @@ sudo octo-pod status             # every arm and peer: state, transport, topic, 
 sudo octo-pod top                # the same, live: rates, mesh, problems (q quits)
 sudo octo-pod get arms           # all ingress and egress arms, with direction
 sudo octo-pod get ingress        # only sensor-facing ingress arms
-sudo octo-pod describe arms radar1 # one item in full, with the commands to dig further
+sudo octo-pod describe arms radar1 # one item in full, with the commands for further diagnosis
 sudo octo-pod logs arms radar1 -f # its container's logs
 sudo octo-pod certs --check      # every certificate; fails if one ends within 30 days
 sudo octo-pod check              # what apply would change; changes nothing
@@ -29,7 +29,7 @@ the order data moves through the pod, with the received and sent rate, drops, qu
 consumers and a trend. The rates come from the stats line each container already logs
 every period, so `top` needs no new port or agent, and a rate is per second over the last
 period. Keys: `1` flows, `2` declarations, `3` mesh peers, `4` problems, `enter` detail
-with the commands to dig further, `l` logs, `/` filter, `?` help. It changes nothing.
+with the commands for further diagnosis, `l` logs, `/` filter, `?` help. It changes nothing.
 `--once` and `--json` print one snapshot for scripts.
 
 For example, start with a live overview, then inspect a named item. `otp` below is
@@ -50,8 +50,7 @@ logs before treating a nonzero rate as successful delivery of sensor data.
 A dashboard layout or declared subscription records intended connectivity. Validate
 actual delivery with the pod counters and a subscriber or receiver at the destination.
 
-**`get`, `describe`, `logs` and `certs` answer one question each**, in the shapes kubectl
-uses. `get arms` includes ingress and egress with a direction column; `get ingress`
+**`get`, `describe`, `logs` and `certs` answer one question each**, using the same command structure as kubectl. `get arms` includes ingress and egress with a direction column; `get ingress`
 and `get egress` filter them. `get flows` also includes bridges and declared peers.
 `describe arms NAME` and `logs arms NAME` accept either direction. The `edit arms`
 command currently supports ingress endpoint corrections only.
@@ -80,7 +79,7 @@ holds no slot.
 
 ## Adding a publisher
 
-Three shapes, by how the sensor behaves:
+Three connection types, selected according to sensor behavior:
 
 ```bash
 # it sends UDP to a port you choose
@@ -120,7 +119,7 @@ addresses; without it, it reaches the pen over the mesh only:
 sudo octo-pod add-peer c2 --from 10.1.2.30
 ```
 
-After `apply`, package its certificate and instructions for hand-off:
+After `apply`, package its certificate and instructions for transfer:
 
 ```bash
 sudo octo-pod peer bundle c2
@@ -128,7 +127,7 @@ sudo octo-pod peer bundle c2
 
 A peer may also subscribe to fabric data you release to it (`octo-pod peer allow-read`),
 and the pod can publish into a partner's own router (`egress add --dest zenoh://`).
-[`docs/guide-zenoh-partners.md`](guide-zenoh-partners.md) walks through every step.
+[`docs/guide-zenoh-partners.md`](guide-zenoh-partners.md) describes each step.
 
 ## Retiring a publisher
 
@@ -155,7 +154,7 @@ both private keys stay on disk. Follow it with `remove-arm` to remove the key.
 
 ## Sending fabric data to a system that cannot join
 
-An egress destination is an arm in reverse. A system that cannot join the mesh receives
+An egress destination is an arm that sends fabric data to a receiver. A system that cannot join the mesh receives
 fabric data from the pod through its own egress arm: its own certificate, one literal
 address, and an audit record of every send. The pod delivers it the way that system
 expects to get it from the sensor itself, so the system's owner changes nothing: they point
@@ -168,7 +167,7 @@ A system can get fabric data three ways. Pick by what you can ask of the system'
 | The system | What runs on it | Use |
 |---|---|---|
 | Cannot or should not join the mesh, or its owner should change nothing | Nothing of yours | An egress destination on this pod |
-| May join the mesh and run your software, but speaks no Zenoh | A socket adapter under the system's own identity | The adapter on the system's host. No pod |
+| May join the mesh and run your software, but does not implement Zenoh | A socket adapter under the system's own identity | The adapter on the system's host. No pod |
 | May join the mesh, and its owner will build Zenoh support | Its own Zenoh client, under its own identity | Nothing extra. It subscribes directly |
 
 Only the pod is one way by construction: the system holds no identity, and a destination
@@ -317,8 +316,8 @@ certificate and audit records are kept.
 
 ### Known limits
 
-- A reconnecting receiver replaces its own connection, and the newest connection wins. A
-  receiver that queues several attempts can churn for a minute before one connection holds.
+- A reconnecting receiver replaces its own connection, and the newest connection replaces the existing one. A
+  receiver that queues several attempts can repeatedly replace connections for a minute before one remains established.
 - The pod's Zenoh sessions leave multicast scouting at Zenoh's default instead of turning it
   off, and sessions to the pen don't check the pen's certificate name. The downlink
   bridge's fabric session does check the router's name.
@@ -361,8 +360,8 @@ sudo octo-pod apply
 ```
 
 `apply` loads the new ruleset and keeps it only if the mesh's management service and the
-fabric router still accept new connections. If either does not, the previous ruleset comes
-back and `apply` fails. The verified ruleset loads at boot before the network comes up.
+fabric router still accept new connections. If either does not, the previous ruleset is
+restored and `apply` fails. The verified ruleset loads at boot before network startup.
 `set-firewall off` and `apply` remove the table and its boot unit.
 
 ## What runs without you
@@ -374,7 +373,7 @@ None applies a configuration change.
 |---|---|
 | `octo-watchdog.timer` | every minute. Restarts an audit sink that is up but subscribing nothing, or a router listening on nothing. Reports declaration drift, never acts on it. Writes `/var/lib/octo-pen/watchdog.status` |
 | `pen-cert-renew.timer` | daily. Renews any certificate the pod's own CA signed inside its 60-day window, then restarts what presents it. Refuses if the clock is implausible |
-| `pen-cert-expiry.timer` | daily. Fails loudly in `systemctl --failed` when something is expiring and renewal did not fix it |
+| `pen-cert-expiry.timer` | daily. Reports failure in `systemctl --failed` when something is expiring and renewal did not fix it |
 
 The pod also publishes its own health onto the fabric every 60 seconds, jittered by its
 identity. Turn it off with `health_pub_enabled: false` in the pod's `05-fabric.yml`.
@@ -504,9 +503,9 @@ Addresses, ports and setup keys are deliberately not completed.
 
 ## Troubleshooting
 
-**This system fails quietly.** A rejected publish looks identical to a successful one at
-the sender. `sudo octo-pod verify` is the only thing that tells working from silent. Run it
-after every change.
+**Rejected publications may not produce a sender-side error.** A rejected publish
+can appear successful to the sender. Run `sudo octo-pod verify` after every change
+to check the pod’s configuration and services.
 
 One exception: a certificate whose CN is in no ACL subject makes the router log this once at
 session open, naming the peer by Zenoh id rather than CN:
@@ -518,18 +517,18 @@ session open, naming the peer by Zenoh id rather than CN:
 | Symptom | Usually |
 |---|---|
 | Sensor data never appears | it is sending from an address other than `--from`. Check with `sudo tcpdump -ni any port 48021` |
-| …still nothing | wrong destination, or the arm is bound to the wrong leg. Compare `ss -ulnp \| grep 48021` against the address the sensor uses |
+| …still nothing | wrong destination, or the arm is bound to the wrong network interface. Compare `ss -ulnp \| grep 48021` against the address the sensor uses |
 | Peer connects, nothing arrives | their key prefix. They must publish to `raw/<their-id>/…` with no org or anchor prefix |
 | Arm says `forwarded=N`, sink sees nothing | the router is denying the writes. Check the CN in the ACL matches the cert the arm mounts |
 | Dial-out feed never connects | a listening arm pointed at a sensor that also listens. It needs `--dial` |
 | `verify` fails on `drift` | a declared publisher is not sending. For an occasional feed set `expect: { continuous: false }` |
-| Sink looks healthy, no data | a dead audit sink keeps serving metrics. Check `goat_audit_subscriber_session_state` |
+| Sink looks healthy, no data | a failed audit subscriber continues to serve metrics. Check `goat_audit_subscriber_session_state` |
 | Everything stops after a router restart | sinks do not reconnect on their own. Run `sudo octo-pod apply` |
 | `octo-pod: command not found` | package installation did not finish |
 | `check` says "not a pod yet" | `join` or `init` has not run |
 | Router stops accepting arms | its certificate may have expired. `systemctl status pen-cert-renew`, or force it with `sudo /usr/local/sbin/pen-cert-renew`. It refuses on an implausible clock, so check `date` first |
 | A publisher you removed is still running | `apply` refuses and names it. `remove-arm <id>` is the clean removal |
-| `join` hangs at enrolment | a spent setup key. It is one-off; mint a fresh one |
+| `join` hangs at enrolment | an already-used setup key. Each key permits one enrollment; issue a new key |
 | A traceback instead of an error | you are missing `sudo` |
 
 ```bash

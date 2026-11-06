@@ -53,14 +53,9 @@
 //!
 //! License: Apache-2.0
 
-mod egress;
-mod framing;
-mod identity;
-mod session;
-mod wire;
-
-// The generated types live in the shared crate; `crate::proto::v2` names them here.
-use sapient_proto as proto;
+// The modules are the crate's library (`src/lib.rs`), so the fuzz targets reach the same
+// code this binary runs.
+use sapient::{egress, framing, identity, session, wire};
 
 use std::sync::Arc;
 use std::time::Instant;

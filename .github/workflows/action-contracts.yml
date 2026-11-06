@@ -16,7 +16,7 @@ jobs:
       matrix:
         leg: [one, two]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: create a registry-free build context
@@ -25,8 +25,8 @@ jobs:
         run: |
           mkdir -p /tmp/action-context
           printf 'FROM scratch\nLABEL smoke.leg="%s"\n' "$LEG" > /tmp/action-context/Dockerfile
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/build-push-action@v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         id: image
         with:
           context: /tmp/action-context
@@ -47,7 +47,7 @@ jobs:
           test "$(docker image inspect local/action-contract:smoke --format '{{index .Config.Labels "smoke.leg"}}')" = "$LEG"
           mkdir -p /tmp/digests
           touch "/tmp/digests/fixture-${LEG}@${DIGEST#sha256:}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: digest-smoke-${{ matrix.leg }}
           path: /tmp/digests/*
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp/digests
           pattern: digest-smoke-*
@@ -79,13 +79,13 @@ jobs:
           mkdir -p /tmp/release-fixture
           printf 'synthetic package\n' > /tmp/release-fixture/package.txt
           (cd /tmp/release-fixture && sha256sum package.txt > SHA256SUMS)
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-smoke
           path: /tmp/release-fixture/*
           if-no-files-found: error
           retention-days: 1
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-smoke
           path: /tmp/release-downloaded

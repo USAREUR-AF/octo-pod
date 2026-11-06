@@ -1,0 +1,81 @@
+# Fuzz targets for the arm code that reads bytes from a peer or from the pen.
+#
+# This is a separate workspace on purpose. The targets need a nightly toolchain and
+# libFuzzer, and keeping them out of ../Cargo.toml leaves `cargo build`, clippy, the tests
+# and the minimum-version check exactly as they were.
+#
+# There is no Cargo.lock here. Each build starts from the workspace lock file
+# (`cp ../Cargo.lock Cargo.lock`), so the fuzz build uses the dependency versions the
+# arms ship with, and only the fuzzing crates are resolved fresh.
+#
+# Run a target with cargo-fuzz; see "Fuzzing" in CONTRIBUTING.md. ClusterFuzzLite builds
+# the same targets for pull requests (.clusterfuzzlite/).
+
+[package]
+name = "octo-pod-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+description = "octo-pod: fuzz targets for the arms' framing, SAPIENT and downlink gate code"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+octo-arm-common = { path = "../common" }
+octo-egress = { path = "../egress" }
+sapient = { path = "../sapient" }
+sapient-proto = { path = "../sapient-proto" }
+sapient-receiver = { path = "../sapient-receiver" }
+prost = "0.14"
+# The egress arms check a sample's key as an OwnedKeyExpr. Same pin as the workspace.
+zenoh = { version = "=1.9.0", features = ["unstable"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "tcp_frame"
+path = "fuzz_targets/tcp_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sapient_frame"
+path = "fuzz_targets/sapient_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sapient_message"
+path = "fuzz_targets/sapient_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sapient_json"
+path = "fuzz_targets/sapient_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "downlink_gate"
+path = "fuzz_targets/downlink_gate.rs"
+test = false
+doc = false
+bench = false

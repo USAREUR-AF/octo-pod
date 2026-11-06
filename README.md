@@ -1,8 +1,41 @@
 # octo-pod
 
-An edge gateway for UDP/TCP sensor feeds and Zenoh peers. Capture and audit locally,
-then release selected feeds to a fabric or deliver fabric data to receivers.
+<!-- badges: the public repository's live status. The documentation book leaves this block out. -->
+[![CI](https://github.com/USAREUR-AF/octo-pod/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/USAREUR-AF/octo-pod/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/USAREUR-AF/octo-pod/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/USAREUR-AF/octo-pod/actions/workflows/codeql.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/USAREUR-AF/octo-pod/badge)](https://scorecard.dev/viewer/?uri=github.com/USAREUR-AF/octo-pod)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/USAREUR-AF/octo-pod?sort=semver)](https://github.com/USAREUR-AF/octo-pod/releases/latest)
+[![MSRV 1.89](https://img.shields.io/badge/MSRV-1.89-orange.svg)](arms/Cargo.toml)
+<!-- /badges -->
+
+octo-pod is an edge gateway appliance. It runs on one small computer where sensors
+live, takes in their feeds, records and audits them locally, and releases only what
+you choose onto a shared Zenoh network, the **fabric**, that other sites and systems
+share. It works the other way too: it can deliver data from the fabric to a local
+receiver.
+
+**Where it fits.** A sensor speaks its own wire format on its own network and has no
+place on a shared fabric; a shared fabric should not reach back into a sensor's
+network. octo-pod is the boundary between the two. Each pod sits at one site, owns the
+identity and access rules for every feed that crosses it, and keeps a local record of
+what it saw even when the link to the fabric is down. The fabric carries only the feeds
+a pod releases, under the names and to the audiences its operator declared. One pod
+serves one site; a larger deployment is many pods, each releasing into the same fabric
+and each governed on its own.
+
+**What crosses, and what does not.** Data enters through an **ingress arm**: a UDP or
+TCP sensor feed, or a Zenoh-native publisher that connects directly. It leaves through
+an **egress arm** to a receiver or to a partner's own Zenoh router, carrying only the
+keys you released. Nothing crosses that you did not declare: every arm and peer gets
+its own certificate and a narrow set of keys it may publish or read, and an optional
+pod firewall limits traffic to the connections you named. Capture stays local until you
+release it.
+
 `otp` is a short alias for `octo-pod`.
+
+For short answers for operators, partners and contributors, read the
+[frequently asked questions](docs/faq.md).
 
 ## Functions
 
@@ -48,6 +81,30 @@ released peer reads require 0.5.0 or later; see [Release status](docs/release-st
 Byte ingress and byte egress preserve the payload format. SAPIENT egress manages the
 session and protocol envelope; its input must already contain SAPIENT messages.
 Local capture does not provide durable store-and-forward delivery.
+
+## Operate from the CLI
+
+Every change edits the pod's declaration; nothing on the running pod changes until you
+`apply`. `otp` is the short alias for every command below.
+
+- **Set up:** `bootstrap` prepares the host and loads carried images; `init` stands up
+  a pod for local capture; `join` enrolls it in a mesh; `set-mesh`, `set-lan` and
+  `set-firewall` declare how it reaches the network.
+- **Declare what crosses:** `add-arm` / `remove-arm` for ingress feeds, `add-peer` /
+  `remove-peer` for Zenoh peers, `release` to publish a captured feed to the fabric,
+  `egress add` / `egress remove` for receivers, and `peer allow-read` / `revoke-read` /
+  `allow-from` / `bundle` for what a peer may read or send. `edit` opens the
+  declaration directly.
+- **Apply and verify:** `check` shows what `apply` would change and changes nothing;
+  `apply` makes the running pod match the declaration; `verify` checks configuration
+  and services; `verify-flowing` confirms data is moving; `verify-clean` confirms no
+  residue.
+- **Watch:** `status` for service health, `top` for live flow counters, and `get` /
+  `describe` / `logs` / `certs` for declarations, detail, logs and certificate checks.
+- **Maintain:** `upgrade` moves to a new version, `fetch-images` pulls carried images,
+  and `identity` renews or inspects certificates. Between applies the pod renews its
+  own certificates and repairs supported service faults on its own, without changing
+  your declaration.
 
 ## Requirements
 
@@ -147,6 +204,7 @@ sudo octo-pod top
 | Upgrade or rebuild an existing pod | [Upgrades](docs/upgrading.md) |
 | Diagnose a failed step | [Troubleshooting](docs/operations.md#troubleshooting) |
 | Check released versus `main` features | [Release status](docs/release-status.md) |
+| List the container images a pod runs | [Container images](docs/images.md) |
 
 ## Development
 

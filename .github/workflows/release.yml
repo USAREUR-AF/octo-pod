@@ -33,16 +33,27 @@ on:
         description: 'Also build the image bundle (proves the ghcr read path)'
         type: boolean
         default: false
+      build_docs:
+        description: 'Also build and package the documentation site'
+        type: boolean
+        default: false
 
 # One release per tag at a time, and never cancel one already running.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read   # read-only by default; jobs that need more ask for it
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      # Every artifact SHA256SUMS lists, base64-encoded, for the provenance job below.
+      subjects: ${{ steps.subjects.outputs.subjects }}
     permissions:
       contents: write        # to create the release and attach artifacts
       id-token: write        # what makes keyless cosign work; nothing else needs it
@@ -53,7 +64,7 @@ jobs:
       # publishes releases, and nothing it does should be able to move an image tag.
       packages: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: version — the tag and the tree agree
         id: v
@@ -86,7 +97,7 @@ jobs:
       # it. A pod that installs from the bundle holds nothing, and verifies by digest,
       # which is public information and useless to an attacker. Capture yields the bytes
       # that box was already running, and no access to anything else.
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: startsWith(github.ref, 'refs/tags/octo-pod-v') || inputs.build_images
         with:
           registry: ghcr.io
@@ -98,16 +109,34 @@ jobs:
       # build-release.sh rather than a separate step on purpose — the bundle has to exist
       # BEFORE SHA256SUMS is written, or it ships unlisted, and an artifact the signature
       # does not cover is one a pod must refuse.
+      # THE DOCUMENTATION SITE, where this repository carries its builder: each release
+      # ships the documentation that matches it, listed in SHA256SUMS and covered by the
+      # same signature and provenance as everything else. A copy of the repository
+      # without tools/build-docs.py skips this step and releases without it.
+      - name: documentation site
+        id: docs
+        if: (startsWith(github.ref, 'refs/tags/octo-pod-v') || inputs.build_docs) && hashFiles('tools/build-docs.py') != ''
+        run: |
+          set -euo pipefail
+          cargo install --locked mdbook --version 0.5.4
+          cargo install --locked mdbook-i18n-helpers --version 0.4.0
+          python3 tools/build-docs.py --out "$RUNNER_TEMP/docs"
+          echo "dir=$RUNNER_TEMP/docs" >> "$GITHUB_OUTPUT"
+
       - name: build
         env:
           WANT_IMAGES: ${{ inputs.build_images }}
+          DOCS_DIR: ${{ steps.docs.outputs.dir }}
         run: |
           set -euo pipefail
+          args=("${{ steps.v.outputs.version }}")
           if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/octo-pod-v}" ] || [ "$WANT_IMAGES" = true ]; then
-            tools/build-release.sh "${{ steps.v.outputs.version }}" --with-images
-          else
-            tools/build-release.sh "${{ steps.v.outputs.version }}"
+            args+=(--with-images)
           fi
+          if [ -n "$DOCS_DIR" ]; then
+            args+=(--docs "$DOCS_DIR")
+          fi
+          tools/build-release.sh "${args[@]}"
 
       # The bundle is only useful if what it carries is what the playbooks ask for. A
       # mismatch here is a bundle that installs cleanly and then cannot start a pod.
@@ -176,7 +205,7 @@ jobs:
       # produces bundles for refs that will never ship.
       - name: Install cosign
         if: startsWith(github.ref, 'refs/tags/octo-pod-v')
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         with:
           cosign-release: 'v2.4.1'
 
@@ -190,6 +219,10 @@ jobs:
           # Signing the MANIFEST, not each artifact: one signature, and every hash in
           # the file inherits it. This is the exact chain bin/octo-pod-upgrade walks.
           cosign sign-blob --yes --bundle SHA256SUMS.cosign-bundle SHA256SUMS
+          # The same signature again in the standard Sigstore bundle format, under the
+          # file name other Sigstore clients and OpenSSF Scorecard look for. Pods and the
+          # installer keep reading SHA256SUMS.cosign-bundle; this one is for everyone else.
+          cosign sign-blob --yes --new-bundle-format --bundle SHA256SUMS.sigstore.json SHA256SUMS
           {
             echo "### cosign keyless signature"
             echo
@@ -214,9 +247,25 @@ jobs:
             --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             SHA256SUMS
+          cosign verify-blob \
+            --new-bundle-format \
+            --bundle SHA256SUMS.sigstore.json \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
           sha256sum -c --ignore-missing SHA256SUMS
 
-      - uses: actions/upload-artifact@v7
+      # The provenance subjects are exactly what the signed manifest lists, so the
+      # provenance and the signature describe the same set of files. SHA256SUMS is
+      # already in the "<sha256>  <name>" form the SLSA generator reads.
+      - name: provenance subjects
+        id: subjects
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        run: |
+          set -euo pipefail
+          echo "subjects=$(base64 -w0 < dist/SHA256SUMS)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: octo-pod-${{ steps.v.outputs.version }}
           path: |
@@ -226,6 +275,8 @@ jobs:
             dist/*.deb.sha256
             dist/octo-pod-images-*.tar.gz
             dist/octo-pod-images-*.tar.gz.sha256
+            dist/octo-pod-docs-*.tar.gz
+            dist/octo-pod-docs-*.tar.gz.sha256
             dist/SHA256SUMS*
             dist/index.html
             dist/LATEST
@@ -249,7 +300,7 @@ jobs:
         id: publish
         continue-on-error: true
         if: startsWith(github.ref, 'refs/tags/octo-pod-v')
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           files: |
             dist/*.tar.gz
@@ -258,6 +309,8 @@ jobs:
             dist/*.deb.sha256
             dist/octo-pod-images-*.tar.gz
             dist/octo-pod-images-*.tar.gz.sha256
+            dist/octo-pod-docs-*.tar.gz
+            dist/octo-pod-docs-*.tar.gz.sha256
             dist/SHA256SUMS*
             dist/index.html
             dist/LATEST
@@ -270,6 +323,20 @@ jobs:
                   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
                   SHA256SUMS
                 sha256sum -c --ignore-missing SHA256SUMS
+
+            `SHA256SUMS.sigstore.json` carries the same signature in the standard Sigstore
+            bundle format, for `cosign verify-blob --new-bundle-format` and other Sigstore
+            clients.
+
+            ## Verify build provenance (SLSA Build Level 3)
+
+                slsa-verifier verify-artifact octo-pod-${{ steps.v.outputs.version }}.tar.gz \
+                  --provenance-path octo-pod-${{ steps.v.outputs.version }}.intoto.jsonl \
+                  --source-uri github.com/${{ github.repository }} \
+                  --source-tag ${{ github.ref_name }}
+
+            `octo-pod-docs-${{ steps.v.outputs.version }}.tar.gz`, when present, is the
+            documentation site for this release. Unpack it and open `index.html`.
 
             ## Install on a pod
 
@@ -343,12 +410,12 @@ jobs:
           tmp="$(mktemp -d)"
 
           # REQUIRED: without any one of these a pod cannot install, or cannot verify.
-          required="octo-pod-${v}.tar.gz octo-pod_${v}_all.deb SHA256SUMS SHA256SUMS.cosign-bundle LATEST"
+          required="octo-pod-${v}.tar.gz octo-pod_${v}_all.deb SHA256SUMS SHA256SUMS.cosign-bundle SHA256SUMS.sigstore.json LATEST"
           # ADVISORY: convenience copies of a hash that the signed SHA256SUMS already carries.
           advisory="octo-pod-${v}.tar.gz.sha256 octo-pod_${v}_all.deb.sha256 index.html octo-pod-images-${v}.tar.gz.sha256"
 
           have=""
-          for try in 1 2 3; do
+          for _ in 1 2 3; do
             have="$(gh release view "octo-pod-v${v}" --repo "$GITHUB_REPOSITORY" \
                       --json assets --jq '.assets[].name' 2>/dev/null || true)"
             [ -n "$have" ] && break
@@ -371,6 +438,15 @@ jobs:
             printf '%s\n' "$have" | grep -qx "$f" \
               || echo "::warning::$f is absent — a convenience copy of a hash the signed SHA256SUMS already carries. The release is installable and verifiable without it."
           done
+
+          # The documentation site, when this build produced it, must be published too:
+          # SHA256SUMS lists it, so a release without it fails its own manifest.
+          if [ -f "dist/octo-pod-docs-${v}.tar.gz" ]; then
+            printf '%s\n' "$have" | grep -qx "octo-pod-docs-${v}.tar.gz" || {
+              echo "::error::the documentation site was built but is not in the release"
+              exit 1
+            }
+          fi
 
           # If the bundle was built it must be published: a pod told to install airgapped
           # cannot recover from its absence.
@@ -406,9 +482,12 @@ jobs:
 
           # VERIFIED AS A CONSUMER DOES — from the published release, not from dist/.
           gh release download "octo-pod-v${v}" --repo "$GITHUB_REPOSITORY" -D "$tmp" \
-             -p SHA256SUMS -p SHA256SUMS.cosign-bundle \
+             -p SHA256SUMS -p SHA256SUMS.cosign-bundle -p SHA256SUMS.sigstore.json \
              -p "octo-pod-${v}.tar.gz" -p "octo-pod_${v}_all.deb"
           ( cd "$tmp" && cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
+              --certificate-identity-regexp "^https://github.com/$GITHUB_REPOSITORY/" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS )
+          ( cd "$tmp" && cosign verify-blob --new-bundle-format --bundle SHA256SUMS.sigstore.json \
               --certificate-identity-regexp "^https://github.com/$GITHUB_REPOSITORY/" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS )
           ( cd "$tmp" && sha256sum -c --ignore-missing SHA256SUMS )
@@ -473,8 +552,11 @@ jobs:
           aws s3 cp "dist/octo-pod_${v}_all.deb"               "$DEST" --endpoint-url "$EP"
           aws s3 cp "dist/SHA256SUMS"                          "$DEST" --endpoint-url "$EP"
           aws s3 cp "dist/SHA256SUMS.cosign-bundle"            "$DEST" --endpoint-url "$EP"
+          aws s3 cp "dist/SHA256SUMS.sigstore.json"            "$DEST" --endpoint-url "$EP"
           [ -f "dist/octo-pod-images-${v}.tar.gz" ] \
             && aws s3 cp "dist/octo-pod-images-${v}.tar.gz"    "$DEST" --endpoint-url "$EP"
+          [ -f "dist/octo-pod-docs-${v}.tar.gz" ] \
+            && aws s3 cp "dist/octo-pod-docs-${v}.tar.gz"      "$DEST" --endpoint-url "$EP"
           [ -f "dist/index.html" ] \
             && aws s3 cp "dist/index.html" "s3://${R2_BUCKET}/${R2_PREFIX}/index.html" --endpoint-url "$EP"
 
@@ -497,4 +579,63 @@ jobs:
             echo "\`$base/LATEST\` → \`$v\` (verified over the public URL)"
             echo
             echo "Pods with \`octo_repo_url: $base\` will take this on \`octo-pod upgrade\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # SLSA BUILD LEVEL 3 PROVENANCE for every artifact the signed manifest lists. The
+  # signature above says "this workflow published these bytes"; provenance adds which
+  # commit, which tag and which workflow built them, signed by a builder that this
+  # repository's own steps cannot tamper with. Pods do not read it; partners and
+  # auditors verify it with slsa-verifier (the release notes give the command).
+  #
+  # Referenced by TAG, not by commit SHA: the generator proves its own identity from the
+  # tag it was called at, and a SHA reference fails that check. OpenSSF Scorecard's
+  # pinning check exempts this reusable workflow for that reason.
+  provenance:
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+    permissions:
+      actions: read      # the generator reads this workflow run
+      id-token: write    # keyless signing of the provenance
+      contents: write    # attach the provenance to the release
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.build.outputs.subjects }}
+      provenance-name: octo-pod-${{ needs.build.outputs.version }}.intoto.jsonl
+      upload-assets: true
+      # The provenance goes to the public Sigstore transparency log, exactly as the
+      # cosign signature above already does. A private repository must opt in to that.
+      private-repository: ${{ github.event.repository.private }}
+
+  # Proven from the published release, the way a partner verifies it, not from the
+  # generator's own report of success.
+  provenance-verified:
+    needs: [build, provenance]
+    if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+      - name: every signed artifact has verifiable provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          gh release download "octo-pod-v${V}" --repo "$GITHUB_REPOSITORY" -D "$dir" \
+            -p SHA256SUMS -p "octo-pod-${V}.intoto.jsonl" \
+            -p "octo-pod-${V}.tar.gz" -p "octo-pod_${V}_all.deb"
+          cd "$dir"
+          for f in "octo-pod-${V}.tar.gz" "octo-pod_${V}_all.deb"; do
+            slsa-verifier verify-artifact "$f" \
+              --provenance-path "octo-pod-${V}.intoto.jsonl" \
+              --source-uri "github.com/${GITHUB_REPOSITORY}" \
+              --source-tag "octo-pod-v${V}"
+          done
+          {
+            echo "### Provenance verified"
+            echo
+            echo "\`octo-pod-v${V}\`: tarball and package carry SLSA Build Level 3 provenance from this repository and tag."
           } >> "$GITHUB_STEP_SUMMARY"

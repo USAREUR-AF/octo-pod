@@ -1,7 +1,7 @@
 # Contributing to octo-pod
 
-Thanks for helping. This guide covers how to set up, how to shape a change so it can be
-merged, and how releases are cut. Report security issues privately, as
+Thanks for helping. This guide covers how to set up, how to prepare a change so it can be
+merged, and how releases are published. Report security issues privately, as
 [SECURITY.md](SECURITY.md) describes, never in a public issue.
 
 ## Before You Start
@@ -57,6 +57,24 @@ fix(firewall): admit the mesh's relay ports on the WAN leg
 docs(readme): say where the slot bundle comes from
 ```
 
+## Test Policy
+
+New functionality and bug fixes come with automated tests, in the same pull request.
+
+- A bug fix includes a test that fails without the fix and passes with it.
+- Put tests on the security boundary: the release and signature checks, the firewall,
+  identity and certificates, and the access rules that a declaration generates. Test
+  that the boundary refuses what it must refuse, not only that it accepts what it must
+  accept.
+- Put Rust tests with the crate that they test, under `arms/`. Put platform, CLI and
+  release tests in `platform/tests/`.
+- List every command that you ran in the pull request's Test Plan, so that a reviewer can
+  run the same commands.
+- If a change can't have an automated test, for example a change to documentation only,
+  say so in the Test Plan and give the reason.
+
+Maintainers don't merge a change to functionality without its tests.
+
 ## Run the Checks
 
 Run what CI runs before you push. The Rust checks run from `arms/`.
@@ -91,8 +109,69 @@ Run the release tests:
 python3 tests/test_release.py
 ```
 
-A change to a shell script also needs `shellcheck` clean; CI fails on any shell script it
+A change to a shell script also must pass `shellcheck`; CI fails on any shell script it
 doesn't lint.
+
+### Fuzzing
+
+The code that reads bytes from a peer or from the pen has fuzz targets in `arms/fuzz`:
+the TCP framing, the SAPIENT framing and messages, and the downlink gate.
+ClusterFuzzLite runs them on each pull request that changes `arms/`. To run a target on
+your computer, you need a nightly Rust toolchain and cargo-fuzz.
+
+Install the nightly toolchain:
+
+```zsh
+rustup toolchain install nightly
+```
+
+Install cargo-fuzz:
+
+```zsh
+cargo install cargo-fuzz --locked
+```
+
+Run the remaining commands from `arms/fuzz`. The fuzz crate is a separate workspace
+without a lock file of its own. Copy the workspace lock file, so that the fuzz build uses
+the same dependency versions as the arms:
+
+```zsh
+cp ../Cargo.lock Cargo.lock
+```
+
+List the targets:
+
+```zsh
+cargo +nightly fuzz list
+```
+
+Run a target for 60 seconds. New inputs go to the first directory, and the committed seed
+inputs are in the second:
+
+```zsh
+cargo +nightly fuzz run tcp_frame corpus/tcp_frame seeds/tcp_frame -- -max_total_time=60
+```
+
+The `sapient_json` target starts from the SAPIENT reference vectors instead:
+
+```zsh
+cargo +nightly fuzz run sapient_json corpus/sapient_json ../sapient-receiver/tests/vectors/true ../sapient-receiver/tests/vectors/false -- -max_total_time=60
+```
+
+When a target finds a crash, cargo-fuzz saves the input in `artifacts/<target>/`. Run the
+target on that file to reproduce the crash:
+
+```zsh
+cargo +nightly fuzz run tcp_frame artifacts/tcp_frame/crash-<hash>
+```
+
+Add the input as a regression test in the crate that owns the code, then fix the code.
+After you change the reference vectors or the input format of a target, regenerate the
+seed inputs:
+
+```zsh
+cargo run --example make_seeds
+```
 
 ## Pull Requests
 
@@ -105,6 +184,13 @@ Never commit site values: addresses, hostnames, enrollment output, keys or token
 values belong in an operator's ignored identity files, and the examples use
 documentation addresses (RFC 5737) only.
 
+## Documentation language
+
+Write documentation in clear, literal English so it can be translated and used across
+countries. Avoid idioms, metaphors, colloquialisms and culture-specific references.
+State the actor, action and condition directly, and define project-specific terms when
+first used. Keep commands, flags, file paths and configuration identifiers exact.
+
 ## Decisions
 
 Record an architectural decision as an ADR in [docs/adr/](docs/adr/), from
@@ -113,7 +199,7 @@ pull request.
 
 ## Releases
 
-Maintainers cut releases. The version lives in `VERSION` and follows
+Maintainers publish releases. The version is recorded in `VERSION` and follows
 [Semantic Versioning](https://semver.org/); while it is below 1.0, a minor version may
 break compatibility. A release is a signed tag `octo-pod-v<version>`, and a release
 candidate is `octo-pod-v<version>-rc.<n>`. The release workflow refuses a tag that
@@ -137,7 +223,7 @@ Version 2.0 (see [LICENSE](LICENSE)).
 | `platform/templates/bridge/` and `platform/templates/egress/` | Uplink/downlink bridge and egress units |
 | `tools/` | `mint-key.sh`, `install-to-pod.sh`, `deprovision-pod.sh`, release builders |
 | `docs/` | design notes and the reasoning |
-| `/etc/octo-pod` | **the pod's identity**. Written by `join` or `init`, never touched by an upgrade |
+| `/etc/octo-pod` | **the pod's identity**. Written by `join` or `init`, never modified by an upgrade |
 
 `mint-key.sh`, `install-to-pod.sh` and `deprovision-pod.sh` run from a clone on your laptop,
 against a pod. `octo-pod remote <install|deprovision|mint-key>` wraps the same three and
@@ -192,3 +278,5 @@ Review all six `PIN-THIS` values and commit the matching `*_image_upstream` valu
 `platform/group_vars/all/10-infrastructure.yml`. Build and verify the package and
 container bundle from that pinned checkout. Publishing a new image does not change
 existing pins or running pods. Bridge and third-party images have separate pins.
+
+See [Release pattern](docs/release-pattern.md) for every step from a commit to a running pod, which gate checks it, and how to verify a release.

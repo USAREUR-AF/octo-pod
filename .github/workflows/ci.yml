@@ -12,16 +12,19 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read   # read-only by default; jobs that need more ask for it
+
 jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: arms
       - name: fmt
@@ -39,11 +42,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: '1.89.0'
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: arms
       - name: check the declared minimum Rust version
@@ -57,8 +60,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with: { python-version: '3.12' }
       - name: dependencies
         run: |
@@ -72,6 +75,11 @@ jobs:
       - name: templates (ACL semantics, arm env, compose)
         run: python3 tests/test_templates.py
         working-directory: platform
+
+      # docs/images.md is generated from the digest pins. A pin change without a
+      # regenerated page would publish an image list the pod does not run.
+      - name: the image list matches the pins
+        run: python3 tools/gen-images-doc.py --check
 
       # What a pod actually installs is not the repository. This stages the release
       # payload and asserts on the tree, so "no credential in the artifact" and "no arm
@@ -113,6 +121,7 @@ jobs:
                    tools/install-to-pod.sh tools/deprovision-pod.sh tools/push-images.sh
                    tools/mint-key.sh tools/build-vm-image.sh tools/vm-image-provision.sh
                    tools/prove-sapient/run.sh
+                   .clusterfuzzlite/build.sh
                    completions/octo-pod.bash"
           # Default severity, not -S warning: `info`-level findings include unquoted
           # expansions, which is how a path with a space becomes two arguments — and one
@@ -132,7 +141,7 @@ jobs:
           # shellcheck disable=SC2086,SC2116 # Intentional whitespace normalization.
           checked=" $(echo $scripts) "
           missing=0
-          for f in $(git ls-files "bin/*" "tools/*" "completions/*"); do
+          for f in $(git ls-files "bin/*" "tools/*" "completions/*" ".clusterfuzzlite/*"); do
             head -1 "$f" | grep -qE "^#!.*(bash|/bin/sh)" || continue
             case "$checked" in
               *" $f "*) ;;
@@ -193,14 +202,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0          # gitleaks scans history, not just the worktree
 
       # Dependency policy, shared with goat: cargo-deny enforces licenses, bans and
       # sources; cargo-audit handles vulnerabilities. Maintenance warnings remain
       # visible without blocking CI.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       # THIRD_PARTY_LICENSES.md ships in every arm image. It is generated from Cargo.lock,
       # so a dependency change must regenerate it: rebuild it here and fail on any drift.
       - name: third-party notices are current
@@ -229,6 +238,17 @@ jobs:
           cargo install --locked cargo-audit
           cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0041
         working-directory: arms
+
+      # The Python dependencies, checked the same way: what every requirements file in
+      # the repository resolves to today must have no known vulnerability. The list comes
+      # from git, so a new requirements file is covered without editing this step.
+      - name: pip-audit
+        run: |
+          pip install --quiet pip-audit==2.10.1
+          args=()
+          while IFS= read -r f; do args+=(-r "$f"); done < <(git ls-files '*requirements*.txt')
+          [ "${#args[@]}" -gt 0 ] || { echo "::error::no requirements files found"; exit 1; }
+          pip-audit --progress-spinner off "${args[@]}"
 
       # The languages cargo cannot see: the playbooks, the generated shell, the Python
       # CLI, the Dockerfiles and these workflows. `--error` fails the job on ERROR

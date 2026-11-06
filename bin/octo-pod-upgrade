@@ -251,7 +251,8 @@ regex_quote() { printf '%s' "$1" | sed 's/[][\\.*^$+?(){}|]/\\&/g'; }
 CERT_IDENTITY="${OCTO_POD_CERT_IDENTITY:-}"
 CERT_OVERRIDE="${CERT_IDENTITY:+1}"
 if [ -z "$CERT_IDENTITY" ] && signer_repo="$(release_repo)"; then
-  CERT_IDENTITY='^https://github\.com/'"$(regex_quote "${signer_repo}")"'/\.github/workflows/release\.yml@refs/tags/octo-pod-v'
+  # Owner and repository in any letter case, as GitHub treats them; path and tag exact.
+  CERT_IDENTITY='^https://github\.com/(?i:'"$(regex_quote "${signer_repo}")"')/\.github/workflows/release\.yml@refs/tags/octo-pod-v'
 fi
 # <<< signer
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
@@ -279,7 +280,7 @@ verify_manifest() {  # verify_manifest <dir> — the signature over SHA256SUMS
 "this pod's release names no repository whose workflow signs releases (it was built
 outside a release workflow), so a new release can't be verified. Name the signer:
 
-    sudo OCTO_POD_CERT_IDENTITY='^https://github\.com/<owner>/<repo>/\.github/workflows/release\.yml@refs/tags/octo-pod-v' octo-pod upgrade
+    sudo OCTO_POD_CERT_IDENTITY='^https://github\.com/(?i:<owner>/<repo>)/\.github/workflows/release\.yml@refs/tags/octo-pod-v' octo-pod upgrade
 
   The release that installs records its own repository, so the next upgrade needs no
   override."

@@ -1,0 +1,40 @@
+# ClusterFuzzLite batch fuzzing: once a week, fuzz every target on main for longer than a
+# pull request can. The corpus it grows is kept as a workflow artifact, and the pull
+# request runs (cflite_pr.yml) start from it. A crash fails the job, and the input that
+# caused it is uploaded as an artifact.
+name: ClusterFuzzLite batch fuzzing
+on:
+  schedule:
+    - cron: '41 4 * * 2'   # weekly, Tuesday 04:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      # Read the corpus that the previous batch run kept.
+      actions: read
+    steps:
+      - name: Build the fuzz targets
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: address
+      - name: Fuzz the targets
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 1200
+          mode: batch
+          sanitizer: address
+          output-sarif: false

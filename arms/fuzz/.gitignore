@@ -1,0 +1,7 @@
+# cargo-fuzz working state. The committed seed inputs are in seeds/.
+target/
+corpus/
+artifacts/
+coverage/
+# Copied from ../Cargo.lock before each build; see Cargo.toml.
+Cargo.lock

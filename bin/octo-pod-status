@@ -28,6 +28,7 @@ dials in. That is the TYPE column, not two tables.
 The bridge is its own line because it is not a publisher. It is the only way anything
 leaves this pod, so "what is released" is a property of the pod, not of a row.
 """
+from octo_pod_i18n import critical as _critical
 import json
 import os
 import re
@@ -37,7 +38,7 @@ import sys
 try:
     import yaml
 except ImportError:
-    sys.exit("python3-yaml is missing — it is a package dependency: sudo apt-get install -f -y")
+    sys.exit(_critical("python3-yaml is missing — it is a package dependency: sudo apt-get install -f -y"))
 
 ETC = os.environ.get("OCTO_POD_ETC", "/etc/octo-pod")
 PEN_STATE = os.environ.get("OCTO_PEN_STATE", "/var/lib/octo-pen")
@@ -317,11 +318,11 @@ def render(info, rows):
 def main():
     as_json = "--json" in sys.argv[1:]
     if not os.path.isdir(ETC):
-        print(f"no {ETC} — this box is not a pod yet. Run: octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>", file=sys.stderr)
+        print(_critical('no {v0} — this box is not a pod yet. Run: octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>', v0=ETC), file=sys.stderr)
         return 0
     info, rows = collect()
     if info is None:
-        print(f"{ETC} has no pod identity — run: octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>", file=sys.stderr)
+        print(_critical('{v0} has no pod identity — run: octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>', v0=ETC), file=sys.stderr)
         return 0
     if as_json:
         print(json.dumps({"pod": info, "publishers": rows}, indent=2))

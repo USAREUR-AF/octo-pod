@@ -30,6 +30,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from test_top import build_pod, stamp  # the same scratch pod as top's tests
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "bin"))
 INSPECT = REPO / "bin" / "octo-pod-inspect"
 SECRET = "A1B2-THIS-MUST-NOT-APPEAR-C3D4"
 ROOT = os.geteuid() == 0   # root reads through every mode bit, so those checks skip
