@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! What the receiver sends back. A fusion node is not a passive sniffer: a registering
 //! node waits for a RegistrationAck and will not proceed to status and detections without
 //! one. Answering is what makes this a receiver a real node can register with, and what

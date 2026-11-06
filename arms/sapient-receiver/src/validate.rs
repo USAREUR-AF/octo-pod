@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2021-2024 Crown Copyright (Dstl)
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Port of SAPIENT BSI Flex 335 v2.0 Test Harness validators.
 //! Crown-owned copyright, 2021-2024. Used under Apache-2.0; see tests/vectors/NOTICE.
 //! Rust adaptation: descriptor-backed field access preserves protobuf presence and

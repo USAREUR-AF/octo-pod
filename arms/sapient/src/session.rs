@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The connection driver: reach the peer, settle the role, register, hold the session.
 //!
 //! Concurrency shape, and why:
@@ -1460,6 +1462,78 @@ mod tests {
             )),
             "a refused node must not heartbeat"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_without_reasons_still_says_it_was_refused() {
+        let (l, addr) = fake_peer().await;
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let reg = read_msg(&mut s, ByteOrder::Le)
+                .await
+                .expect("a registration");
+            let ack = wire::registration_ack("dmm", reg.node_id.clone(), false);
+            write_msg(&mut s, &ack, ByteOrder::Le).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let (out, emits) = run_session(&dialing(addr, Role::Asm)).await;
+        peer.abort();
+        let err = format!("{:#}", out.expect_err("a refusal ends the session"));
+        assert!(err.contains("no reason given"), "{err}");
+        assert!(saw(&emits, "registration-rejected"), "{:?}", events(&emits));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_asm_ignores_a_peer_that_also_tries_to_register_and_keeps_the_link() {
+        let (l, addr) = fake_peer().await;
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let reg = read_msg(&mut s, ByteOrder::Le)
+                .await
+                .expect("a registration");
+            // A confused peer registers back instead of acknowledging.
+            let mut confused = cfg();
+            confused.node_id = "5f0b0d3a-0000-4000-8000-000000000002".into();
+            write_msg(&mut s, &wire::registration(&confused), ByteOrder::Le).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Then behaves: the ASM must still be there to accept the acknowledgement.
+            let ack = wire::registration_ack("dmm", reg.node_id.clone(), true);
+            write_msg(&mut s, &ack, ByteOrder::Le).await;
+        });
+        let (out, emits) = run_session(&dialing(addr, Role::Asm)).await;
+        peer.await.unwrap();
+        assert!(out.is_ok(), "{out:?}");
+        assert!(saw(&emits, "registered"), "{:?}", events(&emits));
+        // It never acknowledged the stray registration: an ASM does not act as a DMM.
+        assert!(
+            !written(&emits)
+                .iter()
+                .any(|m| wire::registration_ack_of(m).is_some()),
+            "an ASM sent a RegistrationAck"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_auto_arm_whose_peer_stays_silent_registers_as_the_sensor() {
+        let (l, addr) = fake_peer().await;
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            // Say nothing; after the probe the arm must register with us.
+            let reg = read_msg(&mut s, ByteOrder::Le)
+                .await
+                .expect("a registration");
+            assert!(wire::is_registration(&reg));
+            let ack = wire::registration_ack("dmm", reg.node_id.clone(), true);
+            write_msg(&mut s, &ack, ByteOrder::Le).await;
+        });
+        let (_out, emits) = run_session(&dialing(addr, Role::Auto)).await;
+        peer.await.unwrap();
+        let role = events(&emits)
+            .into_iter()
+            .find(|e| e.contains("role-detected"))
+            .expect("the role must be published");
+        assert!(role.contains("asm"), "{role}");
+        assert!(saw(&emits, "registered"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

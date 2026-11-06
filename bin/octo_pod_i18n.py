@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """Offline gettext support for human prose; never apply to structured output."""
 import argparse
 from functools import lru_cache

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # octo-arm-common — everything octo-pod arms share.
 #
 # An arm binary should contain ONLY its wire protocol. Session setup,
@@ -18,12 +20,22 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The in-process test router (src/testing.rs). Arms enable it from [dev-dependencies]
+# only, so no arm binary carries it.
+test-support = []
+
 [dependencies]
 zenoh = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
+serde_json = "1"
 
 [lints]
 workspace = true

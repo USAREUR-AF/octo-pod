@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The SAPIENT arm's framing: a 4-byte length prefix whose byte order the arm discovers
 //! from the first frame (`sapient::framing::FrameBuf`), with the session's own tie-breaker
 //! (`sapient::wire::decodes`). Every byte a SAPIENT peer sends goes through it first.

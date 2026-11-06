@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # build-airgap-bundle.sh — everything a pod needs to run with no route to anywhere.
 #
 #   tools/build-airgap-bundle.sh --out ./octo-stage
@@ -27,8 +29,15 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GROUP_VARS="$REPO/platform/group_vars/all/10-infrastructure.yml"
 OUT="$REPO/dist/octo-stage"
+# The two tool images the bundle carries. A pod loads them BY TAG (see below), so the
+# tag is the name it knows them by; the digest decides the bytes behind that name, so a
+# tag that moves upstream cannot change what a bundle built from this commit contains.
 SKOPEO_IMAGE="quay.io/skopeo/stable:latest"
+SKOPEO_DIGEST="sha256:2681eccb8b02c495b013c2669cbf7f41d5c0b0b0e644e7c69bd3ea9bcb20641f"   # skopeo 1.22.3
 REGISTRY_IMAGE="registry:2"
+REGISTRY_DIGEST="sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373"
+# repository@digest: the tag is dropped, the digest is what is pulled.
+pinned() { printf '%s@%s' "${1%:*}" "$2"; }
 
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 say() { printf '  %s\n' "$*"; }
@@ -118,11 +127,12 @@ skopeo() {
     --user "$(id -u):$(id -g)" \
     -v "$OUT/images/oci:/oci" \
     "${AUTH_MOUNT[@]}" \
-    "$SKOPEO_IMAGE" "$@"
+    "$(pinned "$SKOPEO_IMAGE" "$SKOPEO_DIGEST")" "$@"
 }
 
 say "fetching skopeo"
-docker pull -q "$SKOPEO_IMAGE" >/dev/null || die "could not pull $SKOPEO_IMAGE"
+docker pull -q "$(pinned "$SKOPEO_IMAGE" "$SKOPEO_DIGEST")" >/dev/null \
+  || die "could not pull $SKOPEO_IMAGE at $SKOPEO_DIGEST"
 
 for i in "${!TAGS[@]}"; do
   tag="${TAGS[$i]}"; ref="${REFS[$i]}"
@@ -166,20 +176,36 @@ done < "$OUT/images/MAP"
 #
 # So both, named by architecture, and the pod loads the one matching its own. That costs
 # one extra copy of each tool and removes an entire class of "works on my runner".
+#
+# THE LOCAL COPY GOES FIRST. Each tool is pinned by its multi-platform digest, and
+# Docker's image store keeps one platform per name: pulling the same digest for a second
+# architecture fails with "cannot overwrite digest". So the copy from the previous
+# architecture is removed before each pull. Only the local copy; the pin is unchanged.
+drop_local() {  # drop_local <repository:tag> <digest>
+  docker image rm -f "$(pinned "$1" "$2")" "$1" >/dev/null 2>&1 || true
+}
 for arch in amd64 arm64; do
-  for spec in "registry:$REGISTRY_IMAGE" "skopeo:$SKOPEO_IMAGE"; do
-    name="${spec%%:*}"; ref="${spec#*:}"
+  for spec in "registry|$REGISTRY_IMAGE|$REGISTRY_DIGEST" "skopeo|$SKOPEO_IMAGE|$SKOPEO_DIGEST"; do
+    IFS='|' read -r name ref digest <<<"$spec"
     say "saving $name for linux/$arch"
-    docker pull -q --platform "linux/$arch" "$ref" >/dev/null \
-      || die "could not pull $ref for linux/$arch"
+    drop_local "$ref" "$digest"
+    docker pull -q --platform "linux/$arch" "$(pinned "$ref" "$digest")" >/dev/null \
+      || die "could not pull $ref at $digest for linux/$arch"
+    docker tag "$(pinned "$ref" "$digest")" "$ref" \
+      || die "could not tag $ref"
     docker save "$ref" -o "$OUT/images/${name}-${arch}.tar" \
       || die "could not save $ref for linux/$arch"
   done
 done
 # Put the native-platform tools back. Leaving the last-pulled architecture in place
 # would break anything that runs skopeo or the registry after this script.
-docker pull -q "$SKOPEO_IMAGE" >/dev/null 2>&1 || true
-docker pull -q "$REGISTRY_IMAGE" >/dev/null 2>&1 || true
+for spec in "$REGISTRY_IMAGE|$REGISTRY_DIGEST" "$SKOPEO_IMAGE|$SKOPEO_DIGEST"; do
+  IFS='|' read -r ref digest <<<"$spec"
+  drop_local "$ref" "$digest"
+  if docker pull -q "$(pinned "$ref" "$digest")" >/dev/null 2>&1; then
+    docker tag "$(pinned "$ref" "$digest")" "$ref" >/dev/null 2>&1 || true
+  fi
+done
 
 printf '%s\n' "$REGISTRY_IMAGE" > "$OUT/images/REGISTRY_IMAGE"
 printf '%s\n' "$SKOPEO_IMAGE"   > "$OUT/images/SKOPEO_IMAGE"

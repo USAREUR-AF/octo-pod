@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! tcp-connect — octo-pod arm #4: dial-out TCP with reconnect → the shared
 //! ingest path (octo-arm-common).
 //!
@@ -143,7 +145,15 @@ fn parse_feeds(spec: &str, default_framing: Framing) -> Result<Vec<Feed>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     octo_arm_common::init_tracing();
-    let args = Args::parse();
+    run(Args::parse(), async {
+        tokio::signal::ctrl_c().await.context("waiting for ctrl-c")
+    })
+    .await
+}
+
+/// The whole arm: open the pen session, dial every feed, publish until `shutdown`
+/// resolves. `main` passes ctrl-c; a test passes its own trigger.
+async fn run(args: Args, shutdown: impl std::future::Future<Output = Result<()>>) -> Result<()> {
     let default_framing = Framing::parse(&args.default_framing)?;
     let feeds = parse_feeds(&args.feeds, default_framing)?;
 
@@ -184,9 +194,7 @@ async fn main() -> Result<()> {
         Some(ingestor.outbox.clone()),
     );
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("waiting for ctrl-c")?;
+    shutdown.await?;
     info!("shutdown signal received");
     stats_task.abort();
     drain_task.abort();
@@ -264,6 +272,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_label_may_use_dash_and_underscore_but_may_not_be_empty() {
+        let feeds = parse_feeds(
+            "radar-1=192.0.2.1:9000,ais_2=192.0.2.2:9001",
+            Framing::Stream,
+        )
+        .unwrap();
+        assert_eq!(feeds[0].label, "radar-1");
+        assert_eq!(feeds[1].label, "ais_2");
+        assert!(parse_feeds("=192.0.2.1:9000", Framing::Stream).is_err());
+        // A host with nothing before the port is not a target.
+        assert!(parse_feeds("x=:9000", Framing::Stream).is_err());
+    }
+
+    #[test]
     fn feeds_parse_target_and_framing() {
         let feeds = parse_feeds(
             "radar-one=192.0.2.104:9000, sapient=sensor-a:48000:len32le, cot=host:8087:newline",
@@ -294,6 +316,138 @@ mod tests {
         assert!(parse_feeds("", Framing::Stream).is_err());
         // label that would not survive as a key chunk
         assert!(parse_feeds("bad/label=host:1", Framing::Stream).is_err());
+    }
+
+    use octo_arm_common::testing::{free_tcp_port, next_sample, TestPen, ARRIVES, QUIET};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    fn args(pen: &TestPen, feeds: &str, allow: &str) -> Args {
+        Args::try_parse_from([
+            "tcp-connect",
+            "--feeds",
+            feeds,
+            "--endpoint",
+            &pen.endpoint,
+            "--allow-sources",
+            allow,
+        ])
+        .expect("args")
+    }
+
+    fn start(args: Args) -> (oneshot::Sender<()>, tokio::task::JoinHandle<Result<()>>) {
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(run(args, async move {
+            let _ = stopped.await;
+            Ok(())
+        }));
+        (stop, task)
+    }
+
+    async fn accept(sensor: &TcpListener) -> TcpStream {
+        tokio::time::timeout(ARRIVES, sensor.accept())
+            .await
+            .expect("the arm dials the sensor")
+            .expect("accept")
+            .0
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_arm_dials_the_sensor_and_publishes_its_frames_keyed_by_the_address_reached() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let sensor = TcpListener::bind("127.0.0.1:0").await.expect("sensor");
+        let target = sensor.local_addr().expect("addr");
+        let (stop, task) = start(args(&pen, &format!("radar={target}:newline"), "127.0.0."));
+
+        let mut conn = accept(&sensor).await;
+        conn.write_all(b"track-1\ntrack-2\n").await.expect("write");
+        for want in [&b"track-1"[..], b"track-2"] {
+            let s = next_sample(&sub, ARRIVES).await.expect("published");
+            assert_eq!(s.key_expr().as_str(), "raw/octo/radar/127-0-0-1");
+            assert_eq!(s.payload().to_bytes().as_ref(), want);
+        }
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sensor_that_hangs_up_or_sends_garbage_is_redialled() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let sensor = TcpListener::bind("127.0.0.1:0").await.expect("sensor");
+        let target = sensor.local_addr().expect("addr");
+        let (stop, task) = start(args(&pen, &format!("s={target}:len32le"), ""));
+
+        // First connection: an impossible length. The arm closes it.
+        let mut first = accept(&sensor).await;
+        first
+            .write_all(&u32::MAX.to_le_bytes())
+            .await
+            .expect("write");
+        let mut rest = Vec::new();
+        tokio::time::timeout(ARRIVES, first.read_to_end(&mut rest))
+            .await
+            .expect("the arm closes a connection it cannot frame")
+            .expect("read");
+        // Second connection, after the backoff: a good frame, then a clean hang-up.
+        let mut second = accept(&sensor).await;
+        second
+            .write_all(&Framing::Len32Le.encode(b"good").expect("frame"))
+            .await
+            .expect("write");
+        drop(second);
+        let s = next_sample(&sub, ARRIVES).await.expect("published");
+        assert_eq!(s.payload().to_bytes().as_ref(), b"good");
+        // Third: the arm comes back after the sensor hung up.
+        let _third = accept(&sensor).await;
+
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sensor_that_is_down_at_start_is_reached_when_it_comes_up() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let port = free_tcp_port();
+        let (stop, task) = start(args(&pen, &format!("late=127.0.0.1:{port}"), ""));
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let sensor = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("sensor up");
+        let mut conn = accept(&sensor).await;
+        conn.write_all(b"hello").await.expect("write");
+        let s = next_sample(&sub, ARRIVES).await.expect("published");
+        assert_eq!(s.payload().to_bytes().as_ref(), b"hello");
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sensor_outside_the_allowlist_is_dialled_but_never_published() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let sensor = TcpListener::bind("127.0.0.1:0").await.expect("sensor");
+        let target = sensor.local_addr().expect("addr");
+        let (stop, task) = start(args(&pen, &format!("radar={target}:newline"), "192.0.2."));
+
+        let mut conn = accept(&sensor).await;
+        conn.write_all(b"x\n").await.expect("write");
+        assert!(next_sample(&sub, QUIET).await.is_none());
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_default_framing_fails_startup() {
+        let pen = TestPen::start().await;
+        let mut a = args(&pen, "x=h:1", "");
+        a.default_framing = "chunks".into();
+        let err = run(a, async { Ok(()) }).await.expect_err("framing");
+        assert!(format!("{err:#}").contains("unknown framing"), "{err:#}");
     }
 
     #[test]

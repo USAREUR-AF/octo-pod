@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # Task names are deliberately "area — action" in lowercase: they read as a running
 # narrative in playbook output, which matters more here than title case.
 skip_list:

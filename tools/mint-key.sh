@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # mint-key.sh — mint a mesh setup key and put it on the pod, without it ever being typed.
 #
 #   tools/mint-key.sh <user>@<pod-ip>

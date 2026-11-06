@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The generated SAPIENT types, shared by every crate that speaks SAPIENT.
 //!
 //! One module per proto package, named as the package is. `v2` is the standard's

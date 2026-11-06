@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # PEERS — Zenoh-native publishers.
 #
 # A peer already speaks Zenoh and holds an mTLS identity WE minted. It publishes

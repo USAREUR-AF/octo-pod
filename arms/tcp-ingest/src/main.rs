@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! tcp-ingest — octo-pod arm #2: labeled TCP listeners with pluggable
 //! framing → the shared ingest path (octo-arm-common).
 //!
@@ -118,7 +120,15 @@ fn parse_feeds(spec: &str, default_framing: Framing) -> Result<Vec<Feed>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     octo_arm_common::init_tracing();
-    let args = Args::parse();
+    run(Args::parse(), async {
+        tokio::signal::ctrl_c().await.context("waiting for ctrl-c")
+    })
+    .await
+}
+
+/// The whole arm: bind every feed, open the pen session, publish until `shutdown`
+/// resolves. `main` passes ctrl-c; a test passes its own trigger.
+async fn run(args: Args, shutdown: impl std::future::Future<Output = Result<()>>) -> Result<()> {
     let default_framing = Framing::parse(&args.default_framing)?;
     let feeds = parse_feeds(&args.feeds, default_framing)?;
 
@@ -165,9 +175,7 @@ async fn main() -> Result<()> {
         Some(ingestor.outbox.clone()),
     );
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("waiting for ctrl-c")?;
+    shutdown.await?;
     info!("shutdown signal received");
     stats_task.abort();
     drain_task.abort();
@@ -232,6 +240,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_label_may_use_dash_and_underscore_but_may_not_be_empty() {
+        let feeds = parse_feeds("cot-1=8087:newline,sapient_2=48000", Framing::Stream).unwrap();
+        assert_eq!(feeds[0].label, "cot-1");
+        assert_eq!(feeds[1].label, "sapient_2");
+        assert!(parse_feeds("=8087", Framing::Stream).is_err());
+    }
+
+    #[test]
     fn feeds_parse_with_framing() {
         let feeds = parse_feeds(
             "sapient=48000:len32le, cot=8087:newline, x=9000",
@@ -247,5 +263,174 @@ mod tests {
     fn feeds_reject_bad() {
         assert!(parse_feeds("a=1:bogus", Framing::Stream).is_err());
         assert!(parse_feeds("", Framing::Stream).is_err());
+        assert!(parse_feeds("a.b=1", Framing::Stream).is_err());
+        assert!(parse_feeds("a=70000", Framing::Stream).is_err());
+        assert!(parse_feeds("nolabel", Framing::Stream).is_err());
+    }
+
+    use octo_arm_common::testing::{free_tcp_port, next_sample, TestPen, ARRIVES, QUIET};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::oneshot;
+
+    type Sub =
+        zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<zenoh::sample::Sample>>;
+
+    fn args(pen: &TestPen, feeds: &str, allow: &str) -> Args {
+        Args::try_parse_from([
+            "tcp-ingest",
+            "--feeds",
+            feeds,
+            "--bind-host",
+            "127.0.0.1",
+            "--endpoint",
+            &pen.endpoint,
+            "--allow-sources",
+            allow,
+        ])
+        .expect("args")
+    }
+
+    fn start(args: Args) -> (oneshot::Sender<()>, tokio::task::JoinHandle<Result<()>>) {
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(run(args, async move {
+            let _ = stopped.await;
+            Ok(())
+        }));
+        (stop, task)
+    }
+
+    /// Connect once the arm's listener is up.
+    async fn connect(port: u16) -> TcpStream {
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        loop {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+                return s;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listener never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn payloads(sub: &Sub, n: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let s = next_sample(sub, ARRIVES).await.expect("frame published");
+            assert_eq!(s.key_expr().as_str().rsplit('/').next(), Some("127-0-0-1"));
+            out.push(s.payload().to_bytes().to_vec());
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn newline_frames_split_across_reads_publish_one_sample_per_line() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/cot/**").await;
+        let port = free_tcp_port();
+        let (stop, task) = start(args(&pen, &format!("cot={port}:newline"), "127.0.0."));
+
+        let mut conn = connect(port).await;
+        conn.write_all(b"first\r\nsec").await.expect("write");
+        conn.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        conn.write_all(b"ond\npartial").await.expect("write");
+
+        assert_eq!(
+            payloads(&sub, 2).await,
+            vec![b"first".to_vec(), b"second".to_vec()]
+        );
+        // A line with no newline yet is held, not published as a fragment.
+        assert!(next_sample(&sub, QUIET).await.is_none());
+
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn length_prefixed_frames_publish_their_payloads_without_the_prefix() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/sapient/**").await;
+        let port = free_tcp_port();
+        let (stop, task) = start(args(&pen, &format!("sapient={port}:len32le"), ""));
+
+        let mut wire = Framing::Len32Le.encode(b"\x08\x01").expect("frame");
+        wire.extend(Framing::Len32Le.encode(b"").expect("empty frame"));
+        wire.extend(Framing::Len32Le.encode(b"tail").expect("frame"));
+        let mut conn = connect(port).await;
+        // One byte at a time: every split point inside a header and a payload.
+        for b in &wire {
+            conn.write_all(std::slice::from_ref(b))
+                .await
+                .expect("write");
+        }
+
+        assert_eq!(
+            payloads(&sub, 3).await,
+            vec![b"\x08\x01".to_vec(), Vec::new(), b"tail".to_vec()]
+        );
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_oversize_length_closes_that_connection_and_the_listener_keeps_serving() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let port = free_tcp_port();
+        let (stop, task) = start(args(&pen, &format!("feed={port}:len32be"), ""));
+
+        let mut bad = connect(port).await;
+        let huge = u32::try_from(octo_arm_common::framing::MAX_FRAME + 1).expect("fits");
+        bad.write_all(&huge.to_be_bytes()).await.expect("write");
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(ARRIVES, bad.read_to_end(&mut rest)).await;
+        assert!(
+            closed.is_ok(),
+            "the arm must close a connection it cannot frame"
+        );
+        assert!(next_sample(&sub, QUIET).await.is_none());
+
+        let mut good = connect(port).await;
+        good.write_all(&Framing::Len32Be.encode(b"ok").expect("frame"))
+            .await
+            .expect("write");
+        assert_eq!(payloads(&sub, 1).await, vec![b"ok".to_vec()]);
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_from_outside_the_allowlist_publishes_nothing() {
+        let pen = TestPen::start().await;
+        let sub = pen.subscribe("raw/octo/**").await;
+        let port = free_tcp_port();
+        let (stop, task) = start(args(&pen, &format!("cot={port}:newline"), "192.0.2."));
+
+        let mut conn = connect(port).await;
+        conn.write_all(b"one\ntwo\n").await.expect("write");
+        assert!(next_sample(&sub, QUIET).await.is_none());
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_fails_on_an_unknown_default_framing_or_a_taken_port() {
+        let pen = TestPen::start().await;
+        let mut bad_default = args(&pen, "x=1", "");
+        bad_default.default_framing = "chunks".into();
+        let err = run(bad_default, async { Ok(()) })
+            .await
+            .expect_err("framing");
+        assert!(format!("{err:#}").contains("unknown framing"), "{err:#}");
+
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy");
+        let port = taken.local_addr().expect("addr").port();
+        let err = run(args(&pen, &format!("cot={port}"), ""), async { Ok(()) })
+            .await
+            .expect_err("bind");
+        assert!(format!("{err:#}").contains("feed `cot`"), "{err:#}");
     }
 }

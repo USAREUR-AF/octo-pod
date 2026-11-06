@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # ClusterFuzzLite batch fuzzing: once a week, fuzz every target on main for longer than a
 # pull request can. The corpus it grows is kept as a workflow artifact, and the pull
 # request runs (cflite_pr.yml) start from it. A crash fails the job, and the input that

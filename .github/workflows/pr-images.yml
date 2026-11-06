@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # Full builds and final-image loader checks before merge. No registry credentials or pushes.
 name: PR images
 on:
@@ -31,7 +33,6 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 4
       matrix:
         arm: ${{ fromJSON(needs.changes.outputs.images) }}
         arch: [amd64, arm64]
@@ -53,8 +54,13 @@ jobs:
           load: true
           push: false
           provenance: false
-          cache-from: type=gha,scope=pr-image-${{ matrix.arm }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=pr-image-${{ matrix.arm }}-${{ matrix.arch }}
+          # The same scope images.yml writes on main. A pull request reads its own cache,
+          # then main's, so its first build already has main's compiled dependencies. What
+          # it writes stays with the pull request: GitHub never lets a pull request's cache
+          # into a build on main. One scope per architecture, shared by every arm, holds one
+          # copy of the dependency layer that all seven Dockerfiles have in common.
+          cache-from: type=gha,scope=arms-linux/${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=arms-linux/${{ matrix.arch }},ignore-error=true
       - name: verify final-image architecture, nonroot user and every installed binary
         env:
           ARM: ${{ matrix.arm }}

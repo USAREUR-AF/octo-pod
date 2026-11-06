@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # SITE FACTS — interfaces and addressing for this one box.
 #
 # Every file in this directory is merged into one namespace, loaded alphabetically;

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 // uplink-bridge — the pod's sync leg: pen → fabric scoped zenoh uplink.
 //
 // Two client sessions, one direction. Samples matching the allowlist on the
@@ -198,8 +200,31 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let args = Args::parse();
+    let code = match run(Args::parse(), async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!(error = %e, "cannot wait for SIGINT; running until killed");
+            std::future::pending::<()>().await;
+        }
+    })
+    .await
+    {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "uplink-bridge stopped");
+            1
+        }
+    };
+    // Non-zero when a subscriber died unexpectedly (or startup was refused) so the
+    // container restart policy (Restart=on-failure) re-runs us into the open_forever
+    // retry loop. Exiting 0 there would leave the uplink down for good with nothing
+    // restarting it.
+    std::process::exit(code);
+}
 
+/// The whole bridge: open both legs, uplink every allowed pen sample under the slot
+/// until `shutdown` resolves (Ok) or a subscriber task ends (Err, so main exits
+/// non-zero and the supervisor restarts it).
+async fn run(args: Args, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
     validate_slot_prefix(&args.slot_prefix)?;
     let allow = normalize_allow(&args.allow)?;
 
@@ -295,16 +320,24 @@ async fn main() -> Result<()> {
         })
     };
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => info!("SIGINT; shutting down"),
-        Some(_) = tasks.join_next() => warn!("a subscriber task ended; shutting down for supervisor restart"),
-    }
+    let subscriber_died = tokio::select! {
+        () = shutdown => {
+            info!("SIGINT; shutting down");
+            false
+        }
+        Some(_) = tasks.join_next() => {
+            warn!("a subscriber task ended; shutting down for supervisor restart");
+            true
+        }
+    };
     stats_task.abort();
+    tasks.abort_all();
     pen.close().await.ok();
     fabric.close().await.ok();
-    // Non-zero when a subscriber died unexpectedly so the container
-    // restart policy re-runs us into the open_forever retry loop.
-    std::process::exit(0);
+    if subscriber_died {
+        bail!("a subscriber task ended; exiting for supervisor restart");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -350,6 +383,259 @@ mod tests {
         // bridge cannot address a sibling slot or a bare fabric key.
         for source in ["ops/env/health/x", "a", "from/elsewhere/**", "../escape"] {
             assert!(slotted_key("slot7", source).starts_with("slot7/"));
+        }
+    }
+
+    use octo_arm_common::testing::{free_tcp_port, next_sample, TestPen, ARRIVES, QUIET};
+    use tokio::sync::oneshot;
+
+    const SLOT: &str = "slot7";
+
+    fn args(pen: &str, fabric: &str, allow: &str, slot: &str) -> Args {
+        Args::try_parse_from([
+            "uplink-bridge",
+            "--pen-endpoint",
+            pen,
+            "--pen-cert",
+            "/unused/pen.crt",
+            "--pen-key",
+            "/unused/pen.key",
+            "--pen-root-ca",
+            "/unused/pen-ca.pem",
+            "--fabric-endpoint",
+            fabric,
+            "--fabric-cert",
+            "/unused/slot.crt",
+            "--fabric-key",
+            "/unused/slot.key",
+            "--fabric-root-ca",
+            "/unused/fabric-ca.pem",
+            "--slot-prefix",
+            slot,
+            "--allow",
+            allow,
+        ])
+        .expect("args")
+    }
+
+    fn start(args: Args) -> (oneshot::Sender<()>, tokio::task::JoinHandle<Result<()>>) {
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(run(args, async move {
+            let _ = stopped.await;
+        }));
+        (stop, task)
+    }
+
+    type Sub =
+        zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<zenoh::sample::Sample>>;
+
+    /// Publish on the pen until the bridge has subscribed and the sample is up.
+    async fn put_until_uplinked(
+        pen: &TestPen,
+        key: &str,
+        body: &[u8],
+        up: &Sub,
+    ) -> zenoh::sample::Sample {
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        loop {
+            pen.session
+                .put(key, body.to_vec())
+                .encoding(zenoh::bytes::Encoding::APPLICATION_JSON)
+                .await
+                .expect("pen put");
+            if let Some(s) = next_sample(up, Duration::from_millis(250)).await {
+                return s;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never uplinked");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_allowed_pen_sample_goes_up_under_the_slot_and_nothing_else_does() {
+        let (pen, fabric) = (TestPen::start().await, TestPen::start().await);
+        let up = fabric.subscribe("**").await;
+        let (stop, task) = start(args(
+            &pen.endpoint,
+            &fabric.endpoint,
+            "ops/env/health/**",
+            SLOT,
+        ));
+
+        let s = put_until_uplinked(&pen, "ops/env/health/pod-1", br#"{"ok":true}"#, &up).await;
+        assert_eq!(s.key_expr().as_str(), "slot7/ops/env/health/pod-1");
+        assert_eq!(s.payload().to_bytes().as_ref(), br#"{"ok":true}"#);
+        assert_eq!(*s.encoding(), zenoh::bytes::Encoding::APPLICATION_JSON);
+        assert_eq!(s.kind(), SampleKind::Put);
+
+        // Outside the allowlist: a sibling namespace and a lookalike prefix.
+        for key in [
+            "ops/env/secrets/pod-1",
+            "ops/env/healthy/pod-1",
+            "raw/octo/radar/x",
+        ] {
+            pen.session.put(key, b"no".to_vec()).await.expect("pen put");
+        }
+        assert!(next_sample(&up, QUIET).await.is_none());
+
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_on_the_pen_is_a_delete_under_the_slot() {
+        let (pen, fabric) = (TestPen::start().await, TestPen::start().await);
+        let up = fabric.subscribe("**").await;
+        let (stop, task) = start(args(&pen.endpoint, &fabric.endpoint, "demo/**", SLOT));
+
+        put_until_uplinked(&pen, "demo/a", b"1", &up).await;
+        pen.session.delete("demo/a").await.expect("pen delete");
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        let gone = loop {
+            let s = next_sample(&up, ARRIVES).await.expect("delete uplinked");
+            if s.kind() == SampleKind::Delete {
+                break s;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no delete");
+        };
+        assert_eq!(gone.key_expr().as_str(), "slot7/demo/a");
+
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_published_on_the_fabric_comes_down_to_the_pen() {
+        let (pen, fabric) = (TestPen::start().await, TestPen::start().await);
+        let up = fabric.subscribe("**").await;
+        let down = pen.subscribe("**").await;
+        let (stop, task) = start(args(&pen.endpoint, &fabric.endpoint, "ops/**", SLOT));
+
+        // Bridge is up once one sample has crossed; drain the pen's view of our own put.
+        put_until_uplinked(&pen, "ops/x", b"up", &up).await;
+        while next_sample(&down, Duration::from_millis(200))
+            .await
+            .is_some()
+        {}
+
+        for key in ["slot7/ops/x", "ops/x", "ops/command/reboot"] {
+            fabric
+                .session
+                .put(key, b"down".to_vec())
+                .await
+                .expect("fabric put");
+        }
+        assert!(
+            next_sample(&down, QUIET).await.is_none(),
+            "the fabric leg must never subscribe"
+        );
+
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slot_prefix_outside_one_segment_is_refused_before_any_session_opens() {
+        // Nothing listens on either endpoint: reaching open_forever would hang the test.
+        let nowhere = format!("tcp/127.0.0.1:{}", free_tcp_port());
+        for slot in ["", "a/b", "../other-slot"] {
+            let err = tokio::time::timeout(
+                Duration::from_secs(5),
+                run(
+                    args(&nowhere, &nowhere, "ops/**", slot),
+                    std::future::pending(),
+                ),
+            )
+            .await
+            .expect("refused at once")
+            .expect_err("bad slot");
+            assert!(
+                err.to_string().contains("single key segment"),
+                "{slot}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscriber_that_cannot_run_stops_the_bridge_with_an_error() {
+        // Regression: this path used to exit 0, and Restart=on-failure left it stopped.
+        let (pen, fabric) = (TestPen::start().await, TestPen::start().await);
+        let (_stop, task) = start(args(&pen.endpoint, &fabric.endpoint, "ops//typo", SLOT));
+        let err = tokio::time::timeout(ARRIVES, task)
+            .await
+            .expect("the bridge stops")
+            .expect("join")
+            .expect_err("must be an error, so main exits non-zero");
+        assert!(err.to_string().contains("subscriber task ended"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pen_that_comes_up_after_the_bridge_is_waited_for() {
+        let fabric = TestPen::start().await;
+        let up = fabric.subscribe("**").await;
+        let port = free_tcp_port();
+        let pen_endpoint = format!("tcp/127.0.0.1:{port}");
+        let (stop, task) = start(args(&pen_endpoint, &fabric.endpoint, "ops/**", SLOT));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let pen = TestPen::start_on(port).await;
+        let deadline = tokio::time::Instant::now() + SESSION_OPEN_RETRY + ARRIVES;
+        loop {
+            pen.session
+                .put("ops/late", b"1".to_vec())
+                .await
+                .expect("pen put");
+            if let Some(s) = next_sample(&up, Duration::from_millis(250)).await {
+                assert_eq!(s.key_expr().as_str(), "slot7/ops/late");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "bridge never opened the pen leg"
+            );
+        }
+        stop.send(()).expect("stop");
+        task.await.expect("join").expect("clean shutdown");
+    }
+
+    #[test]
+    fn the_fabric_leg_verifies_router_names_by_default_and_the_pen_leg_does_not() {
+        let a = args(
+            "tls/192.0.2.1:7447",
+            "tls/zenoh.fabric.example:7447",
+            "ops/**",
+            SLOT,
+        );
+        for (leg, want) in [
+            (
+                TlsLeg {
+                    label: "pen",
+                    endpoint: &a.pen_endpoint,
+                    cert: &a.pen_cert,
+                    key: &a.pen_key,
+                    root_ca: &a.pen_root_ca,
+                    verify_name: a.verify_name_pen,
+                },
+                false,
+            ),
+            (
+                TlsLeg {
+                    label: "fabric",
+                    endpoint: &a.fabric_endpoint,
+                    cert: &a.fabric_cert,
+                    key: &a.fabric_key,
+                    root_ca: &a.fabric_root_ca,
+                    verify_name: a.verify_name_fabric,
+                },
+                true,
+            ),
+        ] {
+            let config = make_config(&leg).expect("config");
+            let tls: serde_json::Value =
+                serde_json::from_str(&config.get_json("transport/link/tls").expect("tls block"))
+                    .expect("json");
+            assert_eq!(tls["verify_name_on_connect"], want, "{}", leg.label);
+            assert_eq!(tls["enable_mtls"], true, "{}", leg.label);
+            assert_eq!(config.get_json("mode").expect("mode"), "\"client\"");
         }
     }
 

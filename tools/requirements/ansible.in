@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# The offline job: the template tests plus ansible-core, resolved together so the
+# two never disagree on a shared dependency.
+-r ../../platform/tests/requirements.in
+# 2.21 is the last line that runs on Python 3.12, which the offline job uses.
+ansible-core==2.21.6

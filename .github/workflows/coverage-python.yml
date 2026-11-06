@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# Python test coverage for the CLI in bin/ and the release tools in tools/. Every PR and
+# every push to main. It runs every suite in platform/tests, including the ones ci.yml
+# does not list, so a failing test fails this job too.
+# platform/tests/run_with_coverage.py holds the floors; it fails below either one, or
+# when a Python file in scope is run by no suite at all.
+name: coverage-python
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  coverage-python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: { python-version: '3.12' }
+      - name: dependencies
+        run: |
+          python3 -m pip install --quiet --require-hashes -r tools/requirements/coverage.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables shellcheck jq zsh
+      - name: suites under coverage
+        run: python3 platform/tests/run_with_coverage.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: coverage-python
+          path: |
+            coverage/coverage.json
+            coverage/html/
+          if-no-files-found: ignore

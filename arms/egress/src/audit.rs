@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The egress arm's local audit record: what was sent where, and when.
 //!
 //! One NDJSON file per arm, appended and flushed per line, on the pod's own disk, so the

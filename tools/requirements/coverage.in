@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# What .github/workflows/coverage-python.yml installs, pinned exactly. The suites need
+# jinja2 and PyYAML (as platform/tests/requirements.txt); coverage measures them.
+# Regenerate coverage.txt with hashes after any change here:
+#   uv pip compile --universal --generate-hashes --python-version 3.12 \
+#     tools/requirements/coverage.in -o tools/requirements/coverage.txt
+coverage==7.17.2
+jinja2==3.1.6
+PyYAML==6.0.3

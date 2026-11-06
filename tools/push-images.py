@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """Carry digest-pinned images from a trusted checkout to an installed pod.
 
 Default: build, verify and stage. --load explicitly seeds the pod's loopback registry.

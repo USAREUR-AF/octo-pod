@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+#
+# The REUSE linter for the `reuse` check (.github/workflows/reuse.yml). Edit this pin,
+# then regenerate the hashed lock file:
+#   uv pip compile --universal --generate-hashes --python-version 3.12 tools/requirements/reuse.in -o tools/requirements/reuse.txt
+reuse[charset-normalizer]==6.3.0

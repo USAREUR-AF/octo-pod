@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Reference verdict oracle. Inputs are byte-for-byte upstream fixtures.
 use sapient_receiver::{json, validate};
 use sha2::{Digest, Sha256};

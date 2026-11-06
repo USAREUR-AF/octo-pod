@@ -6,6 +6,12 @@ Notable changes to octo-pod. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-06
+
+Every arm image is rebuilt from this release's source and pinned by digest. Most changes
+are to how octo-pod is built, tested and released. The arm changes are listed under
+Changed and Fixed.
+
 ### Added
 
 - Each tagged release carries the documentation site, `octo-pod-docs-<version>.tar.gz`,
@@ -21,8 +27,64 @@ Notable changes to octo-pod. The format follows
   digest. `tools/gen-images-doc.py` generates it from the pins, and CI fails if it is
   stale.
 - An OpenSSF Scorecard workflow, and status badges in the README.
+- Each arm image's multi-arch manifest carries a provenance attestation that
+  `images.yml` signs keylessly. `tools/pin-images.sh` pins only digests that
+  `images.yml` signed on `main`, and the `signed-pins` check refuses any other arm pin.
+- A tagged release waits in the `release` environment until a maintainer other than the
+  person who pushed the tag approves it. The release stops if the environment does not
+  have that rule.
+- `release.yml` refuses a lightweight tag, a tag whose signature GitHub does not verify,
+  and a tag that does not point at the commit the run builds. Create release tags with
+  `git tag -s`.
+- Release artifacts and arm images are reproducible: the same commit produces the same
+  bytes. The `reproducible` workflow builds each one twice and compares the results.
+  `docs/reproducible-builds.md` describes how to check a release yourself.
+- CI measures test coverage on every pull request and fails when it drops below a floor:
+  Python at 94% of statements and 89.5% of branches, Rust at 93% of lines and regions and
+  80% of branches.
+- The Rust tests run every arm end to end, and ClusterFuzzLite fuzzes the arms' framing,
+  SAPIENT and downlink gate code.
+- Every file states its copyright and license in the REUSE 3.3 format, and the `reuse`
+  check keeps it that way.
+- `MAINTAINERS.md`, `ROADMAP.md`, `docs/assurance-case.md`, `docs/security-review.md`,
+  `docs/release-pattern.md`, `docs/faq.md`, and code review standards in
+  `CONTRIBUTING.md`.
+
+### Changed
+
+- health-pub exits 1 if it cannot install its Ctrl-C handler. It exited 0 before.
+- uplink-bridge keeps running if it cannot install its Ctrl-C handler, until it is
+  stopped. It exited 0 at once before.
+- uplink-bridge and downlink-bridge stop their subscriber tasks before they close their
+  sessions, so no task publishes into a closing session.
+- The SAPIENT reference test receiver logs the address it bound.
+- CI installs every Python dependency from a lock file with hashes and audits each lock.
+- CI installs prebuilt, pinned tools and checks the hash of each download, instead of
+  compiling the tools on every run.
+- Image builds compile dependencies in a separate cached layer that every arm shares. A
+  pull request reads the cache of `main`, and `main` never reads the cache of a pull
+  request. A check proves that a build with the cache produces the same image as a build
+  without it, and every image must print its usage text.
+- GitHub Actions are pinned by commit, workflow tokens are read-only by default, and
+  CodeQL runs on every commit.
 
 ### Fixed
+
+- uplink-bridge exited 0 when a subscriber task stopped. Its unit restarts it only on
+  failure, so a stopped subscriber left the uplink of the pod down. It now exits 1.
+- zenoh-egress-arm wrote the partner's key into the `pen_key` field of its audit `sent`
+  lines. It now writes the key the bytes were read on, as the audit record documents.
+  The field names are unchanged. A tool that reads `pen_key` from these lines sees
+  different values.
+- `octo-pod-declare`, `octo-pod-egress` and `octo-pod-peer` printed a traceback that did
+  not name the file when a declaration had a YAML syntax error. They now name the file and
+  change nothing.
+- `add-arm`, `add-peer` and `egress add` accepted ids that YAML reads as another type,
+  such as `off`, `null` or `0x1f`. `octo-pod add-arm off` left an arm that no command
+  could find, and `octo-pod status` then failed on every run. These ids are now refused
+  before anything is written, and `status` shows such an id instead of failing.
+- `set-firewall on` no longer fails on a pod that has no `00-site.yml`.
+- The release check accepts the owner and repository of the signer in any letter case.
 
 - The watchdog no longer reports a running arm as declaration drift at random, and can no
   longer mistake a listening pen router for a silent one. It read `podman ps` and `ss`
@@ -42,6 +104,8 @@ Notable changes to octo-pod. The format follows
 - CI checks the Python dependencies with `pip-audit`. `arms/osv-scanner.toml` records the
   five triaged Rust advisories, each with its reason and an expiry date, for osv-scanner
   and OpenSSF Scorecard, and a test keeps it in step with `arms/deny.toml`.
+- The tests no longer print the credential they plant to prove that a command never
+  echoes it.
 
 ## [0.5.0] - 2026-11-05
 

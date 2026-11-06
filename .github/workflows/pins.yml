@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+name: pins
+on:
+  # Every pull request, so `signed-pins` always reports and can be a required check.
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  packages: read        # resolve private image digests
+  attestations: read    # read their provenance attestations
+jobs:
+  signed-pins:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: every image this repository builds is pinned to a signed main build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/verify-pins.sh

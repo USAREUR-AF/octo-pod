@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Arm counters + the periodic stats line.
 //!
 //! Every arm emits the same counters on the same schedule, so an operator can read any
@@ -119,4 +121,102 @@ pub fn spawn_stats_logger_with_depth(
 /// Back-compatible entry point for an arm that has no outbox to report.
 pub fn spawn_stats_logger(stats: Arc<Stats>, period_secs: u64) -> tokio::task::JoinHandle<()> {
     spawn_stats_logger_with_depth(stats, period_secs, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::outbox::{Outbox, Pending, Policy};
+    use std::io::Write;
+    use std::sync::Mutex;
+    use zenoh::bytes::Encoding;
+
+    /// Collects formatted log lines so a test can read what an operator would.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        }
+    }
+
+    fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let out = Captured::default();
+        let writer = out.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        (out, tracing::subscriber::set_default(subscriber))
+    }
+
+    #[test]
+    fn a_pen_outage_is_counted() {
+        let s = Stats::default();
+        s.note_pen_down();
+        s.note_pen_down();
+        assert_eq!(s.pen_outages.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_stats_line_reports_every_counter_and_the_live_backlog() {
+        let (log, _guard) = capture();
+        let stats = Arc::new(Stats::default());
+        Stats::bump(&stats.received);
+        Stats::bump(&stats.received);
+        Stats::bump(&stats.dropped_source);
+        stats.note_pen_down();
+        let outbox = Arc::new(Outbox::new(Policy::default(), stats.clone()));
+        outbox.push(Pending::new(
+            "raw/t/1".into(),
+            vec![1],
+            Encoding::APPLICATION_OCTET_STREAM,
+        ));
+        let task = spawn_stats_logger_with_depth(stats.clone(), 30, Some(outbox.clone()));
+
+        // Nothing before the first period ends.
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        outbox.push(Pending::new(
+            "raw/t/2".into(),
+            vec![2],
+            Encoding::APPLICATION_OCTET_STREAM,
+        ));
+        assert!(!log.text().contains("stats"), "{}", log.text());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let line = log.text();
+        task.abort();
+        // `pending` is read from the outbox when the line is written, not when the
+        // logger started.
+        for field in [
+            "received=2",
+            "dropped_source=1",
+            "pen_outages=1",
+            "pending=2",
+            &format!("outbox_capacity={}", Policy::default().capacity),
+        ] {
+            assert!(line.contains(field), "missing {field} in {line}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_arm_without_an_outbox_reports_no_backlog_and_a_zero_period_is_one_second() {
+        let (log, _guard) = capture();
+        let task = spawn_stats_logger(Arc::new(Stats::default()), 0);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let line = log.text();
+        task.abort();
+        assert!(line.contains("pending=0"), "{line}");
+        assert!(line.contains("outbox_capacity=0"), "{line}");
+    }
 }

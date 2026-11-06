@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Carry images from a Mac to an installed pod
 
 This is an operator-initiated SSH delivery path for a field device that cannot pull

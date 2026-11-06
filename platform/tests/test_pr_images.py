@@ -1,8 +1,11 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """Offline controls for PR image selection and final-image loader refusals."""
 import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +40,62 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(sorted(self.images), matrix.select_images(['arms/new-shared-input'], self.images))
 
 
+class MatrixCommandTests(unittest.TestCase):
+    """The command pr-images.yml runs: git diff between two commits, then the selection."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        for arm in ('egress', 'sapient'):
+            (self.repo / 'arms' / arm).mkdir(parents=True)
+            (self.repo / 'arms' / arm / 'Dockerfile').write_text('FROM scratch\n')
+        (self.repo / 'docs').mkdir()
+        (self.repo / 'docs' / 'a.md').write_text('a\n')
+        self.git('init', '-q')
+        self.commit('base')
+
+    def git(self, *args):
+        return subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid',
+                               '-c', 'commit.gpgsign=false', *args], cwd=self.repo, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def commit(self, message):
+        self.git('add', '-A')
+        self.git('commit', '-q', '--allow-empty', '-m', message)
+        return self.git('rev-parse', 'HEAD')
+
+    def matrix(self, base, head):
+        r = subprocess.run([sys.executable, str(REPO / 'tools/pr-image-matrix.py'), base, head],
+                           cwd=self.repo, capture_output=True, text=True, check=False)
+        return r.returncode, r.stdout.strip(), r.stderr
+
+    def test_an_arm_change_builds_that_arm(self):
+        base = self.git('rev-parse', 'HEAD')
+        (self.repo / 'arms' / 'egress' / 'main.rs').write_text('fn main() {}\n')
+        head = self.commit('egress')
+        self.assertEqual((0, '["egress"]'), self.matrix(base, head)[:2])
+
+    def test_a_docs_change_builds_nothing(self):
+        base = self.git('rev-parse', 'HEAD')
+        (self.repo / 'docs' / 'a.md').write_text('b\n')
+        head = self.commit('docs')
+        self.assertEqual((0, '[]'), self.matrix(base, head)[:2])
+
+    def test_a_shared_input_builds_every_arm(self):
+        base = self.git('rev-parse', 'HEAD')
+        (self.repo / 'arms' / 'Cargo.lock').write_text('# lock\n')
+        head = self.commit('lock')
+        self.assertEqual((0, '["egress", "sapient"]'), self.matrix(base, head)[:2])
+
+    def test_no_arm_dockerfiles_is_an_error_not_an_empty_matrix(self):
+        for arm in ('egress', 'sapient'):
+            (self.repo / 'arms' / arm / 'Dockerfile').unlink()
+        rc, out, err = self.matrix('HEAD', 'HEAD')
+        self.assertNotEqual(0, rc)
+        self.assertIn('No arm Dockerfiles found', err)
+
+
 class LoaderGuardTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -57,7 +116,7 @@ if args[:2] == ['image', 'inspect']:
         print(os.environ.get('FIXTURE_USER', '65532:65532'))
     sys.exit(0)
 if args[0] == 'run':
-    print('Usage: synthetic fixture; no container or network')
+    print(os.environ.get('FIXTURE_RUN_OUTPUT', 'Usage: synthetic fixture; no container or network'))
     sys.exit(int(os.environ.get('FIXTURE_RUN_STATUS', '0')))
 sys.exit(99)
 ''')
@@ -100,6 +159,14 @@ sys.exit(99)
     def test_loader_failure_is_not_ignored(self):
         self.env['FIXTURE_RUN_STATUS'] = '127'
         self.assertNotEqual(0, self.guard().returncode)
+        self.assertEqual(1, sum(c[0] == 'run' for c in self.calls()))
+
+    def test_a_binary_that_prints_no_usage_is_refused(self):
+        # A placeholder main from the dependency layer exits 0 and prints nothing.
+        self.env['FIXTURE_RUN_OUTPUT'] = ''
+        result = self.guard()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('printed no usage', result.stderr)
         self.assertEqual(1, sum(c[0] == 'run' for c in self.calls()))
 
     def test_missing_binary_contract_is_refused(self):

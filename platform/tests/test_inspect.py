@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """
 bin/octo-pod-inspect (get, describe, logs, certs) against a scratch pod.
 
@@ -32,7 +34,7 @@ from test_top import build_pod, stamp  # the same scratch pod as top's tests
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "bin"))
 INSPECT = REPO / "bin" / "octo-pod-inspect"
-SECRET = "A1B2-THIS-MUST-NOT-APPEAR-C3D4"
+CANARY = "A1B2-THIS-MUST-NOT-APPEAR-C3D4"
 ROOT = os.geteuid() == 0   # root reads through every mode bit, so those checks skip
 
 FAKE_SYSTEMCTL = r'''#!/usr/bin/env python3
@@ -169,11 +171,11 @@ def main_pod(repo, check, root):
     hv = pathlib.Path(env["OCTO_POD_ETC"]) / "host_vars" / "pod-test"
     (hv / "20-peers.yml").write_text(
         "peers:\n  - id: field1\n    namespace: raw/octo/field1\n"
-        f"    setup_key: {SECRET}\n    setupKey: {SECRET}\n    apiKey: {SECRET}\n"
-        f"    tokens: [{SECRET}]\n    passphrase: {SECRET}\n    psk: {SECRET}\n"
-        f"    url: tcp://ops:{SECRET}@192.0.2.1:9000\n"
-        f"    auth:\n      api_token: {SECRET}\n      password: {SECRET}\n"
-        f"    tls:\n      client: |\n        -----BEGIN PRIVATE KEY-----\n        {SECRET}\n"
+        f"    setup_key: {CANARY}\n    setupKey: {CANARY}\n    apiKey: {CANARY}\n"
+        f"    tokens: [{CANARY}]\n    passphrase: {CANARY}\n    psk: {CANARY}\n"
+        f"    url: tcp://ops:{CANARY}@192.0.2.1:9000\n"
+        f"    auth:\n      api_token: {CANARY}\n      password: {CANARY}\n"
+        f"    tls:\n      client: |\n        -----BEGIN PRIVATE KEY-----\n        {CANARY}\n"
         "        -----END PRIVATE KEY-----\n    keys: [aabbcc/field1/**]\n")
     tls = pathlib.Path(env["OCTO_PEN_STATE"]) / "zenoh" / "tls"
     work = root / "ca-work"
@@ -312,7 +314,7 @@ def main_pod(repo, check, root):
           and "CN=octo-peer-field1" in out and "EXPIRED" in out
           and "pod-cert.pem" not in out, out + p.stderr)
     check("describe never prints a credential, whatever the key looks like",
-          SECRET not in out and "PRIVATE" not in out and "namespace: raw/octo/field1" in out
+          CANARY not in out and "PRIVATE" not in out and "namespace: raw/octo/field1" in out
           and "aabbcc/field1/**" in out and "tcp://<redacted>@192.0.2.1:9000" in out, out)
     out = r("describe", "c2-tcp").stdout
     check("describe an egress destination: keys shown, both copies of its certificate",
@@ -531,7 +533,9 @@ def main_pod(repo, check, root):
         if not executable:
             continue
         def complete(*words):
-            init='autoload -Uz compinit bashcompinit; compinit -D; bashcompinit\n' if shell=='zsh' else ''
+            # -i: ignore fpath directories compaudit calls insecure instead of asking. A CI
+            # runner has group-writable ones, and with no terminal to ask on, compinit aborts.
+            init='autoload -Uz compinit bashcompinit; compinit -i -D; bashcompinit\n' if shell=='zsh' else ''
             script=(init + 'source ' + shlex.quote(str(repo/'completions/octo-pod.bash')) + '\n'
                     + ('emulate -L sh; setopt kshglob noshglob braceexpand\n' if shell=='zsh' else '')
                     + 'COMP_WORDS=(octo-pod ' + ' '.join(map(shlex.quote,words)) + '); '

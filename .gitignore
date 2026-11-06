@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 target/
 .env
 *.pem
@@ -26,3 +28,6 @@ dist/
 # means the repo carries two diagrams that disagree, and the stale one is the one nobody
 # notices is stale.
 .$*.bkp
+
+# Python coverage output (platform/tests/run_with_coverage.py)
+/coverage/

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """
 Which way an upgrade goes, and what it trusts. No network, no root, no real pod:
 bin/octo-pod-upgrade runs against a temporary release tree and a file:// mirror, with a
@@ -275,7 +277,13 @@ sys.stdout.write("".join(l + "\n" for l in lines))
             for e in entries:
                 if e.name == "cosign" or (farm / e.name).is_symlink():
                     continue
-                if e.is_file() and os.access(e, os.X_OK):
+                # An entry this user may not stat (macOS ships some in /usr/sbin) is not
+                # a program it could run. Before Python 3.14, is_file() raises on it.
+                try:
+                    runnable = e.is_file() and os.access(e, os.X_OK)
+                except OSError:
+                    continue
+                if runnable:
                     (farm / e.name).symlink_to(e)
         return {"PATH": str(farm)}
 

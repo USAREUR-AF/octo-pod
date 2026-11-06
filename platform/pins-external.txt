@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# Images this repository does not build. Each is pinned by digest in
+# platform/group_vars/all/10-infrastructure.yml, but none carries this repository's
+# signature, so tools/verify-pins.sh checks only that it is pinned by digest.
+# One group_vars key per line, then the reason.
+zenoh_image_upstream   # Eclipse Zenoh router, an upstream release
+audit_image_upstream   # GOAT audit subscriber, built and published by GOAT

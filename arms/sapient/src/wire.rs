@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The only SAPIENT this arm speaks, and the only SAPIENT it reads.
 //!
 //! Everything here serves the session and nothing else: the messages the arm must send to
@@ -458,6 +460,74 @@ mod tests {
     }
 
     #[test]
+    fn a_client_relays_only_direction_that_already_names_its_node() {
+        use crate::proto::v2::{AlertAck, DetectionReport, Task};
+        use sapient_message::Content as C;
+        let addressed = |content| {
+            let mut m = SapientMessage::decode(relayed(content).as_slice()).unwrap();
+            m.destination_id = Some("sensor-7".into());
+            m.encode_to_vec()
+        };
+        // Addressed by its source: sent on, to the node it names, under the arm's id.
+        let out = relay_for_role(
+            &addressed(C::Task(Task::default())),
+            Role::Client,
+            "pod",
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.destination_id.as_deref(), Some("sensor-7"));
+        assert_eq!(out.node_id.as_deref(), Some("pod"));
+        // A handler serves many nodes: the client never picks one on anyone's behalf,
+        // even when it knows a registered peer.
+        let out = relay_for_role(
+            &addressed(C::AlertAck(AlertAck::default())),
+            Role::Client,
+            "pod",
+            Some("someone-else"),
+        )
+        .unwrap();
+        assert_eq!(out.destination_id.as_deref(), Some("sensor-7"));
+        for unaddressed in [C::Task(Task::default()), C::AlertAck(AlertAck::default())] {
+            let err = relay_for_role(&relayed(unaddressed), Role::Client, "pod", None).unwrap_err();
+            assert!(err.contains("must name the node"), "{err}");
+        }
+        let err = relay_for_role(
+            &addressed(C::DetectionReport(DetectionReport::default())),
+            Role::Client,
+            "pod",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("client role"), "{err}");
+    }
+
+    #[test]
+    fn a_controller_with_no_registered_sensor_keeps_the_given_address() {
+        use crate::proto::v2::Task;
+        let mut m = SapientMessage::decode(
+            relayed(sapient_message::Content::Task(Task::default())).as_slice(),
+        )
+        .unwrap();
+        m.destination_id = Some("as-given".into());
+        let out = relay_for_role(&m.encode_to_vec(), Role::Dmm, "pod", None).unwrap();
+        assert_eq!(out.destination_id.as_deref(), Some("as-given"));
+    }
+
+    #[test]
+    fn an_arm_that_has_not_settled_its_role_relays_nothing() {
+        use crate::proto::v2::{AlertAck, DetectionReport, Task};
+        use sapient_message::Content as C;
+        for content in [
+            C::DetectionReport(DetectionReport::default()),
+            C::Task(Task::default()),
+            C::AlertAck(AlertAck::default()),
+        ] {
+            assert!(relay_for_role(&relayed(content), Role::Auto, "pod", None).is_err());
+        }
+    }
+
+    #[test]
     fn a_sample_that_is_not_a_sapient_message_is_refused() {
         assert!(relay_for_role(b"\xff\xff\xff\xff not protobuf", Role::Asm, "n", None).is_err());
         // Decodes as protobuf, but carries no content an arm could send.
@@ -506,6 +576,23 @@ mod tests {
         assert_eq!(caps[1].2, None);
         assert!(capabilities("").unwrap().is_empty());
         assert!(capabilities("lonely").is_err());
+        // Both mandatory fields must be non-empty, not merely present.
+        for spec in [":Feed", "Relay:", " : "] {
+            let err = format!("{:#}", capabilities(spec).unwrap_err());
+            assert!(err.contains("empty category or type"), "{spec}: {err}");
+        }
+        // An empty optional field is absent, not an empty value.
+        let caps = capabilities("Radar:Power::dB").unwrap();
+        assert_eq!(
+            (caps[0].2.as_deref(), caps[0].3.as_deref()),
+            (None, Some("dB"))
+        );
+    }
+
+    #[test]
+    fn only_a_registration_declares_a_status_interval() {
+        assert_eq!(declared_status_interval(&status_report("n")), None);
+        assert_eq!(declared_status_interval(&SapientMessage::default()), None);
     }
 
     #[test]

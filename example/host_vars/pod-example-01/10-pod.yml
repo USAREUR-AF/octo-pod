@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # THIS POD's identity and its release gate. Everything here differs per pod;
 # shared policy lives in platform/group_vars/all/.
 

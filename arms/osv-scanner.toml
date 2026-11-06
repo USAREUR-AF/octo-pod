@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # Triaged advisories for arms/Cargo.lock, read by osv-scanner and by the OpenSSF
 # Scorecard Vulnerabilities check, which runs osv-scanner.
 #

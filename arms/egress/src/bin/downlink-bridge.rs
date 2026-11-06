@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! downlink-bridge: the uplink bridge, run in reverse.
 //!
 //! The uplink bridge (`uplink-bridge`) subscribes on the pen to the namespaces in
@@ -86,7 +88,17 @@ struct Counters {
 #[tokio::main]
 async fn main() -> ExitCode {
     octo_arm_common::init_tracing();
-    let args = Args::parse();
+    ExitCode::from(
+        bridge(Args::parse(), async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await,
+    )
+}
+
+/// The whole bridge, until `shutdown` resolves (exit 0) or an upstream subscription ends
+/// (exit 1, so the supervisor restarts it into a clean set of subscriptions).
+async fn bridge(args: Args, shutdown: impl std::future::Future<Output = ()>) -> u8 {
     let entries: Vec<String> = args
         .allow
         .split(',')
@@ -107,9 +119,9 @@ async fn main() -> ExitCode {
 
     if gate.is_empty() {
         info!("nothing released downward: no fabric session is opened");
-        let _ = tokio::signal::ctrl_c().await;
+        shutdown.await;
         stats.abort();
-        return ExitCode::SUCCESS;
+        return 0;
     }
 
     let pen = Leg {
@@ -146,13 +158,14 @@ async fn main() -> ExitCode {
     }
 
     let code = tokio::select! {
-        _ = tokio::signal::ctrl_c() => { info!("shutdown signal received"); ExitCode::SUCCESS }
+        () = shutdown => { info!("shutdown signal received"); 0 }
         Some(_) = tasks.join_next() => {
             // Non-zero so the supervisor restarts us into a clean set of subscriptions.
             error!("a subscriber task ended; exiting for a supervised restart");
-            ExitCode::FAILURE
+            1
         }
     };
+    tasks.abort_all();
     stats.abort();
     let _ = fabric.close().await;
     let _ = pen.close().await;
@@ -221,4 +234,136 @@ fn spawn_stats(secs: u64, c: Arc<Counters>, refused: u64) -> tokio::task::JoinHa
             );
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octo_arm_common::testing::{free_tcp_port, next_sample, TestPen, ARRIVES, QUIET};
+    use tokio::sync::oneshot;
+
+    const KEY: &str = "894aee26d8146f54a0e949eb66acc40c/sensors/radar1/asterix/data";
+    const OTHER: &str = "894aee26d8146f54a0e949eb66acc40c/sensors/radar2/asterix/data";
+
+    fn args(fabric: &str, pen: &str, allow: &str) -> Args {
+        Args::try_parse_from([
+            "downlink-bridge",
+            "--fabric-endpoint",
+            fabric,
+            "--fabric-cert",
+            "/unused/slot.crt",
+            "--fabric-key",
+            "/unused/slot.key",
+            "--fabric-root-ca",
+            "/unused/fabric-ca.pem",
+            "--pen-endpoint",
+            pen,
+            "--pen-cert",
+            "/unused/pen.crt",
+            "--pen-key",
+            "/unused/pen.key",
+            "--pen-root-ca",
+            "/unused/pen-ca.pem",
+            "--allow",
+            allow,
+        ])
+        .unwrap()
+    }
+
+    fn start(args: Args) -> (oneshot::Sender<()>, tokio::task::JoinHandle<u8>) {
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(bridge(args, async move {
+            let _ = stopped.await;
+        }));
+        (stop, task)
+    }
+
+    type Sub =
+        zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<zenoh::sample::Sample>>;
+
+    /// Publish upstream until the bridge has subscribed and the sample is on the pen.
+    async fn put_until_down(fabric: &TestPen, pen: &Sub) -> zenoh::sample::Sample {
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        loop {
+            fabric
+                .session
+                .put(KEY, b"\x30\x00\x03".to_vec())
+                .encoding(zenoh::bytes::Encoding::APPLICATION_OCTET_STREAM)
+                .await
+                .unwrap();
+            if let Some(s) = next_sample(pen, Duration::from_millis(250)).await {
+                return s;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never came down");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_released_keys_come_down_and_only_under_downlink() {
+        let (fabric, pen) = (TestPen::start().await, TestPen::start().await);
+        let down = pen.subscribe("**").await;
+        // `**` is refused (it would reach the whole fabric); the released key still runs.
+        let (stop, task) = start(args(&fabric.endpoint, &pen.endpoint, &format!("**,{KEY}")));
+
+        let s = put_until_down(&fabric, &down).await;
+        assert_eq!(s.key_expr().as_str(), format!("downlink/{KEY}"));
+        assert_eq!(s.payload().to_bytes().as_ref(), b"\x30\x00\x03");
+        while next_sample(&down, Duration::from_millis(200))
+            .await
+            .is_some()
+        {}
+
+        for key in [OTHER, "ops/env/health/pod-1", "downlink/x"] {
+            fabric.session.put(key, b"no".to_vec()).await.unwrap();
+        }
+        assert!(next_sample(&down, QUIET).await.is_none());
+
+        fabric.session.delete(KEY).await.unwrap();
+        let gone = next_sample(&down, ARRIVES).await.expect("delete came down");
+        assert_eq!(gone.kind(), SampleKind::Delete);
+        assert_eq!(gone.key_expr().as_str(), format!("downlink/{KEY}"));
+
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_published_on_the_pen_goes_up_through_this_bridge() {
+        let (fabric, pen) = (TestPen::start().await, TestPen::start().await);
+        let down = pen.subscribe("**").await;
+        let up = fabric.subscribe("**").await;
+        let (stop, task) = start(args(&fabric.endpoint, &pen.endpoint, KEY));
+        put_until_down(&fabric, &down).await;
+        while next_sample(&up, Duration::from_millis(200)).await.is_some() {}
+
+        for key in [
+            format!("downlink/{KEY}"),
+            KEY.to_string(),
+            "raw/octo/radar/x".into(),
+        ] {
+            pen.session.put(key, b"up?".to_vec()).await.unwrap();
+        }
+        assert!(
+            next_sample(&up, QUIET).await.is_none(),
+            "the pen leg must never subscribe"
+        );
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_released_opens_no_session_and_stops_cleanly() {
+        // Neither router exists: opening either leg would never return.
+        let nowhere = format!("tcp/127.0.0.1:{}", free_tcp_port());
+        for allow in ["", "**", "ops/**,attest/x"] {
+            let (stop, task) = start(args(&nowhere, &nowhere, allow));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stop.send(()).unwrap();
+            let code = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("stops without opening anything")
+                .unwrap();
+            assert_eq!(code, 0, "{allow}");
+        }
+    }
 }

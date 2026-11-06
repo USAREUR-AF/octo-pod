@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! The SAPIENT session arm's modules, as a library.
 //!
 //! The `sapient` binary (`src/main.rs`) is the arm and uses these modules unchanged. They

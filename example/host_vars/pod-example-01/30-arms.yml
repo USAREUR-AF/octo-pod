@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # ARMS — socket publishers we give identity to.
 #
 # An arm's publisher does NOT speak Zenoh and holds no credential. They send bytes at

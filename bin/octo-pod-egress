@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """
 octo-pod egress: declare, release, revoke, check and remove egress destinations.
 
@@ -115,7 +117,12 @@ def load(path):
         import yaml
     except ImportError:
         die(_critical("pyyaml missing; install python3-yaml"))
-    return (yaml.safe_load(path.read_text()) or {}) if path.exists() else {}
+    if not path.exists():
+        return {}
+    try:
+        return yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError as exc:
+        die(_critical('{v0} is not valid YAML, so nothing was changed. Fix it, then run this again:\n{v1}', v0=path, v1=exc))
 
 
 def key_problem(key):
@@ -383,6 +390,12 @@ def cmd_add(args, d):
         die(_critical('id {v0!r} must be lowercase alphanumeric/dashes: it becomes a CN and a unit name', v0=args.id))
     if args.id in existing_ids(d):
         die(_critical('{v0} is already declared on this pod', v0=args.id))
+    # Written unquoted into 40-egress.yml, so it must read back as itself (not off, null,
+    # 123). existing_ids above has already loaded pyyaml through load().
+    import yaml
+    as_read = yaml.safe_load(args.id)
+    if as_read != args.id:
+        die(_critical('id {v0!r} reads as {v1!r} in YAML, not as a name: YAML takes off, yes and no for booleans, null for nothing, and 123 or 0x1f for numbers. Choose another id.', v0=args.id, v1=as_read))
     if not args.key:
         die(_critical("give at least one --key: the fabric keys this destination receives, e.g. "
             "<anchor>/sensors/radar1/asterix/data"))

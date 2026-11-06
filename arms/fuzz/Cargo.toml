@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # Fuzz targets for the arm code that reads bytes from a peer or from the pen.
 #
 # This is a separate workspace on purpose. The targets need a nightly toolchain and

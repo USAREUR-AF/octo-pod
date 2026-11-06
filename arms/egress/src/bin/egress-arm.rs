@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! egress-arm: one octo-pod arm, run in reverse, per external destination.
 //!
 //! An inbound octo-pod arm takes a sensor's data the way the sensor offers it, gates on
@@ -258,7 +260,17 @@ enum Delivery {
 #[tokio::main]
 async fn main() -> ExitCode {
     octo_arm_common::init_tracing();
-    let args = Args::parse();
+    ExitCode::from(
+        arm(Args::parse(), async {
+            tokio::signal::ctrl_c().await.context("waiting for ctrl-c")
+        })
+        .await,
+    )
+}
+
+/// Plan, then run until `shutdown` resolves. Returns the exit code: 0 stopped, 1 failed
+/// (for the supervisor to restart), [`REFUSED`] for a declaration it will not serve.
+async fn arm(args: Args, shutdown: impl std::future::Future<Output = anyhow::Result<()>>) -> u8 {
     let plan = match plan(&args) {
         Ok(p) => p,
         Err(why) => {
@@ -267,20 +279,24 @@ async fn main() -> ExitCode {
             if let Ok(audit) = AuditLog::open(Path::new(&args.audit_dir), &args.id, &args.dest) {
                 let _ = audit.event("refused", json!({ "reason": why }));
             }
-            return ExitCode::from(REFUSED);
+            return REFUSED;
         }
     };
-    match run(args, plan).await {
-        Ok(()) => ExitCode::SUCCESS,
+    match run(args, plan, shutdown).await {
+        Ok(()) => 0,
         Err(e) => {
             error!(error = %format!("{e:#}"), "egress-arm stopped");
-            ExitCode::FAILURE
+            1
         }
     }
 }
 
 #[allow(clippy::too_many_lines)] // one linear setup; splitting it hides the order
-async fn run(args: Args, plan: Plan) -> anyhow::Result<()> {
+async fn run(
+    args: Args,
+    plan: Plan,
+    shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
     let audit = Arc::new(
         AuditLog::open(Path::new(&args.audit_dir), &args.id, &plan.dest.to_string())
             .context("opening the audit record")?,
@@ -400,7 +416,7 @@ async fn run(args: Args, plan: Plan) -> anyhow::Result<()> {
     };
     tokio::select! {
         () = drain => {}
-        r = tokio::signal::ctrl_c() => { r.context("waiting for ctrl-c")?; info!("shutdown signal received"); }
+        r = shutdown => { r?; info!("shutdown signal received"); }
     }
     stats_task.abort();
     drop(subscribers);
@@ -520,6 +536,311 @@ mod tests {
             sender.tcp.is_none(),
             "the stalled connection is dropped for a re-dial"
         );
+    }
+
+    use octo_arm_common::testing::{free_tcp_port, TestPen, ARRIVES};
+    use serde_json::Value;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::oneshot;
+
+    const PAYLOAD: &[u8] = b"\x30\x00\x0bASTERIX-62";
+
+    fn scratch(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("egress-arm-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.to_string_lossy().into_owned()
+    }
+
+    fn audit_lines(dir: &str) -> Vec<Value> {
+        std::fs::read_to_string(Path::new(dir).join("acts-egress.ndjson"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every audit line is JSON"))
+            .collect()
+    }
+
+    fn kinds(lines: &[Value]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l["kind"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn start(args: Args) -> (oneshot::Sender<()>, tokio::task::JoinHandle<u8>) {
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(arm(args, async move {
+            let _ = stopped.await;
+            Ok(())
+        }));
+        (stop, task)
+    }
+
+    async fn publish(pen: &TestPen) {
+        pen.session
+            .put(format!("downlink/{KEY}"), PAYLOAD.to_vec())
+            .await
+            .expect("pen put");
+    }
+
+    /// Until `deadline`, or fail the test.
+    fn before(deadline: tokio::time::Instant) {
+        assert!(tokio::time::Instant::now() < deadline, "never delivered");
+    }
+
+    const TRY: Duration = Duration::from_millis(250);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_released_sample_is_sent_unchanged_over_udp_and_audited() {
+        let pen = TestPen::start().await;
+        let consumer = UdpSocket::bind("127.0.0.1:0").await.expect("consumer");
+        let addr = consumer.local_addr().expect("addr");
+        let dir = scratch("udp");
+        let (stop, task) = start(args(
+            &format!("udp://{addr}"),
+            &addr.to_string(),
+            KEY,
+            &[
+                "--endpoint",
+                &pen.endpoint,
+                "--audit-dir",
+                &dir,
+                "--stats-secs",
+                "1",
+            ],
+        ));
+
+        let mut got = vec![0u8; 2048];
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        let n = loop {
+            publish(&pen).await;
+            if let Ok(Ok(n)) = tokio::time::timeout(TRY, consumer.recv(&mut got)).await {
+                break n;
+            }
+            before(deadline);
+        };
+        assert_eq!(&got[..n], PAYLOAD, "one datagram per sample, unchanged");
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        stop.send(()).expect("stop");
+        assert_eq!(task.await.expect("join"), 0);
+
+        let lines = audit_lines(&dir);
+        assert_eq!(lines[0]["kind"], "start");
+        assert_eq!(lines[0]["pen_keys"][0], format!("downlink/{KEY}"));
+        let sent = lines
+            .iter()
+            .find(|l| l["kind"] == "sent")
+            .expect("a sent line");
+        assert_eq!(sent["seq"], 1);
+        assert_eq!(sent["fabric_key"], KEY);
+        assert_eq!(sent["pen_key"], format!("downlink/{KEY}"));
+        assert_eq!(sent["len"], PAYLOAD.len());
+        assert_eq!(
+            sent["payload_hash"],
+            octo_egress::audit::payload_hash(PAYLOAD)
+        );
+        assert_eq!(sent["destination"], format!("udp://{addr}"));
+        let summary = lines
+            .iter()
+            .find(|l| l["kind"] == "summary")
+            .expect("a summary");
+        assert!(summary["sent"].as_u64().expect("sent") >= 1);
+        assert_eq!(summary["dest_mismatch"], 0);
+        assert!(
+            summary.get("consumers_connected").is_none(),
+            "not a listener"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ipv6_udp_destination_is_sent_from_an_ipv6_socket() {
+        let pen = TestPen::start().await;
+        let Ok(consumer) = UdpSocket::bind("[::1]:0").await else {
+            return; // no IPv6 loopback on this runner
+        };
+        let addr = consumer.local_addr().expect("addr");
+        let dir = scratch("udp6");
+        let (stop, task) = start(args(
+            &format!("udp://{addr}"),
+            &addr.to_string(),
+            KEY,
+            &["--endpoint", &pen.endpoint, "--audit-dir", &dir],
+        ));
+        let mut got = vec![0u8; 2048];
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        let (n, from) = loop {
+            publish(&pen).await;
+            if let Ok(Ok(v)) = tokio::time::timeout(TRY, consumer.recv_from(&mut got)).await {
+                break v;
+            }
+            before(deadline);
+        };
+        assert_eq!(&got[..n], PAYLOAD);
+        assert!(from.is_ipv6());
+        stop.send(()).expect("stop");
+        assert_eq!(task.await.expect("join"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tcp_destination_is_dialled_and_streams_each_sample_in_order() {
+        let pen = TestPen::start().await;
+        let consumer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("consumer");
+        let addr = consumer.local_addr().expect("addr");
+        let dir = scratch("tcp");
+        let (stop, task) = start(args(
+            &format!("tcp://{addr}"),
+            &addr.to_string(),
+            KEY,
+            &["--endpoint", &pen.endpoint, "--audit-dir", &dir],
+        ));
+
+        // The arm dials when it first has something to send.
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        let mut conn = loop {
+            publish(&pen).await;
+            if let Ok(Ok((s, _))) = tokio::time::timeout(TRY, consumer.accept()).await {
+                break s;
+            }
+            before(deadline);
+        };
+        publish(&pen).await;
+        // Every sample is the payload, back to back, nothing between or around them.
+        let mut stream = vec![0u8; PAYLOAD.len() * 2];
+        tokio::time::timeout(ARRIVES, conn.read_exact(&mut stream))
+            .await
+            .expect("streamed")
+            .expect("read");
+        assert_eq!(&stream[..PAYLOAD.len()], PAYLOAD);
+        assert_eq!(&stream[PAYLOAD.len()..], PAYLOAD);
+
+        stop.send(()).expect("stop");
+        assert_eq!(task.await.expect("join"), 0);
+        assert!(
+            kinds(&audit_lines(&dir))
+                .iter()
+                .filter(|k| *k == "sent")
+                .count()
+                >= 2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listening_destination_serves_a_declared_peer_that_dials_in() {
+        let pen = TestPen::start().await;
+        let port = free_tcp_port();
+        let dir = scratch("serve");
+        let (stop, task) = start(args(
+            &format!("tcp-server://127.0.0.1:{port}"),
+            &format!("127.0.0.1:{port}"),
+            KEY,
+            &[
+                "--peers",
+                "127.0.0.1",
+                "--endpoint",
+                &pen.endpoint,
+                "--audit-dir",
+                &dir,
+                "--stats-secs",
+                "1",
+            ],
+        ));
+
+        // Published while no consumer is connected: counted, not kept. With no replay
+        // configured, the consumer that connects next receives none of it.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for _ in 0..3 {
+            publish(&pen).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        let mut consumer = loop {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+                break s;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listener never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let mut probe = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), consumer.read(&mut probe))
+                .await
+                .is_err(),
+            "a consumer must not be handed samples from before it connected"
+        );
+        let mut got = vec![0u8; PAYLOAD.len()];
+        let deadline = tokio::time::Instant::now() + ARRIVES;
+        loop {
+            publish(&pen).await;
+            if let Ok(Ok(_)) = tokio::time::timeout(TRY, consumer.read_exact(&mut got)).await {
+                break;
+            }
+            before(deadline);
+        }
+        assert_eq!(got, PAYLOAD);
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+
+        stop.send(()).expect("stop");
+        assert_eq!(task.await.expect("join"), 0);
+        let lines = audit_lines(&dir);
+        let sent = lines
+            .iter()
+            .find(|l| l["kind"] == "sent")
+            .expect("a sent line");
+        assert_eq!(sent["consumers"], 1);
+        // The last summary, after the consumer connected; the first predates it.
+        let summary = lines
+            .iter()
+            .rev()
+            .find(|l| l["kind"] == "summary")
+            .expect("a summary");
+        assert_eq!(summary["consumers_connected"], 1);
+        assert!(summary["no_client"].as_u64().expect("no_client") >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_declaration_exits_2_and_records_why_without_opening_anything() {
+        // The default endpoint is never dialled: nothing listens there, and the arm must
+        // not get far enough to try.
+        let dir = scratch("refused");
+        let code = arm(
+            args(
+                "udp://10.1.2.66:4001",
+                "10.1.2.3:4001",
+                KEY,
+                &["--audit-dir", &dir],
+            ),
+            async { Ok(()) },
+        )
+        .await;
+        assert_eq!(code, REFUSED);
+        let lines = audit_lines(&dir);
+        assert_eq!(kinds(&lines), vec!["refused".to_string()]);
+        assert!(lines[0]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("not in the declared allow list"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pen_that_will_not_open_exits_1_for_the_supervisor() {
+        let dir = scratch("nopen");
+        let nowhere = format!("tcp/127.0.0.1:{}", free_tcp_port());
+        let code = arm(
+            args(
+                "udp://10.1.2.3:4001",
+                "10.1.2.3:4001",
+                KEY,
+                &["--endpoint", &nowhere, "--audit-dir", &dir],
+            ),
+            async { Ok(()) },
+        )
+        .await;
+        assert_eq!(code, 1);
+        assert_eq!(kinds(&audit_lines(&dir)), vec!["start".to_string()]);
     }
 
     #[test]

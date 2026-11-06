@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """Drive a sapient:// egress destination end to end, as `apply` deploys it.
 
 Started by run.sh, which builds the image, mints the pen certificates the way `apply`

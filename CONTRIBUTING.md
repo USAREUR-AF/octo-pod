@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Contributing to octo-pod
 
 Thanks for helping. This guide covers how to set up, how to prepare a change so it can be
@@ -56,6 +61,19 @@ feat(egress): serve a destination that dials the pod
 fix(firewall): admit the mesh's relay ports on the WAN leg
 docs(readme): say where the slot bundle comes from
 ```
+
+## Coding Standards
+
+Contributions follow the style guide for their language. Where a tool can check the
+guide, CI runs it and a change that fails doesn't merge.
+
+| Language | Style guide | How it is checked |
+|---|---|---|
+| Rust | The [Rust Style Guide](https://doc.rust-lang.org/style-guide/), as `rustfmt` formats it. Clippy's default lints, with no warnings. No `unsafe` code. | `cargo fmt --check` and `cargo clippy -- -D warnings` in CI; `unsafe_code = "forbid"` in `arms/Cargo.toml` |
+| Shell | The [Google Shell Style Guide](https://google.github.io/styleguide/shellguide.html). Scripts start with `set -euo pipefail`. | ShellCheck in CI, on every script and every rendered shell template |
+| Python | [PEP 8](https://peps.python.org/pep-0008/). | Review. CI doesn't lint Python yet |
+| Ansible | Fully qualified module names, such as `ansible.builtin.file`. | `ansible-playbook --syntax-check` in CI, and review |
+| Documentation | The [Google developer documentation style guide](https://developers.google.com/style), in clear, literal English. See [Documentation language](#documentation-language). | Review |
 
 ## Test Policy
 
@@ -176,13 +194,71 @@ cargo run --example make_seeds
 ## Pull Requests
 
 Fill in the template: what changed and why, how you tested it, and any known gaps. Keep
-one concern per pull request. Reviewers come from [.github/CODEOWNERS](.github/CODEOWNERS);
-a change to the firewall, the release gates, identity or signing needs a second
-reviewer.
+one concern per pull request.
 
 Never commit site values: addresses, hostnames, enrollment output, keys or tokens. Site
 values belong in an operator's ignored identity files, and the examples use
 documentation addresses (RFC 5737) only.
+
+## Code Review
+
+Every change reaches `main` through a pull request, and a person other than the author
+reviews and approves it before it merges. This is the two-person rule. Branch protection
+on `main` requires an approval from a code owner, dismisses that approval when new
+commits arrive, and requires every review thread to be resolved.
+
+### Who Approves
+
+- Approvals come from the maintainers that [.github/CODEOWNERS](.github/CODEOWNERS)
+  names. [MAINTAINERS.md](MAINTAINERS.md) lists who holds each role.
+- The author never approves their own change.
+- A change to the firewall, the release gates, identity, certificates or signing needs a
+  second reviewer in addition to the approver.
+- An administrator can merge without an approval. Use this only to restore service or to
+  repair a broken `main`, and say why in the pull request. A second person then reviews
+  the change after it merges.
+
+### What a Reviewer Checks
+
+Read the tests first, then the code. Check that:
+
+- The pull request does one thing, and its description says what changed and why.
+- A bug fix includes a test that fails without the fix. New functionality includes tests,
+  and a change on the security boundary tests that the boundary refuses what it must
+  refuse. See [Test Policy](#test-policy).
+- The commands in the Test Plan reproduce the result that the author reports.
+- Input from a sensor, peer, receiver or file is bounded and checked against what is
+  allowed before the code uses it.
+- No new path lets data leave the pod without a declaration and an `apply`.
+- No credential, key, real address or hostname is committed.
+- A new dependency is pinned, has a license that `cargo-deny` accepts, and is needed. A
+  new GitHub Action is pinned by commit.
+- A generated file was regenerated with its generator, not edited by hand.
+- Documentation changes in the same pull request as the behavior that it describes. An
+  architectural decision has an ADR.
+- Every commit is signed and carries a DCO sign-off, and the title follows Conventional
+  Commits.
+
+### What Makes a Change Acceptable
+
+A change merges when all of these are true:
+
+- A code owner who is not the author approved it.
+- Every required check passes on a branch that is up to date with `main`.
+- Every review thread is resolved.
+- Every commit is signed and signed off.
+
+A reviewer who requests changes gives the reason and, where possible, the fix. The
+author answers each comment with a change or with a reason.
+
+## Small Tasks for New Contributors
+
+Issues labeled
+[`good first issue`](https://github.com/usareur-af/octo-pod/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
+are small tasks for new or occasional contributors. Each one names the files to change
+and the test that shows the change works, and needs no access to a pod or a fabric.
+Comment on the issue before you start, so that two people don't do the same work.
+Maintainers add the label when they find a task of this size.
 
 ## Documentation language
 
@@ -202,9 +278,26 @@ pull request.
 Maintainers publish releases. The version is recorded in `VERSION` and follows
 [Semantic Versioning](https://semver.org/); while it is below 1.0, a minor version may
 break compatibility. A release is a signed tag `octo-pod-v<version>`, and a release
-candidate is `octo-pod-v<version>-rc.<n>`. The release workflow refuses a tag that
-differs from `VERSION`, builds the artifacts, signs `SHA256SUMS` and publishes them with
-the changelog entry.
+candidate is `octo-pod-v<version>-rc.<n>`.
+
+Create the tag with your signing key. GitHub must be able to verify the signature, so
+the key must be registered on your GitHub account as a signing key:
+
+```zsh
+git tag -s octo-pod-v<version> -m "octo-pod <version>"
+```
+
+Check the signature before you push the tag:
+
+```zsh
+git tag -v octo-pod-v<version>
+```
+
+The release workflow refuses a lightweight tag, a tag that GitHub does not verify as
+signed, and a tag that differs from `VERSION`. It then waits until a release approver
+other than the person who pushed the tag approves. After that, it builds the artifacts,
+signs `SHA256SUMS` and publishes them with the changelog entry. See
+[Release pattern](docs/release-pattern.md) for each gate.
 
 ## License
 
@@ -274,9 +367,12 @@ not updated by this workflow change. Third-party images and air-gap bundle metad
 are outside this image-build check. SBOMs support vulnerability and licence review;
 they do not establish redistribution permission or complete licence compliance.
 
-Review all six `PIN-THIS` values and commit the matching `*_image_upstream` values in
-`platform/group_vars/all/10-infrastructure.yml`. Build and verify the package and
-container bundle from that pinned checkout. Publishing a new image does not change
-existing pins or running pods. Bridge and third-party images have separate pins.
+Pin the new images with `tools/pin-images.sh`. It writes each arm's `*_image_upstream`
+value in `platform/group_vars/all/10-infrastructure.yml`, but only for a digest that
+`images.yml` built and signed on `main`, and regenerates `docs/images.md`. Commit the
+result through a pull request; the `signed-pins` check refuses any pin that `images.yml`
+did not sign. Build and verify the package and container bundle from that pinned
+checkout. Publishing a new image does not change existing pins or running pods.
+Third-party images are listed in `platform/pins-external.txt` and have separate pins.
 
 See [Release pattern](docs/release-pattern.md) for every step from a commit to a running pod, which gate checks it, and how to verify a release.

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 """
 bin/octo-pod-top against a scratch pod: fake podman, fake netbird, a real declaration.
 
@@ -371,6 +373,19 @@ def run_checks(repo, check):
               r.returncode == 0 and any("no pod identity" in p["text"]
                                         for p in doc.get("problems", [])),
               r.stdout[-400:] + r.stderr[-400:])
+
+    # Ages and staleness, at fixed times rather than whenever the suite happens to run.
+    print("\ntop: how old a stats line is, and when that is a problem")
+    ages = [top.fmt_age(s) for s in (-5, 0, 89, 90, 5399, 5400, 172799, 172800)]
+    check("ages read as seconds, minutes, hours, then days, never negative",
+          ages == ["0s", "0s", "89s", "1m", "89m", "1h", "47h", "2d"], str(ages))
+    row = {"id": "radar-1", "kind": "arm", "state": "up", "period": 60}
+    pod = {"root": True, "pod": {"router": "Up 1 hour"}}
+    fresh = top.problems(pod, [dict(row, last=1000.0)], 1000.0 + 3 * 60 + 30)
+    stale = top.problems(pod, [dict(row, last=1000.0)], 1000.0 + 3 * 60 + 31)
+    check("an arm is stale only after three missed periods and half a minute",
+          not any("no stats line" in t for _, t in fresh)
+          and ("warn", "radar-1: no stats line for 3m") in stale, f"{fresh} {stale}")
 
 
 def main():

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Where a zenoh egress arm republishes: a partner's own Zenoh router, dialled in client
 //! mode under a certificate THEY issued us, confined to the prefix THEY granted.
 //!

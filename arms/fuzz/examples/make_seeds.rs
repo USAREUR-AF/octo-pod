@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+// SPDX-License-Identifier: Apache-2.0
 //! Writes the seed inputs in `seeds/`, one directory per fuzz target.
 //!
 //! Run it from `arms/fuzz` after a change to the reference vectors or to a target's input

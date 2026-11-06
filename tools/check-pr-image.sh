@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
 # Inspect a locally loaded PR image and invoke its installed binaries without networking.
 set -euo pipefail
 image=${1:?image tag required}
@@ -13,6 +15,10 @@ binaries=$(sed -nE 's|^COPY --from=[^ ]+ /build/target/release/[^ ]+ (/usr/local
 [ -n "$binaries" ] || { echo 'no installed binaries found in Dockerfile' >&2; exit 1; }
 while IFS= read -r binary; do
   echo "== loader and CLI startup: $binary ($arch, uid 65532)"
-  timeout 30s docker run --rm --network none --read-only --cap-drop ALL \
-    --security-opt no-new-privileges --entrypoint "$binary" "$image" --help
+  out=$(timeout 30s docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --entrypoint "$binary" "$image" --help)
+  printf '%s\n' "$out"
+  # Every arm parses its arguments with clap, so --help prints a usage line. A placeholder
+  # main left over from the dependency layer would exit 0 and print nothing.
+  grep -q '^Usage: ' <<< "$out" || { echo "$binary printed no usage: not the arm's own build" >&2; exit 1; }
 done <<< "$binaries"
