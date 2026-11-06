@@ -137,6 +137,52 @@ def release_reproducible_checks():
           (r.stdout + r.stderr)[-600:])
 
 
+def release_sigstore_keys_checks():
+    """Every release carries sigstore's public keys, so pods verify the next one offline."""
+    import json
+    import yaml
+    print("\nsigstore keys: platform/sigstore/trusted_root.json")
+    keys = PLATFORM / "sigstore" / "trusted_root.json"
+    try:
+        doc = json.loads(keys.read_text())
+    except (OSError, ValueError) as e:
+        check("platform/sigstore/trusted_root.json is a sigstore trusted root", False, str(e))
+        return
+    check("platform/sigstore/trusted_root.json is a sigstore trusted root",
+          doc.get("mediaType") == "application/vnd.dev.sigstore.trustedroot+json;version=0.1")
+    check("it holds the public Rekor log, a Fulcio authority and a CT log",
+          any(t.get("baseUrl") == "https://rekor.sigstore.dev" for t in doc.get("tlogs", []))
+          and any("fulcio" in c.get("uri", "") for c in doc.get("certificateAuthorities", []))
+          and bool(doc.get("ctlogs")))
+    build = (REPO / "tools" / "build-release.sh").read_text()
+    check("the package carries it: platform/ is in the release payload",
+          "PAYLOAD=(bin platform " in build)
+    upgrader = (REPO / "bin" / "octo-pod-upgrade").read_text()
+    check("the upgrader verifies against the keys its own release carries",
+          '$REPO/platform/sigstore/trusted_root.json' in upgrader
+          and "--trusted-root" in upgrader and "--new-bundle-format" in upgrader)
+    installer = (REPO / "tools" / "install-to-pod.sh").read_text()
+    check("the laptop installer verifies against the keys in its checkout",
+          '$here/platform/sigstore/trusted_root.json' in installer and "--trusted-root" in installer)
+    export = (REPO / "tools" / "oss" / "export.py")
+    if export.exists():
+        check("the export copies the keys byte for byte",
+              '"platform/sigstore/trusted_root.json"' in export.read_text())
+    wf = yaml.safe_load((REPO / ".github" / "workflows" / "release.yml").read_text())
+    steps = wf["jobs"]["build"]["steps"]
+    order = [st.get("name") or st.get("id") or st.get("uses", "") for st in steps]
+    fresh = "the sigstore keys this release ships are current"
+    check("the release refuses stale keys, before it builds anything",
+          fresh in order and order.index(fresh) < order.index("build")
+          and "tools/sigstore-trusted-root.py --check" in
+          next(st for st in steps if st.get("name") == fresh).get("run", ""), str(order))
+    pod_check = next((st.get("run", "") for st in steps
+                      if st.get("name") == "Verify the way a pod will"), "")
+    check("the release proves the keys it ships verify it, with the pod's signer pattern",
+          "--trusted-root ../platform/sigstore/trusted_root.json" in pod_check
+          and "release\\\\.yml@refs/tags/octo-pod-v" in pod_check, pod_check[-600:])
+
+
 def release_signed_tag_checks():
     """A release starts only from an annotated tag that GitHub verifies as signed.
 
@@ -485,6 +531,7 @@ def main():
 
     release_signed_tag_checks()
     release_lost_asset_checks()
+    release_sigstore_keys_checks()
     release_provenance_checks()
     release_docs_checks()
     release_reproducible_checks()

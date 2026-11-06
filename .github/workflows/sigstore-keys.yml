@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pods verify each release offline, against sigstore's public keys in
+# platform/sigstore/trusted_root.json. When sigstore adds or rotates a key, that file must
+# change before the next release, or pods on that release cannot verify a release signed
+# with the new key. The release workflow refuses a stale file. This check says so earlier:
+# weekly, and on every pull request that touches the file or the tool that writes it.
+# The fix is `tools/sigstore-trusted-root.py`, committed in a pull request.
+name: sigstore-keys
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'platform/sigstore/**'
+      - 'tools/sigstore-trusted-root.py'
+      - '.github/workflows/sigstore-keys.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  current:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: the sigstore keys pods carry are sigstore's current ones
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/sigstore-trusted-root.py --check

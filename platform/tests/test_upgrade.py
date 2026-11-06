@@ -81,11 +81,15 @@ def versions_block(script):
     return text.split("# >>> versions\n", 1)[1].split("# <<< versions\n", 1)[0]
 
 
-def make_release(d, version, script, repo="example/octo-pod"):
+def make_release(d, version, script, repo="example/octo-pod", trusted_root=False):
     """A release tree as build-release.sh lays it out, as far as the upgrader looks."""
     (d / "bin").mkdir(parents=True)
     shutil.copy(script, d / "bin" / "octo-pod-upgrade")
     (d / "platform").mkdir()
+    if trusted_root:
+        # The sigstore keys a release from 0.6.1 carries. The stub cosign reads nothing.
+        (d / "platform" / "sigstore").mkdir()
+        (d / "platform" / "sigstore" / "trusted_root.json").write_text("{}\n")
     (d / "bin" / "octo-pod").write_text("#!/bin/sh\nexit 0\n")
     (d / "bin" / "octo-pod").chmod(0o755)
     (d / "platform" / "configure-octo-pod.yml").write_text("---\n")
@@ -97,7 +101,8 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def publish(pod, version, latest=False, deb=False, images=False):
+def publish(pod, version, latest=False, deb=False, images=False, sigstore=False,
+            cosign_bundle=True):
     """One version on the mirror: its own SHA256SUMS, a (fake) signature, the artifacts."""
     mirror = pod.mirror
     vd = mirror / version
@@ -122,7 +127,11 @@ def publish(pod, version, latest=False, deb=False, images=False):
             tf.add(stage, arcname="images")
         names.append(b)
     (vd / "SHA256SUMS").write_text("".join(f"{sha256(n)}  {n.name}\n" for n in names))
-    (vd / "SHA256SUMS.cosign-bundle").write_text("{}\n")
+    if cosign_bundle:
+        (vd / "SHA256SUMS.cosign-bundle").write_text("{}\n")
+    if sigstore:
+        # The standard Sigstore bundle, which releases carry from 0.6.0.
+        (vd / "SHA256SUMS.sigstore.json").write_text("{}\n")
     if latest:
         (mirror / "LATEST").write_text(version + "\n")
 
@@ -131,7 +140,7 @@ class Pod:
     """A temporary pod: a release (or package) install, a mirror, and stub binaries."""
 
     def __init__(self, t, script, running, kind="release", installed=(), sort_stub=False,
-                 keep=3, dpkg_broken=False, repo="example/octo-pod"):
+                 keep=3, dpkg_broken=False, repo="example/octo-pod", trusted_root=False):
         self.t = t
         self.kind = kind
         self.script = script
@@ -149,29 +158,42 @@ class Pod:
 
         if kind == "release":
             for v in (running, *installed):
-                make_release(self.opt / f"octo-pod-{v}", v, script, repo)
+                make_release(self.opt / f"octo-pod-{v}", v, script, repo, trusted_root)
             self.root.symlink_to(self.opt / f"octo-pod-{running}")
             self.entry = self.root / "bin" / "octo-pod-upgrade"
         else:
             # A package owns /opt/octo-pod outright: no symlink, no version directories.
             self.root = t / "pkg"
-            make_release(self.root, running, script, repo)
+            make_release(self.root, running, script, repo, trusted_root)
             self.entry = self.root / "bin" / "octo-pod-upgrade"
 
         self.fakebin = t / "fakebin"
         self.fakebin.mkdir()
         # Every call's arguments, one per line, then "--". Fails, as the real one does,
-        # when the --bundle it was handed is missing; otherwise prints cosign.err, if
-        # any, to stderr and exits with cosign.rc.
+        # when the --bundle or --trusted-root it was handed is missing; otherwise prints
+        # cosign.err, if any, to stderr and exits with cosign.rc. A call with
+        # --trusted-root (offline) answers from cosign-offline.rc instead, when that exists.
         self.cosign_log = t / "cosign.log"
         self.cosign_rc = t / "cosign.rc"
         self.cosign_err = t / "cosign.err"
+        self.cosign_offline_rc = t / "cosign-offline.rc"
         self.stub("cosign", f"""#!/bin/sh
 for a in "$@"; do printf '%s\\n' "$a"; done >> "{self.cosign_log}"
 echo -- >> "{self.cosign_log}"
-b=""; prev=""
-for a in "$@"; do [ "$prev" = --bundle ] && b="$a"; prev="$a"; done
+b=""; r=""; prev=""
+for a in "$@"; do
+  [ "$prev" = --bundle ] && b="$a"
+  [ "$prev" = --trusted-root ] && r="$a"
+  prev="$a"
+done
 [ -n "$b" ] && [ -f "$b" ] || exit 1
+if [ -n "$r" ]; then
+  [ -f "$r" ] || exit 1
+  if [ -f "{self.cosign_offline_rc}" ]; then
+    echo "offline: no matching key in the trusted root" >&2
+    exit "$(cat "{self.cosign_offline_rc}")"
+  fi
+fi
 cat "{self.cosign_err}" >&2 2>/dev/null
 exit "$(cat "{self.cosign_rc}" 2>/dev/null || echo 0)"
 """)
@@ -250,7 +272,10 @@ sys.stdout.write("".join(l + "\n" for l in lines))
                 continue
             call, i = {"args": []}, 0
             while i < len(argv):
-                if argv[i].startswith("--") and i + 1 < len(argv):
+                if argv[i] == "--new-bundle-format":
+                    call[argv[i]] = True
+                    i += 1
+                elif argv[i].startswith("--") and i + 1 < len(argv):
                     call[argv[i]] = argv[i + 1]
                     i += 2
                 else:
@@ -700,6 +725,133 @@ def run_checks(repo, check, script=None):
         check("--help documents --expect-sha256 as an extra check and the signer override",
               rc == 0 and "--expect-sha256" in out and "signature is still required" in out
               and "OCTO_POD_CERT_IDENTITY" in out and "skip" not in out.lower(), out)
+
+    print("\nupgrade: offline, against the sigstore keys this pod's release carries")
+    keys_tail = "octo-pod-0.6.1/platform/sigstore/trusted_root.json"
+
+    def offline(call):
+        return "--trusted-root" in call
+
+    with tempfile.TemporaryDirectory() as t:
+        pod = Pod(pathlib.Path(t), script, "0.6.1", trusted_root=True)
+        publish(pod, "0.6.2", latest=True, sigstore=True)
+        rc, out = pod.run()
+        calls = pod.cosign_calls()
+        call = (calls or [{}])[0]
+        check("a release with a Sigstore bundle is verified once, offline, with this pod's keys",
+              rc == 0 and pod.runs() == "0.6.2" and len(calls) == 1
+              and call.get("--new-bundle-format") is True
+              and call.get("--bundle", "").endswith("/SHA256SUMS.sigstore.json"),
+              f"{calls}\n{out[-400:]}")
+        check("...against the keys the running release carries, with the same pinned signer",
+              call.get("--trusted-root", "").endswith(keys_tail)
+              and call.get("--certificate-identity-regexp") == pinned
+              and call.get("--certificate-oidc-issuer")
+              == "https://token.actions.githubusercontent.com"
+              and "offline" in out, f"{call}\n{out[-400:]}")
+
+    with tempfile.TemporaryDirectory() as t:
+        pod = Pod(pathlib.Path(t), script, "0.6.0")      # carries no keys
+        publish(pod, "0.6.1", latest=True, sigstore=True)
+        rc, out = pod.run()
+        calls = pod.cosign_calls()
+        check("a pod whose release carries no keys verifies online, as before",
+              rc == 0 and pod.runs() == "0.6.1" and len(calls) == 1
+              and not offline(calls[0])
+              and calls[0].get("--bundle", "").endswith("/SHA256SUMS.cosign-bundle"),
+              f"{calls}\n{out[-400:]}")
+
+    with tempfile.TemporaryDirectory() as t:
+        pod = Pod(pathlib.Path(t), script, "0.6.1", trusted_root=True)
+        publish(pod, "0.5.0")                              # before the Sigstore bundle
+        rc, out = pod.run("--to", "0.5.0", "--allow-downgrade")
+        calls = pod.cosign_calls()
+        check("a release with only the older bundle is verified online, once",
+              rc == 0 and pod.runs() == "0.5.0" and len(calls) == 1
+              and not offline(calls[0]), f"{calls}\n{out[-400:]}")
+
+    with tempfile.TemporaryDirectory() as t:
+        pod = Pod(pathlib.Path(t), script, "0.6.1", trusted_root=True)
+        publish(pod, "0.6.2", latest=True, sigstore=True)
+        pod.cosign_offline_rc.write_text("1\n")
+        rc, out = pod.run()
+        calls = pod.cosign_calls()
+        check("keys that do not verify it send the check online, which decides it",
+              rc == 0 and pod.runs() == "0.6.2" and len(calls) == 2
+              and offline(calls[0]) and not offline(calls[1])
+              and "asking sigstore online" in out, f"{calls}\n{out[-400:]}")
+
+    with tempfile.TemporaryDirectory() as t:
+        pod = Pod(pathlib.Path(t), script, "0.6.1", trusted_root=True)
+        publish(pod, "0.6.2", latest=True, sigstore=True)
+        pod.cosign_offline_rc.write_text("1\n")
+        pod.cosign_says(1, "Error: tuf: failed to download 10.root.json: connection refused\n")
+        rc, out = pod.run()
+        check("refused when neither verifies, with both answers and the laptop path",
+              rc != 0 and pod.runs() == "0.6.1" and "could not verify SHA256SUMS" in out
+              and "no matching key in the trusted root" in out
+              and "failed to download 10.root.json" in out
+              and "tools/install-to-pod.sh" in out, out[-900:])
+
+    with tempfile.TemporaryDirectory() as t:
+        pod = Pod(pathlib.Path(t), script, "0.6.1", trusted_root=True)
+        publish(pod, "0.6.2", latest=True, sigstore=True, cosign_bundle=False)
+        pod.cosign_offline_rc.write_text("1\n")
+        rc, out = pod.run()
+        calls = pod.cosign_calls()
+        check("a release with only the Sigstore bundle goes online with that bundle",
+              rc == 0 and len(calls) == 2 and not offline(calls[1])
+              and calls[1].get("--new-bundle-format") is True
+              and calls[1].get("--bundle", "").endswith("/SHA256SUMS.sigstore.json"),
+              f"{calls}\n{out[-400:]}")
+
+    with tempfile.TemporaryDirectory() as t:
+        pod = Pod(pathlib.Path(t), script, "0.6.1", trusted_root=True)
+        publish(pod, "0.6.2", latest=True)
+        (pod.mirror / "0.6.2" / "SHA256SUMS.cosign-bundle").unlink()
+        rc, out = pod.run()
+        check("a release with no signature at all is refused before cosign",
+              rc != 0 and "carries no signature" in out and pod.cosign_calls() == []
+              and pod.runs() == "0.6.1", out[-400:])
+
+    with tempfile.TemporaryDirectory() as t:
+        tp = pathlib.Path(t)
+        pod = Pod(tp, script, "0.6.1", trusted_root=True)
+        publish(pod, "0.6.2", latest=True, sigstore=True)
+        other = tp / "keys.json"
+        other.write_text("{}\n")
+        rc, out = pod.run(env={"OCTO_POD_TRUSTED_ROOT": str(other)})
+        call = (pod.cosign_calls() or [{}])[0]
+        check("OCTO_POD_TRUSTED_ROOT is the file cosign is given, and the run says so",
+              rc == 0 and call.get("--trusted-root") == str(other)
+              and "OCTO_POD_TRUSTED_ROOT" in out and str(other) in out, f"{call}\n{out[-400:]}")
+
+    with tempfile.TemporaryDirectory() as t:
+        tp = pathlib.Path(t)
+        pod = Pod(tp, script, "0.6.1", trusted_root=True)
+        publish(pod, "0.6.2", latest=True, sigstore=True)
+        rc, out = pod.run(env={"OCTO_POD_TRUSTED_ROOT": str(tp / "missing.json")})
+        check("an OCTO_POD_TRUSTED_ROOT that is not a file is refused, not skipped",
+              rc != 0 and "OCTO_POD_TRUSTED_ROOT" in out and pod.cosign_calls() == []
+              and pod.runs() == "0.6.1", out[-400:])
+
+    with tempfile.TemporaryDirectory() as t:
+        pod = Pod(pathlib.Path(t), script, "0.6.1", kind="package", trusted_root=True)
+        publish(pod, "0.6.2", deb=True, sigstore=True)
+        rc, out = pod.run("--to", "0.6.2")
+        calls = pod.cosign_calls()
+        check("package: the .deb is verified offline the same way",
+              rc == 0 and "octo-pod_0.6.2_all.deb" in pod.apt() and len(calls) == 1
+              and offline(calls[0]), f"{calls}\n{out[-400:]}")
+
+    with tempfile.TemporaryDirectory() as t:
+        pod = Pod(pathlib.Path(t), script, "0.6.1", trusted_root=True)
+        publish(pod, "0.6.2", latest=True, images=True, sigstore=True)
+        rc, out = pod.run("--images")
+        calls = pod.cosign_calls()
+        check("--images: the bundle is verified offline the same way",
+              rc == 0 and (pod.stage / "images" / "MAP").read_text() == "0.6.2\n"
+              and len(calls) == 1 and offline(calls[0]), f"{calls}\n{out[-400:]}")
 
     print("\nupgrade: the manifest names the artifact exactly once")
     with tempfile.TemporaryDirectory() as t:

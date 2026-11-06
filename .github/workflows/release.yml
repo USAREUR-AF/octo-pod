@@ -145,6 +145,17 @@ jobs:
           fi
           echo "version=$want" >> "$GITHUB_OUTPUT"
 
+      # THE SIGSTORE KEYS THIS RELEASE SHIPS ARE SIGSTORE'S CURRENT ONES. A pod verifies
+      # the next release offline, against platform/sigstore/trusted_root.json from the
+      # release it runs. Keys older than sigstore's at build time would leave every pod on
+      # this release unable to check a release signed with a newer key, so a stale file
+      # stops the release here. tools/sigstore-trusted-root.py writes the current one.
+      - name: the sigstore keys this release ships are current
+        if: hashFiles('tools/sigstore-trusted-root.py') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/sigstore-trusted-root.py --check
+
       # THE CREDENTIAL LIVES HERE AND NOWHERE ELSE. This job already authenticates to
       # ghcr — it is where the images were pushed from — so it is the right place to
       # read them. An edge pod given a PAT stores it base64'd in ~/.docker/config.json:
@@ -312,6 +323,19 @@ jobs:
             --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             SHA256SUMS
+          # OFFLINE, exactly as a pod running this release checks the next one: the keys
+          # this release ships, the signer pattern the upgrader builds, no TUF. If these
+          # keys cannot verify this release, no pod could verify it with them either.
+          repo_rx="$(printf '%s' "$GITHUB_REPOSITORY" | sed 's/[][\\.*^$+?(){}|]/\\&/g')"
+          if [ -f ../platform/sigstore/trusted_root.json ]; then
+            cosign verify-blob \
+              --new-bundle-format \
+              --bundle SHA256SUMS.sigstore.json \
+              --trusted-root ../platform/sigstore/trusted_root.json \
+              --certificate-identity-regexp "^https://github\\.com/(?i:${repo_rx})/\\.github/workflows/release\\.yml@refs/tags/octo-pod-v" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              SHA256SUMS
+          fi
           sha256sum -c --ignore-missing SHA256SUMS
 
       # The provenance subjects are exactly what the signed manifest lists, so the

@@ -259,6 +259,32 @@ fi
 # <<< signer
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
+# SIGSTORE'S KEYS, CARRIED BY THE RELEASE THIS POD RUNS. cosign checks a signature against
+# sigstore's public keys, and without a local copy it downloads them from
+# tuf-repo-cdn.sigstore.dev first: a pod with no route out could verify nothing. Every
+# release from 0.6.1 ships them in platform/sigstore/trusted_root.json, and the release
+# workflow refuses to ship keys that cannot verify that same release. So the keys of the
+# release that runs here verify the next one with no network at all. A release from before
+# 0.6.0 publishes only the older bundle, which cosign cannot check against a local file;
+# that one still needs sigstore online. OCTO_POD_TRUSTED_ROOT names another file, and is
+# printed whenever it decides a verification.
+TRUSTED_ROOT="${OCTO_POD_TRUSTED_ROOT:-$REPO/platform/sigstore/trusted_root.json}"
+
+# The manifest and whatever signatures the release published over it. SHA256SUMS.sigstore.json
+# is the standard Sigstore bundle, the one cosign can check offline; releases from 0.6.0
+# carry it. SHA256SUMS.cosign-bundle is the older format, carried by every release so far.
+fetch_manifest() {  # fetch_manifest <version base url> <dir>
+  local vbase="$1" d="$2"
+  fetch "$vbase/SHA256SUMS" "$d/SHA256SUMS" \
+    || die "no SHA256SUMS published at $vbase, refusing to install unverifiable software"
+  fetch "$vbase/SHA256SUMS.sigstore.json" "$d/SHA256SUMS.sigstore.json" 2>/dev/null \
+    || rm -f "$d/SHA256SUMS.sigstore.json"
+  fetch "$vbase/SHA256SUMS.cosign-bundle" "$d/SHA256SUMS.cosign-bundle" 2>/dev/null \
+    || rm -f "$d/SHA256SUMS.cosign-bundle"
+  [[ -f "$d/SHA256SUMS.sigstore.json" || -f "$d/SHA256SUMS.cosign-bundle" ]] \
+    || die "SHA256SUMS at ${vbase} carries no signature, refusing it"
+}
+
 verify_manifest() {  # verify_manifest <dir> — the signature over SHA256SUMS
   local d="$1"
   # ALWAYS, whatever else was supplied. --expect-sha256 used to stand in for this, which
@@ -290,24 +316,65 @@ outside a release workflow), so a new release can't be verified. Name the signer
   if [[ -n "${CERT_OVERRIDE}" ]]; then
     say "  signer from OCTO_POD_CERT_IDENTITY, not from this pod's release: ${CERT_IDENTITY}"
   fi
-  say "  verifying signature"
   # cosign's own words go in the refusal. "Not signed by" and "could not fetch sigstore's
   # trust root" end the same way, and only the second is fixed by a network route: a pod
   # with an empty /root/.sigstore and no way out can verify nothing.
-  local said
+  local said offline_said=""
+
+  # A file the operator named and that is not there is a mistake to report, not a reason
+  # to quietly go online instead.
+  if [[ -n "${OCTO_POD_TRUSTED_ROOT:-}" && ! -f "${OCTO_POD_TRUSTED_ROOT}" ]]; then
+    die "OCTO_POD_TRUSTED_ROOT names $(shown "${OCTO_POD_TRUSTED_ROOT}"), which is not a file. Nothing was verified or installed."
+  fi
+
+  # OFFLINE FIRST, against the keys this pod's release carries. Same signer, same issuer,
+  # same manifest; only where sigstore's keys come from differs.
+  if [[ -f "$d/SHA256SUMS.sigstore.json" && -f "$TRUSTED_ROOT" ]]; then
+    if [[ -n "${OCTO_POD_TRUSTED_ROOT:-}" ]]; then
+      say "  sigstore keys from OCTO_POD_TRUSTED_ROOT, not from this pod's release: ${TRUSTED_ROOT}"
+    fi
+    say "  verifying signature offline, with the sigstore keys this pod's release carries"
+    if offline_said="$(cosign verify-blob \
+        --new-bundle-format \
+        --bundle "$d/SHA256SUMS.sigstore.json" \
+        --trusted-root "$TRUSTED_ROOT" \
+        --certificate-identity-regexp "$CERT_IDENTITY" \
+        --certificate-oidc-issuer "$OIDC_ISSUER" \
+        "$d/SHA256SUMS" 2>&1)"; then
+      return 0
+    fi
+    # Keys newer than this pod's release, or a forgery. sigstore online tells them apart
+    # where there is a route; with none, the refusal below carries both answers.
+    say "  the keys this pod carries did not verify it; asking sigstore online"
+  fi
+
+  local sig_args=(--bundle "$d/SHA256SUMS.cosign-bundle")
+  [[ -f "$d/SHA256SUMS.cosign-bundle" ]] \
+    || sig_args=(--new-bundle-format --bundle "$d/SHA256SUMS.sigstore.json")
+  say "  verifying signature"
   said="$(cosign verify-blob \
-    --bundle "$d/SHA256SUMS.cosign-bundle" \
+    "${sig_args[@]}" \
     --certificate-identity-regexp "$CERT_IDENTITY" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
     "$d/SHA256SUMS" 2>&1)" \
     || die "cosign could not verify SHA256SUMS against ${CERT_IDENTITY}, refusing this release.
-  cosign said:
+$(if [[ -n "${offline_said}" ]]; then
+  printf '  Offline, against %s, cosign said:\n' "$(shown "${TRUSTED_ROOT}")"
+  printf '%s\n' "${offline_said}" | tail -n 3 | LC_ALL=C tr -cd '[:print:]\n' | cut -c 1-200 | sed 's/^/    /'
+  printf '  Online, cosign said:\n'
+else
+  printf '  cosign said:\n'
+fi)
 $(printf '%s\n' "${said}" | tail -n 5 | LC_ALL=C tr -cd '[:print:]\n' | cut -c 1-200 | sed 's/^/    /')
 
   A tuf, Rekor or connection error means this pod could not fetch sigstore's trust root,
   not that the release is forged: it needs HTTPS to tuf-repo-cdn.sigstore.dev, or a cache
   warmed by one online cosign run as root. Anything else means this release is not from
-  that signer."
+  that signer.$(if [[ -n "${offline_said}" ]]; then printf '%s' "
+
+  If sigstore changed its keys after this pod's release was built, the keys this pod
+  carries cannot verify a newer release. Install it from a laptop instead, with
+  tools/install-to-pod.sh: the laptop checks it with current keys."; fi)"
 }
 
 sha256_of() { { sha256sum "${1}" 2>/dev/null || shasum -a 256 "${1}"; } | awk '{print $1}'; }
@@ -345,10 +412,7 @@ install_release() {  # install_release <version> <base-url>
   vbase="$base/$v"
 
   say "  fetching $v"
-  fetch "$vbase/SHA256SUMS" "$tmp/SHA256SUMS" \
-    || die "no SHA256SUMS published at $vbase — refusing to install unverifiable software"
-  fetch "$vbase/SHA256SUMS.cosign-bundle" "$tmp/SHA256SUMS.cosign-bundle" \
-    || die "SHA256SUMS at ${vbase} carries no signature, refusing it"
+  fetch_manifest "$vbase" "$tmp"
   verify_manifest "$tmp"
 
   fetch "$vbase/octo-pod-$v.tar.gz" "$tar" || die "cannot fetch $vbase/octo-pod-$v.tar.gz"
@@ -528,10 +592,7 @@ if [ "$ACTION" = images ]; then
   fi
 
   say "  fetching the image bundle for $WANT"
-  fetch "$BASE/$WANT/SHA256SUMS" "$itmp/SHA256SUMS" \
-    || die "no SHA256SUMS published at $BASE — refusing an unverifiable bundle"
-  fetch "$BASE/$WANT/SHA256SUMS.cosign-bundle" "$itmp/SHA256SUMS.cosign-bundle" \
-    || die "SHA256SUMS at $BASE carries no signature — refusing it"
+  fetch_manifest "$BASE/$WANT" "$itmp"
   verify_manifest "$itmp"
 
   bundle="octo-pod-images-$WANT.tar.gz"
@@ -622,10 +683,7 @@ case "$KIND" in
     deb_tmp="$(mktemp -d)"
     deb="$deb_tmp/octo-pod_${WANT}_all.deb"
     say "  fetching $WANT"
-    fetch "$BASE/$WANT/SHA256SUMS" "$deb_tmp/SHA256SUMS" \
-      || die "no SHA256SUMS published at $BASE — refusing to install unverifiable software"
-    fetch "$BASE/$WANT/SHA256SUMS.cosign-bundle" "$deb_tmp/SHA256SUMS.cosign-bundle" \
-      || die "SHA256SUMS at ${BASE} carries no signature, refusing it"
+    fetch_manifest "$BASE/$WANT" "$deb_tmp"
     verify_manifest "$deb_tmp"
     fetch "$BASE/$WANT/octo-pod_${WANT}_all.deb" "$deb" \
       || die "cannot fetch $BASE/$WANT/octo-pod_${WANT}_all.deb"
