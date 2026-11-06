@@ -10,6 +10,14 @@ updates:
       day: monday
     commit-message:
       prefix: "chore(deps)"
+    # Zenoh stays on 1.9.x. Every arm speaks the router's 1.9.0 protocol, and a newer
+    # client is a coordinated upgrade of the router and every pod, not a dependency bump.
+    # Patch releases within 1.9 still come through.
+    ignore:
+      - dependency-name: "zenoh"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "zenoh-*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       cargo:
         patterns: ["*"]
