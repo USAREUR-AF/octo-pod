@@ -77,3 +77,12 @@ SPDX-FileCopyrightText = [
   "2026 U.S. Federal Government (in countries where recognized)",
 ]
 SPDX-License-Identifier = "Apache-2.0"
+
+# Sigstore's public keys (its trusted root), as published by sigstore's TUF repository
+# (https://github.com/sigstore/root-signing). tools/sigstore-trusted-root.py writes it;
+# pods verify releases against it offline. JSON carries no comment for a header.
+[[annotations]]
+path = "platform/sigstore/trusted_root.json"
+precedence = "override"
+SPDX-FileCopyrightText = "The Sigstore Authors"
+SPDX-License-Identifier = "Apache-2.0"

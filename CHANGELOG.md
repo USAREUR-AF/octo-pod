@@ -6,6 +6,24 @@ Notable changes to octo-pod. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Every release carries sigstore's public keys in `platform/sigstore/trusted_root.json`.
+  `tools/sigstore-trusted-root.py` writes the current keys. The release workflow refuses
+  to ship keys that are not sigstore's current ones, and proves that the keys it ships
+  verify the release. A weekly check reports when sigstore changes its keys.
+
+### Fixed
+
+- A pod with no route to the internet could not verify an upgrade, because cosign
+  downloads sigstore's keys from `tuf-repo-cdn.sigstore.dev` before it checks a signature.
+  `octo-pod upgrade` and `tools/install-to-pod.sh` now check the standard Sigstore bundle,
+  `SHA256SUMS.sigstore.json`, against the keys that the running release carries, with no
+  network. They ask sigstore online only when those keys do not verify a release: a
+  release before 0.6.0, or one signed after sigstore changed its keys. A pod verifies
+  offline from the first release that carries the keys; move a pod to that release from a
+  laptop with `tools/install-to-pod.sh`.
+
 ## [0.6.0] - 2026-11-06
 
 Every arm image is rebuilt from this release's source and pinned by digest. Most changes

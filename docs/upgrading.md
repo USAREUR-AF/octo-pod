@@ -93,11 +93,26 @@ somewhere other than the mirror. It is an extra check, not a replacement: the si
 and the signed manifest are still verified, and the tarball, `.deb` or (with `--images`)
 image bundle must match your digest as well. Without cosign, `upgrade` refuses.
 
-cosign checks the signature against sigstore's trust root, which it downloads and caches
-in `/root/.sigstore`. Until a release includes that trust root on the pod, the pod needs
-HTTPS to `tuf-repo-cdn.sigstore.dev`, or a cache populated by one online cosign run as root.
-A pod with neither can't verify any release, and `upgrade` refuses with cosign's TUF or
-connection error.
+cosign checks the signature against sigstore's public keys. Every release from 0.6.1
+carries those keys in `platform/sigstore/trusted_root.json`, and the release workflow
+refuses to publish keys that can't verify that same release. A pod running 0.6.1 or later
+therefore verifies the next release offline, against the keys of the release it runs, and
+needs no route to the internet. The upgrade output says `verifying signature offline`.
+
+Three cases still go online, to `tuf-repo-cdn.sigstore.dev`:
+
+- The pod runs a release older than 0.6.1, which carries no keys. Move it to 0.6.1 from a
+  laptop with `tools/install-to-pod.sh`, which checks the signature on the laptop.
+- The target release is older than 0.6.0 and publishes only `SHA256SUMS.cosign-bundle`,
+  which cosign can't check against a local file.
+- Sigstore changed its keys after the pod's release was built, so the keys the pod
+  carries don't verify the new release. The upgrader then asks sigstore online. A pod
+  with no route out refuses, with both of cosign's answers. Install that release from a
+  laptop instead.
+
+Online, cosign downloads the keys and caches them in `/root/.sigstore`. A pod with no route
+and no cache refuses with cosign's TUF or connection error. `OCTO_POD_TRUSTED_ROOT=<file>`
+makes the upgrader use another copy of the keys, and the output says so.
 
 Who may sign a release follows who built the one the pod runs: every release records the
 repository whose release workflow built it in `/opt/octo-pod/RELEASE`, and `upgrade`

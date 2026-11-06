@@ -129,6 +129,18 @@ cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
 The `(?i:...)` group matches the owner and repository names in any letter case, because
 links and clones may spell them differently from the signing certificate.
 
+That check downloads Sigstore's public keys first. To check offline instead, use the
+standard Sigstore bundle that releases from 0.6.0 carry, and the keys in a checkout of
+this repository:
+
+```sh
+gh release download octo-pod-v<version> --repo DesertGOAT/octo-pod -p SHA256SUMS.sigstore.json
+cosign verify-blob --new-bundle-format --bundle SHA256SUMS.sigstore.json \
+  --trusted-root platform/sigstore/trusted_root.json \
+  --certificate-identity-regexp '^https://github\.com/(?i:DesertGOAT/octo-pod)/\.github/workflows/release\.yml@refs/tags/octo-pod-v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+```
+
 Check that the files match the signed hashes:
 
 ```sh

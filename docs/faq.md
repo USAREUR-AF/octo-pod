@@ -85,9 +85,9 @@ container images, but not the operating system packages. Before you disconnect t
 
 - Install the octo-pod package and its dependencies, NetBird, cosign and the clock
   packages.
-- Run one cosign signature check as root on the pod, so that cosign stores the Sigstore
-  trust data in `/root/.sigstore`. Without that data, a disconnected pod can't verify an
-  upgrade.
+- Install 0.6.1 or later. Those releases carry Sigstore's public keys, so the pod
+  verifies the next upgrade offline. A pod on an older release needs one cosign signature
+  check as root while connected, so that cosign stores the keys in `/root/.sigstore`.
 - Prepare the Python environment that `verify` uses.
 
 At the site, load the carried images:

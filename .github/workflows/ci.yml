@@ -102,6 +102,9 @@ jobs:
       - name: image SBOM publication and refusal controls
         run: python3 platform/tests/test_image_sboms.py
 
+      - name: the sigstore keys tool writes only the public instance and refuses stale keys
+        run: python3 platform/tests/test_sigstore_keys.py
+
       - name: playbook syntax
         run: |
           for p in configure-octo-pod.yml verify-octo-pod.yml publish-to-portal.yml bootstrap-octo-pod.yml; do

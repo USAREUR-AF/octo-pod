@@ -271,6 +271,12 @@ TOTAL="$(printf '%s\n' "$SIZES" \
              ($1 in keep) { total += $2 }
              END { print total + 0 }')"
 [ -n "$TOTAL" ] || TOTAL=0
+# THE STANDARD SIGSTORE BUNDLE, carried by releases from 0.6.0. It is the one cosign can
+# check against a local copy of sigstore's keys, so it is fetched whenever the release
+# lists it. An older release has only the cosign bundle, which needs sigstore online.
+if printf '%s\n' "$SIZES" | awk -F'\t' '$1 == "SHA256SUMS.sigstore.json" { f = 1 } END { exit !f }'; then
+  DL+=(-p SHA256SUMS.sigstore.json)
+fi
 [ "$TOTAL" -gt 0 ] 2>/dev/null && ok "$(human "$TOTAL") to fetch"
 
 # RETRIED, because GitHub returns 503 often enough to matter — measured at roughly two
@@ -301,7 +307,7 @@ download() {
   done
   return 1
 }
-rm -f "$WORK/SHA256SUMS" "$WORK/SHA256SUMS.cosign-bundle"
+rm -f "$WORK/SHA256SUMS" "$WORK/SHA256SUMS.cosign-bundle" "$WORK/SHA256SUMS.sigstore.json"
 download || die "could not download octo-pod-v${VERSION} from $REPO_SLUG after 3 tries.
   If GitHub is having an incident this is not your setup — try again shortly, or use
   --deb with a locally built package."
@@ -319,8 +325,29 @@ fi
 #
 # Each check is the condition of an `if`. Run bare under set -e and pipefail, a failure
 # ended the script inside the pipeline, before the refusal that says what it means.
+#
+# OFFLINE FIRST. This checkout carries sigstore's keys (platform/sigstore/trusted_root.json,
+# kept current by tools/sigstore-trusted-root.py), so a laptop that downloaded the release
+# earlier can check it with no network. If those keys do not verify it, sigstore online
+# decides, exactly as before. OCTO_POD_TRUSTED_ROOT names another file.
 step 4/7 "check the signature (who made this)"
-if ! ( cd "$WORK" && cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
+TRUSTED_ROOT="${OCTO_POD_TRUSTED_ROOT:-$here/platform/sigstore/trusted_root.json}"
+if [ -n "${OCTO_POD_TRUSTED_ROOT:-}" ] && [ ! -f "$TRUSTED_ROOT" ]; then
+  die "OCTO_POD_TRUSTED_ROOT names $TRUSTED_ROOT, which is not a file. Nothing was installed."
+fi
+VERIFIED=""
+if [ -f "$WORK/SHA256SUMS.sigstore.json" ] && [ -f "$TRUSTED_ROOT" ]; then
+  printf '      offline, with the sigstore keys in %s\n' "$TRUSTED_ROOT"
+  if ( cd "$WORK" && cosign verify-blob --new-bundle-format --bundle SHA256SUMS.sigstore.json \
+         --trusted-root "$TRUSTED_ROOT" \
+         --certificate-identity-regexp "$IDENT" --certificate-oidc-issuer "$ISSUER" \
+         SHA256SUMS ) 2>&1 | indent; then
+    VERIFIED=1
+  else
+    printf '      those keys did not verify it; asking sigstore online\n'
+  fi
+fi
+if [ -z "$VERIFIED" ] && ! ( cd "$WORK" && cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
          --certificate-identity-regexp "$IDENT" --certificate-oidc-issuer "$ISSUER" \
          SHA256SUMS ) 2>&1 | indent; then
   die "the signature does not check out. This release was NOT built by
