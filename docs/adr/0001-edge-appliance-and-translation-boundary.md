@@ -63,7 +63,7 @@ signed release or field acceptance.
    reconnects. It re-encodes the message with its own node id, send timestamp and TCP
    framing. Detection and alert domain fields are not translated. The published bytes
    and SAPIENT wire bytes therefore need not be identical. The reusable standalone arm
-   also supports controller/client roles; those are session roles, not format converters.
+   also supports controller/client roles; those roles manage sessions rather than convert formats.
 
 4. **Preserve the egress trust boundary.** A destination receives only explicitly released
    downlink keys and has a read-only pen grant. SAPIENT egress runs in the sensor role;
@@ -97,7 +97,7 @@ numbering and supersedes none of those decisions.
 
 | Option | Reason not chosen |
 |---|---|
-| Put local convergence into the GOAT fleet CLI | Couples appliance releases to the fleet control surface and puts unnecessary portal/auth machinery on an edge box. GOAT can still prepare enrollment from the operator's workstation |
+| Put local convergence into the GOAT fleet CLI | Couples appliance releases to the fleet control surface and installs unnecessary portal and authentication code on an edge device. GOAT can still prepare enrollment from the operator's workstation |
 | Put translation into the pod's arms | Duplicates the gateway's mappings and releases, expands payload parsing at the attachment boundary, and couples semantic changes to session maintenance |
 | Make the translation gateway own the receiver session too | Couples translation availability and release cadence to registration, heartbeats and reconnects. The pod already owns the declared endpoint, release gate and delivery audit |
 | Use only byte relays | Works for ordinary sockets but cannot satisfy a receiver that requires SAPIENT registration and heartbeats |

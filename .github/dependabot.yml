@@ -12,7 +12,8 @@ updates:
       cargo:
         patterns: ["*"]
 
-  # Base images are pinned by digest in each arm's Dockerfile.
+  # Base images are pinned by digest in each arm's Dockerfile. One group moves every arm
+  # to the same base digests in one PR, so the arms never run on different bases.
   - package-ecosystem: docker
     directories: ["/arms/*"]
     schedule:
@@ -20,6 +21,9 @@ updates:
       day: monday
     commit-message:
       prefix: "chore(deps)"
+    groups:
+      base-images:
+        patterns: ["*"]
 
   - package-ecosystem: github-actions
     directory: /
@@ -31,3 +35,13 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # The ClusterFuzzLite build image is pinned by digest in .clusterfuzzlite/Dockerfile. It
+  # is not an arm base image, so it stays out of the arms' entry.
+  - package-ecosystem: docker
+    directory: /.clusterfuzzlite
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"

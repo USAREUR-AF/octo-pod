@@ -1,0 +1,16 @@
+Seed inputs for the fuzz targets in arms/fuzz, one directory per target.
+
+The SAPIENT messages in sapient_message/, tcp_frame/ and sapient_frame/ are protobuf
+encodings of the reference vectors in arms/sapient-receiver/tests/vectors/true. The one
+exception is the padded message at the start of sapient_frame/detect_tie_be.bin, which
+is synthetic.
+
+SAPIENT BSI Flex 335 v2.0 Test Harness
+Crown-owned copyright, 2021-2024. Licensed under Apache-2.0.
+Source: https://github.com/dstl/BSI-Flex-335-v2-Test-Harness
+Commit: 6a2999d70d761d224914ddd8fa3f663af5005be0
+See arms/sapient-receiver/tests/vectors/LICENSE.txt and the NOTICE file there.
+
+The only change from the upstream vectors is the encoding: arms/fuzz/examples/make_seeds.rs
+decodes each JSON vector and writes it as protobuf binary. All other seed inputs are
+synthetic and use documentation addresses (RFC 5737) only.

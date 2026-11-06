@@ -8,7 +8,7 @@ octo-pod egress: declare, release, revoke, check and remove egress destinations.
                             --key <anchor>/sensors/radar1/radar-one/** --replay 2
     octo-pod egress add     c2-sapient1 --dest sapient://10.1.2.30:48000 \\
                             --key <anchor>/sapient/** --node-type RADAR
-    octo-pod egress release c2-radar1 --slot ~/slot --ca-fingerprint SHA256:<hex> --router-ip 100.127.0.10
+    octo-pod egress release c2-radar1 --slot ~/slot --ca-fingerprint SHA256:<hex> --router-ip 100.127.0.8
     octo-pod egress revoke  c2-radar1
     octo-pod egress check
     octo-pod egress remove  c2-radar1
@@ -61,6 +61,7 @@ remove-arm). `octo-pod check` then `apply` render the certificate, the pen grant
 unit. Validation is here AND in the playbook AND in the binaries: here it is a fast,
 friendly refusal before anything is written; there it is the gate that cannot be bypassed.
 """
+from octo_pod_i18n import t as _tr, critical as _critical
 import argparse
 import datetime
 import ipaddress
@@ -96,16 +97,16 @@ MAX_CLIENTS, MAX_REPLAY = 64, 1024
 
 
 def die(msg):
-    sys.exit(f"error: {msg}")
+    sys.exit(_critical('error: {v0}', v0=msg))
 
 
 def pod_dir():
     hv = ETC / "host_vars"
     pods = [p for p in hv.iterdir() if p.is_dir()] if hv.is_dir() else []
     if not pods:
-        die(f"no pod identity under {hv}; run 'octo-pod join' first")
+        die(_critical("no pod identity under {v0}; run 'octo-pod join' first", v0=hv))
     if len(pods) > 1:
-        die(f"more than one pod under {hv}: {[p.name for p in pods]}")
+        die(_critical('more than one pod under {v0}: {v1}', v0=hv, v1=[p.name for p in pods]))
     return pods[0]
 
 
@@ -113,7 +114,7 @@ def load(path):
     try:
         import yaml
     except ImportError:
-        die("pyyaml missing; install python3-yaml")
+        die(_critical("pyyaml missing; install python3-yaml"))
     return (yaml.safe_load(path.read_text()) or {}) if path.exists() else {}
 
 
@@ -276,13 +277,13 @@ def set_flag(path, ident, value):
     text = path.read_text()
     span = find_block(text, ident)
     if span is None:
-        die(f"{ident} has no entry in {path.name}")
+        die(_critical('{v0} has no entry in {v1}', v0=ident, v1=path.name))
     start, end = span
     block = text[start:end]
     new, n = re.subn(r"from_fabric:\s*(true|false)[^\n]*(?:\n[ \t]+#[^\n]*)*",
                      f"from_fabric: {'true' if value else 'false'}", block, count=1)
     if not n:
-        die(f"{ident} in {path.name} has no 'release: from_fabric:' line")
+        die(_critical("{v0} in {v1} has no 'release: from_fabric:' line", v0=ident, v1=path.name))
     path.write_text(text[:start] + new + text[end:])
     return new != block
 
@@ -329,7 +330,7 @@ def set_fabric(d, endpoint, router_ip):
     an operator already set is theirs and is left alone."""
     f = d / "05-fabric.yml"
     if not f.exists():
-        die(f"no {f}; run 'octo-pod join' first")
+        die(_critical("no {v0}; run 'octo-pod join' first", v0=f))
     fabric = load(f)
     text = f.read_text()
     current = str(fabric.get("fabric_endpoint", "") or "")
@@ -347,7 +348,7 @@ def set_fabric(d, endpoint, router_ip):
             try:
                 ipaddress.ip_address(router_ip)
             except ValueError:
-                die(f"--router-ip {router_ip!r} is not an IP address")
+                die(_critical('--router-ip {v0!r} is not an IP address', v0=router_ip))
             block = f'fabric_host_pins:\n  - {{ ip: "{router_ip}", names: "{host}" }}'
             text, n = re.subn(r"^fabric_host_pins:.*$", block, text, count=1, flags=re.M)
             if not n:
@@ -371,43 +372,42 @@ def verify_yaml(path, key, ident, present):
     try:
         back = load(path)
     except Exception as e:  # noqa: BLE001 - any parse failure is the finding
-        die(f"wrote invalid YAML to {path}: {e}")
+        die(_critical('wrote invalid YAML to {v0}: {v1}', v0=path, v1=e))
     ids = [x.get("id") for x in (back.get(key) or [])]
     if (ident in ids) != present:
-        die(f"{path} {'lacks' if present else 'still holds'} {ident} after the write; inspect it")
+        die(_critical('{v0} {v1} {v2} after the write; inspect it', v0=path, v1='lacks' if present else 'still holds', v2=ident))
 
 
 def cmd_add(args, d):
     if not ID_RE.match(args.id or ""):
-        die(f"id {args.id!r} must be lowercase alphanumeric/dashes: it becomes a CN and a unit name")
+        die(_critical('id {v0!r} must be lowercase alphanumeric/dashes: it becomes a CN and a unit name', v0=args.id))
     if args.id in existing_ids(d):
-        die(f"{args.id} is already declared on this pod")
+        die(_critical('{v0} is already declared on this pod', v0=args.id))
     if not args.key:
-        die("give at least one --key: the fabric keys this destination receives, e.g. "
-            "<anchor>/sensors/radar1/asterix/data")
+        die(_critical("give at least one --key: the fabric keys this destination receives, e.g. "
+            "<anchor>/sensors/radar1/asterix/data"))
     bad = [p for p in (key_problem(k) for k in args.key) if p]
     if bad:
         die("refusing these keys:\n  - " + "\n  - ".join(bad))
 
     scheme, _, addr = args.dest.partition("://")
     if scheme not in SCHEMES or not literal(addr):
-        die(f"--dest {args.dest!r} must be udp://, tcp://, tcp-server:// sapient:// or zenoh:// with a "
-            "literal, specific IP:port: a name could resolve somewhere else tomorrow")
+        die(_critical('--dest {v0!r} must be udp://, tcp://, tcp-server:// sapient:// or zenoh:// with a literal, specific IP:port: a name could resolve somewhere else tomorrow', v0=args.dest))
     sapient_given = (args.node_type, args.status_interval, args.capabilities) != (None, None, None)
     if sapient_given and scheme != "sapient":
-        die("--node-type, --status-interval and --capabilities apply to sapient:// only")
+        die(_critical("--node-type, --status-interval and --capabilities apply to sapient:// only"))
     if scheme != "zenoh" and (args.prefix or args.partner_bundle):
-        die("--prefix and --partner-bundle apply to zenoh:// only")
+        die(_critical("--prefix and --partner-bundle apply to zenoh:// only"))
     serve = ""
     if scheme == "tcp-server":
         peers = ipv4_list(args.src)
         if not peers:
-            die("a tcp-server:// destination needs --from: the IPv4 addresses of the consumers "
-                "that may dial it (a listener with no allowed consumer answers no one)")
+            die(_critical("a tcp-server:// destination needs --from: the IPv4 addresses of the consumers "
+                "that may dial it (a listener with no allowed consumer answers no one)"))
         if not 1 <= args.max_clients <= MAX_CLIENTS:
-            die(f"--max-clients must be 1-{MAX_CLIENTS}")
+            die(_critical('--max-clients must be 1-{v0}', v0=MAX_CLIENTS))
         if not 0 <= args.replay <= MAX_REPLAY:
-            die(f"--replay must be 0-{MAX_REPLAY}")
+            die(_critical('--replay must be 0-{v0}', v0=MAX_REPLAY))
         serve = (f'\n    allow_sources: "{", ".join(peers)}"'
                  f"\n    max_clients: {args.max_clients}\n    replay: {args.replay}")
         lan_ip = str(load(d / "00-site.yml").get("lan_ip", "") or "")
@@ -415,11 +415,11 @@ def cmd_add(args, d):
             print(f"note: {addr} is not this pod's lan_ip ({lan_ip}); consumers must reach it there")
     elif scheme == "zenoh":
         if args.src:
-            die("--from applies to tcp-server:// only: for zenoh:// the pod dials the receiver")
+            die(_critical("--from applies to tcp-server:// only: for zenoh:// the pod dials the receiver"))
         prefix = (args.prefix or "").strip().strip("/")
         if not prefix or "*" in prefix or "$" in prefix:
-            die("a zenoh:// destination needs --prefix: the literal namespace the receiver "
-                "granted us on its router (e.g. raw/goat), never a wildcard")
+            die(_critical("a zenoh:// destination needs --prefix: the literal namespace the receiver "
+                "granted us on its router (e.g. raw/goat), never a wildcard"))
         src = pathlib.Path(args.partner_bundle or "")
         missing = [f for f in ("cert.pem", "key.pem", "ca.pem") if not (src / f).is_file()]
         if not args.partner_bundle or missing:
@@ -439,8 +439,8 @@ def cmd_add(args, d):
                  + ("\n    verify_name_partner: false" if args.no_verify_name else ""))
         print(f"kept the receiver's bundle in {keep}")
     elif args.src:
-        die("--from applies to tcp-server:// only: for udp://, tcp:// and sapient:// the pod "
-            "connects out")
+        die(_critical("--from applies to tcp-server:// only: for udp://, tcp:// and sapient:// the pod "
+            "connects out"))
     if scheme == "sapient":
         sap = {"node_type": (args.node_type or "OTHER").upper().removeprefix("NODE_TYPE_"),
                "status_interval_s": 5 if args.status_interval is None else args.status_interval,
@@ -515,7 +515,7 @@ def cmd_release(args, d):
     dests = {e.get("id"): e for e in (load(target).get("egress") or [])}
     dest = dests.get(args.id)
     if dest is None:
-        die(f"{args.id} is not declared in {target.name}. Known: {', '.join(sorted(dests)) or 'none'}")
+        die(_critical('{v0} is not declared in {v1}. Known: {v2}', v0=args.id, v1=target.name, v2=', '.join(sorted(dests)) or 'none'))
     problems = problems_with(dest)
     if problems:
         die(f"refusing to release {args.id}:\n  - " + "\n  - ".join(problems))
@@ -532,7 +532,7 @@ def cmd_release(args, d):
         except slotlib.SlotError as exc:
             die(str(exc))
     elif args.ca_fingerprint:
-        die("--ca-fingerprint checks the key that signs a bundle: pass it with --slot")
+        die(_critical("--ca-fingerprint checks the key that signs a bundle: pass it with --slot"))
     changed = set_flag(target, args.id, True)
     print(("opened" if changed else "already open:") + f" release.from_fabric for {args.id}")
     allow = allow_list(pod)
@@ -582,7 +582,7 @@ def cmd_revoke(args, d):
     target = d / "40-egress.yml"
     dests = {e.get("id"): e for e in (load(target).get("egress") or [])}
     if args.id not in dests:
-        die(f"{args.id} is not declared in {target.name}. Known: {', '.join(sorted(dests)) or 'none'}")
+        die(_critical('{v0} is not declared in {v1}. Known: {v2}', v0=args.id, v1=target.name, v2=', '.join(sorted(dests)) or 'none'))
     allow = close_gates(d, args.id, dests)
     print(f"closed release.from_fabric for {args.id}; downlink_allow now holds {len(allow)} key(s)")
     if holds_session(dests[args.id]):
@@ -607,7 +607,7 @@ def cmd_remove(args, d):
     target = d / "40-egress.yml"
     dests = {e.get("id"): e for e in (load(target).get("egress") or [])}
     if args.id not in dests:
-        die(f"{args.id} is not declared in {target.name}. Known: {', '.join(sorted(dests)) or 'none'}")
+        die(_critical('{v0} is not declared in {v1}. Known: {v2}', v0=args.id, v1=target.name, v2=', '.join(sorted(dests)) or 'none'))
 
     # What this destination owns on disk. The certificate stays, as remove-arm keeps it:
     # an audit record naming the CN must still resolve to who it was.
@@ -624,9 +624,9 @@ def cmd_remove(args, d):
     print("  close            both downward gates, then drop its declaration")
     print("  keep             its certificate and its audit records under /var/lib/octo-egress/")
     if not args.yes:
-        typed = input(f"\nType the id to confirm ({args.id}): ").strip()
+        typed = input(_critical('\nType the id to confirm ({v0}): ', v0=args.id)).strip()
         if typed != args.id:
-            die("not confirmed; nothing changed")
+            die(_critical("not confirmed; nothing changed"))
 
     # Stop BEFORE forgetting: a unit left on disk resurrects its arm at the next boot.
     systemctl("stop", f"octo-egress-{args.id}.service")
@@ -663,52 +663,52 @@ def main():
     ap = argparse.ArgumentParser(prog="octo-pod egress")
     ap.add_argument("verb", choices=["add", "release", "revoke", "check", "remove"])
     ap.add_argument("id", nargs="?")
-    ap.add_argument("--dest", help="add: udp://IP:PORT, tcp://IP:PORT, tcp-server://IP:PORT "
+    ap.add_argument("--dest", help=_tr("add: udp://IP:PORT, tcp://IP:PORT, tcp-server://IP:PORT "
                                    "(the pod listens on its own IP and the consumer dials it), or "
                                    "sapient://IP:PORT (a SAPIENT session to a controller), or "
-                                   "zenoh://IP:PORT (the receiver's own Zenoh router)")
-    ap.add_argument("--prefix", help="add, zenoh:// only: the namespace the receiver granted us")
+                                   "zenoh://IP:PORT (the receiver's own Zenoh router)"))
+    ap.add_argument("--prefix", help=_tr("add, zenoh:// only: the namespace the receiver granted us"))
     ap.add_argument("--partner-bundle",
-                    help="add, zenoh:// only: a directory with cert.pem, key.pem and ca.pem, "
-                         "as the receiver issued them to us")
+                    help=_tr("add, zenoh:// only: a directory with cert.pem, key.pem and ca.pem, "
+                         "as the receiver issued them to us"))
     ap.add_argument("--no-verify-name", action="store_true",
-                    help="add, zenoh:// only: do not check the receiver router's certificate "
-                         "name (when it is issued for an identity, not the address we dial)")
+                    help=_tr("add, zenoh:// only: do not check the receiver router's certificate "
+                         "name (when it is issued for an identity, not the address we dial)"))
     ap.add_argument("--key", action="append",
-                    help="add: a fabric key this destination receives, starting with its "
-                         "publisher's anchor (or release/<lane>/); repeat for more")
+                    help=_tr("add: a fabric key this destination receives, starting with its "
+                         "publisher's anchor (or release/<lane>/); repeat for more"))
     ap.add_argument("--from", dest="src",
-                    help="add, tcp-server:// only: the consumers' IPv4 addresses, comma-separated")
+                    help=_tr("add, tcp-server:// only: the consumers' IPv4 addresses, comma-separated"))
     ap.add_argument("--max-clients", type=int, default=1,
-                    help="add, tcp-server:// only: most consumers at once (default 1)")
+                    help=_tr("add, tcp-server:// only: most consumers at once (default 1)"))
     ap.add_argument("--replay", type=int, default=0,
-                    help="add, tcp-server:// only: newest status messages replayed on connect")
+                    help=_tr("add, tcp-server:// only: newest status messages replayed on connect"))
     ap.add_argument("--node-type",
-                    help="add, sapient:// only: the SAPIENT NodeType this pod registers as "
-                         "(default OTHER), for example RADAR")
+                    help=_tr("add, sapient:// only: the SAPIENT NodeType this pod registers as "
+                         "(default OTHER), for example RADAR"))
     ap.add_argument("--status-interval", type=int,
-                    help=f"add, sapient:// only: heartbeat seconds, 1-{MAX_STATUS_INTERVAL} (default 5)")
+                    help=_tr('add, sapient:// only: heartbeat seconds, 1-{v0} (default 5)', v0=MAX_STATUS_INTERVAL))
     ap.add_argument("--capabilities",
-                    help="add, sapient:// only: capabilities to declare, "
-                         "category:type[:value[:units]], comma-separated")
+                    help=_tr("add, sapient:// only: capabilities to declare, "
+                         "category:type[:value[:units]], comma-separated"))
     ap.add_argument("--description", default="")
-    ap.add_argument("--yes", action="store_true", help="remove: skip the typed confirmation")
-    ap.add_argument("--slot", help="release: the bundle GOAT issued for this pod (cert, key, CA roots, signed profile, NOTES.md)")
-    ap.add_argument("--router-ip", help="release: the router's mesh address, pinned when no pin exists")
+    ap.add_argument("--yes", action="store_true", help=_tr("remove: skip the typed confirmation"))
+    ap.add_argument("--slot", help=_tr("release: the bundle GOAT issued for this pod (cert, key, CA roots, signed profile, NOTES.md)"))
+    ap.add_argument("--router-ip", help=_tr("release: the router's mesh address, pinned when no pin exists"))
     ap.add_argument("--ca-fingerprint",
-                    help="release --slot: the fingerprint of the key that signs the bundle, as the "
-                         "goatnet's operators gave it to you and `goat ca add` prints it (SHA256:<hex>)")
+                    help=_tr("release --slot: the fingerprint of the key that signs the bundle, as the "
+                         "goatnet's operators gave it to you and `goat ca add` prints it (SHA256:<hex>)"))
     args = ap.parse_args()
     d = pod_dir()
     if args.verb == "check":
         return cmd_check(d)
     if not args.id:
-        die(f"usage: octo-pod egress {args.verb} <destination-id>")
+        die(_critical('usage: octo-pod egress {v0} <destination-id>', v0=args.verb))
     if args.verb == "add":
         if not args.dest:
-            die("usage: octo-pod egress add <id> --dest udp://IP:PORT|tcp://IP:PORT|"
+            die(_critical("usage: octo-pod egress add <id> --dest udp://IP:PORT|tcp://IP:PORT|"
                 "tcp-server://IP:PORT|sapient://IP:PORT|zenoh://IP:PORT [--from IP,...] "
-                "[--prefix P --partner-bundle DIR] --key <anchor>/<key>")
+                "[--prefix P --partner-bundle DIR] --key <anchor>/<key>"))
         return cmd_add(args, d)
     return {"release": cmd_release, "revoke": cmd_revoke, "remove": cmd_remove}[args.verb](args, d)
 

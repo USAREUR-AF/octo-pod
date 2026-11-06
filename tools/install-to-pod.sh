@@ -132,9 +132,12 @@ if [ -z "$LOCAL_DEB" ]; then
   # THE SAME SIGNER octo-pod upgrade accepts, built the same way. A pattern that stops at
   # the repository accepts a keyless certificate from any workflow in it on any ref, and
   # this is the first install, the one moment the pod cannot check anything itself. The
-  # repository name is quoted because its '.' would otherwise match any character.
+  # repository name is quoted because its '.' would otherwise match any character. Owner
+  # and repository match in any letter case: GitHub treats them that way and writes its
+  # own spelling into the certificate, while the name given here may be typed or exported
+  # in another case. The workflow path and the tag stay exact.
   if [ -z "$IDENT" ]; then
-    IDENT='^https://github\.com/'"$(printf '%s' "$REPO_SLUG" | sed 's/[][\\.*^$+?(){}|]/\\&/g')"'/\.github/workflows/release\.yml@refs/tags/octo-pod-v'
+    IDENT='^https://github\.com/(?i:'"$(printf '%s' "$REPO_SLUG" | sed 's/[][\\.*^$+?(){}|]/\\&/g')"')/\.github/workflows/release\.yml@refs/tags/octo-pod-v'
   else
     warn "signer: $IDENT (--cert-identity, not this repository's release workflow)"
   fi
@@ -426,8 +429,11 @@ if [ "$WITH_IMAGES" = 1 ]; then
   # when the receiver is known to hold a correct prefix, so losing it costs a little time
   # and no safety.
   RS=(--partial "--timeout=60")
-  rsync --help 2>&1 | grep -q -- '--append-verify' && RS+=(--append-verify)
-  if rsync --help 2>&1 | grep -q -- '--info'; then RS+=("--info=progress2"); else RS+=(--progress); fi
+  # Read once, then match: `rsync --help | grep -q` fails under pipefail when grep exits
+  # before rsync finishes writing its help, which dropped these options at random.
+  rs_help="$(rsync --help 2>&1 || true)"
+  grep -q -- '--append-verify' <<<"$rs_help" && RS+=(--append-verify)
+  if grep -q -- '--info' <<<"$rs_help"; then RS+=("--info=progress2"); else RS+=(--progress); fi
 
   if command -v rsync >/dev/null && ssh "$TARGET" 'command -v rsync >/dev/null' 2>/dev/null; then
     rsync "${RS[@]}" "$WORK/$IMAGES" "$TARGET:$STAGE_DIR/$IMAGES" \

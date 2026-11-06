@@ -1,0 +1,2 @@
+<event version="2.0" uid="sensor-1" type="a-u-A" how="m-g" time="2026-01-01T00:00:00Z" start="2026-01-01T00:00:00Z" stale="2026-01-01T00:01:00Z"><point lat="0.5" lon="0.5" hae="100" ce="10" le="10"/></event>
+<event version="2.0" uid="sensor-2" type="a-u-G" how="m-g" time="2026-01-01T00:00:01Z" start="2026-01-01T00:00:01Z" stale="2026-01-01T00:01:01Z"><point lat="0.6" lon="0.6" hae="0" ce="10" le="10"/></event>

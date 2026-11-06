@@ -1,6 +1,6 @@
 # Working With Zenoh-Native Partners
 
-How to connect a partner system that already speaks Zenoh to an octo-pod: let it publish
+How to connect a partner system that already implements Zenoh to an octo-pod: let it publish
 to you, let it subscribe to data you release to it, and publish into its own router.
 Every step is a command. None of them changes the running pod until you run
 `octo-pod apply`.
@@ -60,13 +60,13 @@ firewall to its addresses, and writes its bundle:
 sudo octo-pod apply
 ```
 
-Package the bundle for hand-off:
+Package the bundle for transfer:
 
 ```zsh
 sudo octo-pod peer bundle c2
 ```
 
-The archive holds the peer's private key. Hand it over out of band, send the `sha256` it
+The archive holds the peer's private key. Transfer it through a separate secure channel, send the `sha256` it
 prints by a separate channel so the partner can check the archive, and delete your copy
 once they confirm receipt.
 
@@ -94,7 +94,7 @@ sudo octo-pod peer allow-read c2 --key 'release/REL-C2/<anchor>/sensor2/**'
 ```
 
 If the pod holds no slot yet, add `--slot <dir> --ca-fingerprint <fp>`, as for
-`egress release`. The command refuses a bundle whose signature does not check out.
+`egress release`. The command refuses a bundle whose signature fails verification.
 
 Apply it:
 
@@ -254,7 +254,7 @@ PROOF_DISABLE_ACL=1 /tmp/zv/bin/python tools/prove-peer-access.py
 |---|---|
 | The partner's connection times out | It dials from an address not in `--from`, or over the LAN without `--from`. Check `octo-pod status`. |
 | Connected, but nothing arrives at the pod | It publishes outside `raw/<id>/`, for example with an org prefix. |
-| Subscribed, but the partner receives nothing | It subscribes to the fabric key instead of `downlink/<key>`, the key is not released, or the source is quiet. Check `octo-pod peer check`. |
+| Subscribed, but the partner receives nothing | It subscribes to the fabric key instead of `downlink/<key>`, the key is not released, or the source is not sending data. Check `octo-pod peer check`. |
 | `peer bundle` refuses | `apply` has not run since the last change. Run `sudo octo-pod apply`. |
 | `peer check` says `DISAGREE` | A peer's read is open but its key is missing from `downlink_allow`. Run `peer allow-read` again with that key. |
-| Nothing comes down at all | The pod holds no slot. Give `allow-read` or `egress release` the `--slot` bundle. |
+| No fabric data reaches the pod | The pod holds no slot. Give `allow-read` or `egress release` the `--slot` bundle. |

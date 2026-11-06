@@ -26,6 +26,7 @@ One lowercase scope, no commas. See CONTRIBUTING.md.
 ## Checklist
 
 - [ ] The title follows Conventional Commits
+- [ ] New functionality or a bug fix has automated tests in this pull request, or the Test Plan says why it can't
 - [ ] Every commit is signed and carries a DCO sign-off (`git commit -s`)
 - [ ] The checks in CONTRIBUTING.md pass
 - [ ] No site values: addresses, hostnames, enrollment output, keys or tokens

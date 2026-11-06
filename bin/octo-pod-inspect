@@ -20,6 +20,7 @@ Neither answers "tell me everything about radar1" or "which certificate ends fir
 without the operator reading around the answer, and neither is a stable row format a
 script can grep. These are the kubectl shapes people already know.
 """
+from octo_pod_i18n import t as _tr, critical as _critical
 import argparse
 import difflib
 import glob
@@ -157,8 +158,7 @@ def resolve(query, resource=None):
     """(item, None), or (None, exit code) after saying what went wrong and what to try."""
     m = ID.match(query or "")
     if not m:
-        return None, fail(f"'{query}' is not an id. An id starts with a letter or digit.\n"
-                          "List them: octo-pod get flows")
+        return None, fail(_critical("'{v0}' is not an id. An id starts with a letter or digit.\nList them: octo-pod get flows", v0=query))
     want_kind, name = m.groups()
     items = catalog(STATUS.containers())
     allowed = None
@@ -187,8 +187,7 @@ def resolve(query, resource=None):
     close = [k for k in known if name in k][:3] or difflib.get_close_matches(name, known, n=3,
                                                                              cutoff=0.75)
     hint = f"Did you mean: {', '.join(close)}?\n" if close else ""
-    return None, fail(f"nothing on this pod is called '{query}'.\n{hint}"
-                      "List them: octo-pod get flows   (or get arms, peers, egress, bridges)")
+    return None, fail(_critical("nothing on this pod is called '{v0}'.\n{v1}List them: octo-pod get flows   (or get arms, peers, egress, bridges)", v0=query, v1=hint))
 
 
 def secret_key(key):
@@ -479,7 +478,7 @@ def print_table(headers, cells, gap=3):
 def cmd_get(args):
     kind = ALIASES.get(args.kind, args.kind)
     if kind not in KINDS:
-        return fail(f"unknown kind '{args.kind}'. Kinds: {', '.join(KINDS)}", 2)
+        return fail(_critical("unknown kind '{v0}'. Kinds: {v1}", v0=args.kind, v1=', '.join(KINDS)), 2)
     items, cells, extra = items_of(kind, wide=args.output == "wide")
     if args.output == "json":
         print(json.dumps({"kind": kind, **extra, "items": items}, indent=2, default=str))
@@ -627,14 +626,12 @@ def cmd_logs(args):
     if not item:
         return code
     if args.tail < 0:
-        return fail("--tail takes a number of lines, 0 or more", 2)
+        return fail(_critical("--tail takes a number of lines, 0 or more"), 2)
     if args.since and not re.match(r"^[0-9][0-9A-Za-z:.+-]*$", args.since):
-        return fail(f"--since '{args.since}' is not a time: use 10m, 2h or "
-                    "2026-01-31T10:00:00Z", 2)
+        return fail(_critical("--since '{v0}' is not a time: use 10m, 2h or 2026-01-31T10:00:00Z", v0=args.since), 2)
     name = item["logs"]
     if item["kind"] == "peer":
-        print(f"{item['id']} is a peer: it runs on its own box, so these are the logs of its "
-              f"audit sink here, {name}.", file=sys.stderr)
+        print(_critical('{v0} is a peer: it runs on its own box, so these are the logs of its audit sink here, {v1}.', v0=item['id'], v1=name), file=sys.stderr)
     if item["up"]:
         argv = ["podman", "logs", "--tail", str(args.tail)]
         argv += ["-f"] if args.follow else []
@@ -643,7 +640,7 @@ def cmd_logs(args):
     else:
         # Every pod container runs with --rm, so podman forgets one that stopped. Its
         # unit's journal still has what it printed, which is what a crash needs.
-        print(f"{name} is not running; these are its unit's journal lines.", file=sys.stderr)
+        print(_critical("{v0} is not running; these are its unit's journal lines.", v0=name), file=sys.stderr)
         argv = ["journalctl", "-u", f"{name}.service", "-n", str(args.tail), "--no-pager",
                 "-o", "cat"]
         argv += ["-f"] if args.follow else []
@@ -653,7 +650,7 @@ def cmd_logs(args):
         # A successful exec replaces this process; make the tail call explicit.
         return os.execvp(argv[0], argv)
     except OSError as e:
-        return fail(f"cannot run {argv[0]}: {e}. Is this a pod?")
+        return fail(_critical('cannot run {v0}: {v1}. Is this a pod?', v0=argv[0], v1=e))
 
 
 def cmd_certs(args):
@@ -661,8 +658,7 @@ def cmd_certs(args):
     if certs:
         print_table(COLUMNS["certs"][0], cert_cells(certs), gap=CERT_GAP)
     else:
-        print(f"no certificates under {pen_tls()} (the pen was never built: "
-              "sudo octo-pod apply)", file=sys.stderr)
+        print(_critical('no certificates under {v0} (the pen was never built: sudo octo-pod apply)', v0=pen_tls()), file=sys.stderr)
     for c in certs:
         if c.get("dir") and not args.check:   # --check says it once, below
             print(advice(c), file=sys.stderr)
@@ -684,7 +680,7 @@ def cmd_certs(args):
         return 0
     due = [c for c in certs if c["status"] in DUE]
     if not due and not any(c["expires"] for c in certs):
-        return fail("\nno certificate was read, so none can be shown to be valid.", 1)
+        return fail(_critical("\nno certificate was read, so none can be shown to be valid."), 1)
     if due:
         todo = list(dict.fromkeys(advice(c) for c in due))
         return fail(f"\n{len(due)} certificate(s) or directories expired, unreadable or "
@@ -694,29 +690,28 @@ def cmd_certs(args):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    ap = argparse.ArgumentParser(prog="octo-pod", description="Read-only views of this pod.")
+    ap = argparse.ArgumentParser(prog="octo-pod", description=_tr("Read-only views of this pod."))
     sub = ap.add_subparsers(dest="verb", required=True)
-    g = sub.add_parser("get", help="one row per item of a kind")
+    g = sub.add_parser("get", help=_tr("one row per item of a kind"))
     g.add_argument("kind", nargs="?", default="flows", help=", ".join(KINDS))
     g.add_argument("-o", "--output", choices=("table", "wide", "json"), default="table")
-    d = sub.add_parser("describe", help="everything about one item")
-    d.add_argument("id", help="an arm, peer or egress id, uplink, downlink, or a container")
-    d.add_argument("name", nargs="?", help="item name when preceded by a resource type")
-    lg = sub.add_parser("logs", help="podman logs for one item")
-    lg.add_argument("id", help="item name, or resource type followed by name")
-    lg.add_argument("name", nargs="?", help="item name when preceded by a resource type")
+    d = sub.add_parser("describe", help=_tr("everything about one item"))
+    d.add_argument("id", help=_tr("an arm, peer or egress id, uplink, downlink, or a container"))
+    d.add_argument("name", nargs="?", help=_tr("item name when preceded by a resource type"))
+    lg = sub.add_parser("logs", help=_tr("podman logs for one item"))
+    lg.add_argument("id", help=_tr("item name, or resource type followed by name"))
+    lg.add_argument("name", nargs="?", help=_tr("item name when preceded by a resource type"))
     lg.add_argument("-f", "--follow", action="store_true")
     lg.add_argument("--tail", type=int, default=100)
     lg.add_argument("--since")
-    c = sub.add_parser("certs", help="every certificate this pod holds")
-    c.add_argument("--check", action="store_true", help="exit 1 if any is due")
-    c.add_argument("--days", type=int, default=30, help="what counts as due (default 30)")
+    c = sub.add_parser("certs", help=_tr("every certificate this pod holds"))
+    c.add_argument("--check", action="store_true", help=_tr("exit 1 if any is due"))
+    c.add_argument("--days", type=int, default=30, help=_tr("what counts as due (default 30)"))
     args = ap.parse_args(argv)
     # Without root, podman lists none of the pod's containers and the pen's files are
     # closed, so every row would read "not running" and look authoritative. Say so first.
     if os.geteuid() != 0:
-        print("not root: podman and the pen's files are hidden from this user, so this view "
-              f"is incomplete. Run: sudo octo-pod {shlex.join(argv)}", file=sys.stderr)
+        print(_critical("not root: podman and the pen's files are hidden from this user, so this view is incomplete. Run: sudo octo-pod {v0}", v0=shlex.join(argv)), file=sys.stderr)
     return {"get": cmd_get, "describe": cmd_describe, "logs": cmd_logs,
             "certs": cmd_certs}[args.verb](args)
 

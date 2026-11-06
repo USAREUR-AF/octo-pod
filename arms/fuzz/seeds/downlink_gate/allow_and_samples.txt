@@ -1,0 +1,16 @@
++aa11/sapient/radar1
++bb22/sensors/**
++release/lane-a/**
++**
++release/**
++ops/status
++@/admin
++downlink/aa11
+downlink/aa11/sapient/radar1
+downlink/aa11/sapient/radar2
+downlink/bb22/sensors/radar3/data
+downlink/release/lane-a/aa11/tracks
+downlink/release/lane-b/aa11/tracks
+downlink/cc33/sapient/radar1
+raw/octo/sapient/192-0-2-10
+downlink/

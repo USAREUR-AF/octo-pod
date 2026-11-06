@@ -626,7 +626,7 @@ def run_checks(repo, check, script=None):
               and len(pod.cosign_calls()) == 1, out[-400:])
 
     print("\nupgrade: who may sign is the release workflow, on a release tag")
-    pinned = (r"^https://github\.com/example/octo-pod/\.github/workflows/release\.yml"
+    pinned = (r"^https://github\.com/(?i:example/octo-pod)/\.github/workflows/release\.yml"
               r"@refs/tags/octo-pod-v")
     with tempfile.TemporaryDirectory() as t:
         pod = Pod(pathlib.Path(t), script, "0.4.0")
@@ -642,7 +642,9 @@ def run_checks(repo, check, script=None):
     # Go's regexp and Python's agree on everything this pattern uses.
     rx = re.compile(call.get("--certificate-identity-regexp") or "(?!)")
     gh = "https://github.com/example/octo-pod/.github/workflows/"
-    takes = [gh + "release.yml@refs/tags/octo-pod-v0.4.1"]
+    takes = [gh + "release.yml@refs/tags/octo-pod-v0.4.1",
+             # GitHub writes its own spelling of owner and repository into the certificate.
+             "https://github.com/EXAMPLE/Octo-Pod/.github/workflows/release.yml@refs/tags/octo-pod-v0.4.1"]
     refuses = [gh + "ci.yml@refs/heads/main", gh + "release.yml@refs/heads/main",
                gh + "release.yml@refs/tags/v0.4.1", gh + "release.yml@refs/pull/7/merge",
                gh + "evil.yml@refs/tags/octo-pod-v0.4.1",
@@ -660,7 +662,7 @@ def run_checks(repo, check, script=None):
         rc, out = pod.run()
         got = (pod.cosign_calls() or [{}])[-1].get("--certificate-identity-regexp", "")
         check("a '.' in the repository name is escaped, not a wildcard",
-              rc == 0 and got.startswith(r"^https://github\.com/example/octo\.pod/\.github/")
+              rc == 0 and got.startswith(r"^https://github\.com/(?i:example/octo\.pod)/\.github/")
               and not re.search(got, "https://github.com/example/octoXpod/.github/workflows/"
                                      "release.yml@refs/tags/octo-pod-v0.4.1"), got)
 

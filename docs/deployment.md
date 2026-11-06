@@ -19,10 +19,10 @@ it before you start.
 Supported: amd64 or arm64 Debian/Ubuntu-family Linux with systemd, Podman 4.7 or later
 and skopeo, such as
 Ubuntu 24.04. The [LXD image helper](#lab-only-lxd-image-helper) is for lab testing.
-The package declares that contract, so on Ubuntu 24.04 installing it with apt brings
+The package declares that contract, so on Ubuntu 24.04 installing it with apt installs
 podman and skopeo. Ubuntu 22.04, Debian 12, Raspberry Pi OS and JetPack 6 ship an older
 podman, without Quadlet: apt refuses the package there, and such a device needs a base
-image that brings a newer podman.
+image that includes a newer Podman version.
 
 Dependency installation is split between the package installer and the CLI:
 
@@ -165,8 +165,8 @@ Mints a one-off key and writes it to `/root/nb.key` on the pod without displayin
 The helper stages the key under `/root`; keep it private and mint a fresh key for each rebuild.
 
 **A setup key is one-off.** It is consumed the moment a box enrols. Mint a fresh one for
-every rebuild. A second attempt with a spent key does not fail cleanly: `netbird up` never
-returns, and the play gives up after 120 seconds.
+every rebuild. A second attempt with an already-used key does not return an immediate error:
+`netbird up` does not return, and the play times out after 120 seconds.
 
 `mint-key.sh` wraps `goat machine mesh-key <pod-name>`, which is quota-neutral and
 re-derives the key's groups from the machine's class. For a machine with no anchor yet,
@@ -195,7 +195,7 @@ The line that matters:
 ```
 
 `--with-images` carries the container images. A pod usually has no route to a registry,
-so carrying them is the normal path. Drop the flag only if the pod can reach a
+so carrying them is the normal path. Omit the flag only if the pod can reach a
 registry that already holds them.
 
 ### 3. Prepare the box
@@ -282,7 +282,7 @@ One declaration produces a certificate, an ACL grant, an audit sink and the runn
 
 Send a known test datagram from the sensor LAN to the pod's declared UDP listener
 (port 48021 in this example). Use a source address listed in `--from` and
-coordinate the test with the sensor operator. This package ships no traffic simulator.
+coordinate the test with the sensor operator. This package includes no traffic simulator.
 
 On the pod:
 
@@ -305,7 +305,7 @@ sudo octo-pod init --pod <pod-name>
 sudo octo-pod apply
 ```
 
-Everything else is the same, and two things get simpler. The pod takes the address off its
+Everything else is the same, and two things get simpler. The pod uses the address associated with its
 default route, so `add-arm` needs no `--bind`. And with no mirror declared, `apply` finds
 the registry on the pod and uses it.
 
@@ -318,14 +318,14 @@ sudo octo-pod join --setup-key-file <PATH> --mgmt https://<netbird-host> --pod <
 
 ## Installing without the script
 
-Do the same three things by hand: verify, copy, install.
+Perform the same three steps manually: verify, copy, install.
 
 ```bash
 gh release download octo-pod-v<version> -R <owner>/<repo> \
   -p "octo-pod_<version>_all.deb" -p SHA256SUMS -p SHA256SUMS.cosign-bundle
 
 cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
-  --certificate-identity-regexp '^https://github\.com/<owner>/<repo>/\.github/workflows/release\.yml@refs/tags/octo-pod-v' \
+  --certificate-identity-regexp '^https://github\.com/(?i:<owner>/<repo>)/\.github/workflows/release\.yml@refs/tags/octo-pod-v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
 
@@ -361,9 +361,9 @@ tools/build-vm-image.sh --host <lxd-host> --manifest <packages.manifest>
 ```
 
 The LXD host does the building, so only the committed source crosses your link. Every
-octo-pod image is compiled from source there, the image is published as
-`octo-pod-gateway/<version>-<sha>-<arch>`, and its manifest, every package version and
-image digest, lands in `dist/vm-image/`. An image with the same name is never
+octo-pod image is compiled from source there. The image is published as
+`octo-pod-gateway/<version>-<sha>-<arch>`. Its manifest, every package version and
+image digest are written to `dist/vm-image/`. An image with the same name is never
 overwritten, and the build VM is deleted whether the build passes or fails (`--keep`
 keeps a failed one).
 

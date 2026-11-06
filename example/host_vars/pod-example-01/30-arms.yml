@@ -24,7 +24,7 @@ arms:
     feed: cat62-v1                     # [A-Za-z0-9_-] only; the arm rejects slashes
     transport: udp
     port: 48020
-    allow_sources: "100.127.0.18"       # operator laptop sending a known test datagram
+    allow_sources: "100.127.0.16"       # operator laptop sending a known test datagram
     trust_tier: T1                     # socket + source IP only; no crypto identity
     affiliation: { id: octo-pod, kind: first-party }
     contact: "Platform team"

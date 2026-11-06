@@ -29,6 +29,7 @@ The declared half (what should exist, release, certificates, orphans) is
 octo-pod status's own collect(), loaded from beside this file, so the two commands
 cannot disagree about what the pod was told to do.
 """
+from octo_pod_i18n import t as _tr, critical as _critical
 import argparse
 import collections
 import importlib.machinery
@@ -994,9 +995,9 @@ def interactive(collector):
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="octo-pod top", description="A live, read-only view of this pod.")
-    ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
-    ap.add_argument("--json", action="store_true", help="one snapshot as JSON")
+        prog="octo-pod top", description=_tr("A live, read-only view of this pod."))
+    ap.add_argument("--once", action="store_true", help=_tr("print one snapshot and exit"))
+    ap.add_argument("--json", action="store_true", help=_tr("one snapshot as JSON"))
     args = ap.parse_args()
 
     collector = Collector()

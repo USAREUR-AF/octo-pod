@@ -101,6 +101,24 @@ fn make_config(leg: &TlsLeg) -> Result<zenoh::Config> {
     config
         .insert_json5("connect/endpoints", &format!("[\"{}\"]", leg.endpoint))
         .map_err(|e| anyhow::anyhow!("[{}] config connect/endpoints: {e}", leg.label))?;
+    // Pin transport compression off on both transports, as every other arm does
+    // (octo_arm_common::SessionConfig). It is off by default in zenoh 1.9.0, and a link
+    // only compresses when both ends enable it, but this bridge faces the external fabric:
+    // pinning it keeps lz4_flex's decompress path (RUSTSEC-2026-0041) unreachable even if
+    // a future zenoh default or a far-end router changes.
+    config
+        .insert_json5("transport/unicast/compression/enabled", "false")
+        .map_err(|e| {
+            anyhow::anyhow!("[{}] config transport/unicast/compression: {e}", leg.label)
+        })?;
+    config
+        .insert_json5("transport/multicast/compression/enabled", "false")
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "[{}] config transport/multicast/compression: {e}",
+                leg.label
+            )
+        })?;
     if leg.endpoint.starts_with("tls/") {
         // Insert the whole TLS block at once — per-sub-key inserts do not
         // enable the client-cert mTLS send path (same gotcha as the bundled
@@ -140,6 +158,39 @@ async fn open_forever(leg: &TlsLeg<'_>) -> zenoh::Session {
     }
 }
 
+/// The write anchor must be a single key segment. A slot prefix that is empty
+/// or contains a path separator would let the bridge publish outside the slot
+/// the portal assigned it, which is the one thing the prefix exists to prevent.
+fn validate_slot_prefix(prefix: &str) -> Result<()> {
+    if prefix.is_empty() || prefix.contains('/') {
+        bail!("--slot-prefix must be a single key segment (the fabric slot uuid)");
+    }
+    Ok(())
+}
+
+/// Trim the allowlist, drop empty entries (a trailing or doubled comma in
+/// BRIDGE_ALLOW yields one), and require at least one. An empty entry must never
+/// become a subscription, and a bridge with an all-empty allowlist uplinks
+/// nothing by mistake rather than failing loudly.
+fn normalize_allow(raw: &[String]) -> Result<Vec<String>> {
+    let allow: Vec<String> = raw
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if allow.is_empty() {
+        bail!("--allow must name at least one key expression");
+    }
+    Ok(allow)
+}
+
+/// Every uplinked sample is published under `<slot_prefix>/<source_key>`. The
+/// slot prefix is the bridge's entire write authority on the fabric, so a source
+/// key can only ever land beneath it, never at a sibling slot or a bare key.
+fn slotted_key(slot_prefix: &str, source_key: &str) -> String {
+    format!("{slot_prefix}/{source_key}")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -149,18 +200,8 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    if args.slot_prefix.is_empty() || args.slot_prefix.contains('/') {
-        bail!("--slot-prefix must be a single key segment (the fabric slot uuid)");
-    }
-    let allow: Vec<String> = args
-        .allow
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if allow.is_empty() {
-        bail!("--allow must name at least one key expression");
-    }
+    validate_slot_prefix(&args.slot_prefix)?;
+    let allow = normalize_allow(&args.allow)?;
 
     info!(
         slot_prefix = args.slot_prefix.as_str(),
@@ -212,7 +253,7 @@ async fn main() -> Result<()> {
                         return;
                     }
                 };
-                let uplink_key = format!("{}/{}", slot, sample.key_expr());
+                let uplink_key = slotted_key(&slot, sample.key_expr().as_ref());
                 let result = match sample.kind() {
                     SampleKind::Put => {
                         pub_session
@@ -264,4 +305,78 @@ async fn main() -> Result<()> {
     // Non-zero when a subscriber died unexpectedly so the container
     // restart policy re-runs us into the open_forever retry loop.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_prefix_must_be_a_single_segment() {
+        // A real portal slot uuid is accepted.
+        assert!(validate_slot_prefix("a1b2c3d4e5f6").is_ok());
+        // Empty, a separator, a traversal attempt, or a trailing slash are all
+        // ways to address a key outside the assigned slot; all are refused.
+        assert!(validate_slot_prefix("").is_err());
+        assert!(validate_slot_prefix("a/b").is_err());
+        assert!(validate_slot_prefix("../other-slot").is_err());
+        assert!(validate_slot_prefix("slot/").is_err());
+    }
+
+    #[test]
+    fn allowlist_drops_empty_entries_and_requires_at_least_one() {
+        assert_eq!(
+            normalize_allow(&["ops/env/health/**".into(), "  demo/**  ".into()]).unwrap(),
+            vec!["ops/env/health/**".to_string(), "demo/**".to_string()],
+        );
+        // A trailing comma in BRIDGE_ALLOW produces an empty entry; it is dropped,
+        // never turned into a subscription.
+        assert_eq!(
+            normalize_allow(&["ops/**".into(), "".into()]).unwrap(),
+            vec!["ops/**".to_string()],
+        );
+        // No entries, or only blank ones, must fail rather than uplink nothing silently.
+        assert!(normalize_allow(&[]).is_err());
+        assert!(normalize_allow(&["".into(), "   ".into()]).is_err());
+    }
+
+    #[test]
+    fn uplink_key_is_confined_to_the_slot_prefix() {
+        assert_eq!(
+            slotted_key("slot7", "sensors/radar/tracks"),
+            "slot7/sensors/radar/tracks",
+        );
+        // Whatever the source key, the result always begins with "<slot>/", so the
+        // bridge cannot address a sibling slot or a bare fabric key.
+        for source in ["ops/env/health/x", "a", "from/elsewhere/**", "../escape"] {
+            assert!(slotted_key("slot7", source).starts_with("slot7/"));
+        }
+    }
+
+    #[test]
+    fn compression_is_pinned_off_on_both_legs_and_transports() {
+        // Guards RUSTSEC-2026-0041 (lz4_flex 0.10.0 decompress) on the leg that faces the
+        // external fabric as well as the pen leg, with and without TLS. A wrong key path
+        // would have failed make_config, so this also proves the paths are valid.
+        for endpoint in ["tls/fabric.example.test:7447", "tcp/192.0.2.10:7447"] {
+            let leg = TlsLeg {
+                label: "test",
+                endpoint,
+                cert: "/etc/octo-pod/tls/pod.crt",
+                key: "/etc/octo-pod/tls/pod.key",
+                root_ca: "/etc/octo-pod/tls/root.pem",
+                verify_name: true,
+            };
+            let config = make_config(&leg).expect("config builds");
+            for transport in ["unicast", "multicast"] {
+                assert_eq!(
+                    config
+                        .get_json(&format!("transport/{transport}/compression/enabled"))
+                        .expect("key exists"),
+                    "false",
+                    "{endpoint} {transport}"
+                );
+            }
+        }
+    }
 }

@@ -3,7 +3,7 @@
 # editing it locally: a crate allowed here and denied there is a question nobody
 # can answer at 3am.
 #
-# cargo-deny — Rust license / bans / sources gate.
+# cargo-deny: Rust license / bans / sources gate.
 #
 # Single responsibility: enforce the project's permissive-license posture
 # (Tier 1-4 permissive allowlist; Tier-5 disqualified by omission) plus
@@ -24,36 +24,44 @@ all-features = true
 no-default-features = false
 
 # ---------------------------------------------------------------------------
-# Licenses — permissive allowlist. Add only after confirming
+# Licenses: permissive allowlist. Add only after confirming
 # the license is on the Tier 1-4 ladder; never add a Tier-5 (SSPL /
 # Commons Clause / Elastic v2 / restrictive BSL / "non-commercial").
 # ---------------------------------------------------------------------------
-# ADVISORY IGNORES — every one is transitive through zenoh =1.9.0, which is pinned
+# ADVISORY IGNORES: every one is transitive through zenoh =1.9.0, which is pinned
 # deliberately ("a minor bump has changed wire behaviour before"). Same posture as
 # GOAT: name them, say why, and keep the
 # vulnerability gate live so any NEW vulnerability outside the CI ignore list fails.
 #
 # RE-CHECK TRIGGER: whenever zenoh is bumped in arms/Cargo.toml. Delete any entry that
-# no longer appears — an ignore list that only grows stops being a decision.
+# no longer appears, because an ignore list that only grows stops being a decision.
 [advisories]
 ignore = [
-  # rsa 0.9.10 — Marvin timing sidechannel on RSA private-key operations.
+  # rsa 0.9.10: Marvin timing side channel on RSA private-key operations.
   # Not reachable here: the pen mints prime256v1 (EC) leaves, and zenoh's pubkey auth
-  # mechanism (the only consumer) is unconfigured — transport.auth.pubkey is null in
+  # mechanism (the only consumer) is unconfigured: transport.auth.pubkey is null in
   # the generated router config. Reassess if RSA certs or pubkey auth are ever enabled.
   "RUSTSEC-2023-0071",
   # lz4_flex decompression can leak uninitialised memory or a reused output buffer.
   # Reached only through zenoh-transport's compression feature on a link that negotiated
   # compression (not websocket-specific). Every arm opens a mode=client session that pins
   # transport/unicast and transport/multicast compression/enabled = false
-  # (arms/common/src/session.rs, arms/egress/src/session.rs), so the decompress path is
+  # (arms/common/src/session.rs, arms/egress/src/session.rs,
+  # arms/uplink-bridge/src/main.rs), so the decompress path is
   # unreachable. No zenoh release past 1.9.0 moves lz4_flex to the fixed 0.11.6; all pin
   # ^0.10.0. Reassess if any session enables compression or zenoh re-bumps lz4_flex.
   "RUSTSEC-2026-0041",
-  # paste — unmaintained, not a vulnerability. Build-time proc-macro only.
+  # paste: unmaintained, not a vulnerability. Build-time proc-macro only.
   "RUSTSEC-2024-0436",
-  # rustls-pemfile — unmaintained, superseded upstream. No known vulnerability.
+  # rustls-pemfile: unmaintained, superseded upstream. No known vulnerability.
   "RUSTSEC-2025-0134",
+  # unsafe-libyaml: unmaintained, not a vulnerability. Reached only through
+  # zenoh-config's serde_yaml loader for YAML config files. Every arm builds its config
+  # in code with Config::default() and insert_json5 (arms/common/src/session.rs,
+  # arms/egress/src/session.rs, arms/uplink-bridge/src/main.rs) and never loads a file,
+  # so the parser is compiled in but not called. Reassess if an arm ever reads a
+  # zenoh config file.
+  "RUSTSEC-2024-0449",
 ]
 
 [licenses]
@@ -73,7 +81,7 @@ allow = [
     # Permissive DATA license (Community Data License Agreement) carried by the
     # Mozilla CA trust-store crates (webpki-roots / webpki-root-certs, the rustls
     # ecosystem standard since their MPL->CDLA relicense). No copyleft, no
-    # field-of-use restriction — same tier as CC0/Unicode-DFS above.
+    # field-of-use restriction, the same tier as CC0/Unicode-DFS above.
     "CDLA-Permissive-2.0",
     "0BSD",
     "BSL-1.0",
@@ -83,14 +91,14 @@ confidence-threshold = 0.8
 exceptions = []
 
 # ---------------------------------------------------------------------------
-# Bans — guard against duplicate / wildcard crates.
+# Bans: guard against duplicate / wildcard crates.
 # ---------------------------------------------------------------------------
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 # Path dependencies carry no version, which cargo-deny reads as a wildcard. Inside one
-# workspace that is how you refer to a sibling crate — octo-arm-common is not fetched
-# from a registry — so allow it here rather than weakening `wildcards` itself, which
+# workspace that is how you refer to a sibling crate (octo-arm-common is not fetched
+# from a registry), so allow it here rather than weakening `wildcards` itself, which
 # still catches a real `foo = "*"` from crates.io.
 allow-wildcard-paths = true
 highlight = "all"
@@ -100,7 +108,7 @@ skip = []
 skip-tree = []
 
 # ---------------------------------------------------------------------------
-# Sources — only crates.io + the explicitly-named git remotes below.
+# Sources: only crates.io + the explicitly-named git remotes below.
 # ---------------------------------------------------------------------------
 [sources]
 unknown-registry = "deny"

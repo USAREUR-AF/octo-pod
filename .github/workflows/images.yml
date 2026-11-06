@@ -27,6 +27,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read   # read-only by default; jobs that need more ask for it
+
 jobs:
   build:
     runs-on: ${{ matrix.runner }}
@@ -47,9 +50,9 @@ jobs:
           - { platform: linux/amd64, runner: ubuntu-24.04 }
           - { platform: linux/arm64, runner: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -60,7 +63,7 @@ jobs:
 
       # Push by digest only — no tag. Tags are applied once, by the merge job, so a
       # half-finished matrix never leaves a tag pointing at one architecture.
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         id: build
         with:
           context: arms
@@ -79,7 +82,7 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: digest-${{ matrix.arm }}-${{ strategy.job-index }}
           path: /tmp/digests/*
@@ -92,6 +95,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write       # keyless signing of the provenance attestation
+      attestations: write   # store it with GitHub's attestation API
     strategy:
       matrix:
         # MUST MATCH THE BUILD MATRIX. It did not: health-pub was added to build and not
@@ -101,20 +106,21 @@ jobs:
         # The coverage job below now fails when the two drift.
         arm: [udp-ingest, tcp-ingest, tcp-connect, health-pub, egress, sapient, uplink-bridge]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with: { path: /tmp/digests, pattern: 'digest-*', merge-multiple: true }
 
       - name: create the manifest list
+        id: manifest
         run: |
           IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/octo-${{ matrix.arm }}"
           SHA="sha-${GITHUB_SHA::7}"
@@ -154,6 +160,8 @@ jobs:
           # may not have. Writing it only to the step summary put it in a web page: not
           # greppable, not pipeable, and gone when the run expires.
           echo "PIN-THIS ${var}_upstream: \"${IMAGE}@${DIGEST}\"  # ${SHA}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
           echo "### \`octo-${{ matrix.arm }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo '```yaml' >> "$GITHUB_STEP_SUMMARY"
@@ -176,7 +184,19 @@ jobs:
           SHA="sha-${GITHUB_SHA::7}"
           python3 tools/check-image-sboms.py "${IMAGE}:${SHA}" --output-dir /tmp/sboms
 
-      - uses: actions/upload-artifact@v7
+      # SIGN WHAT DEPLOYS PIN. The manifest-list digest gets a keyless provenance
+      # attestation issued to this workflow and stored with the image, so a pin can be
+      # checked before it merges: it must name a digest that this repository's images.yml
+      # built from main. It is signed only after the architecture and SBOM checks above,
+      # so a digest that failed them never carries a signature.
+      - name: sign the manifest list
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ steps.manifest.outputs.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sbom-${{ matrix.arm }}-${{ github.sha }}
           path: /tmp/sboms/*
@@ -208,13 +228,13 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with: { path: /tmp/digests, pattern: 'digest-*', merge-multiple: true }
 
       - name: every built image is multi-arch

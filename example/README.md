@@ -15,7 +15,7 @@ and downlink release gates; declare those with `octo-pod egress` as described in
 | `host_vars/<pod>/00-site.yml` | interfaces and addressing for the ingest LAN |
 | `host_vars/<pod>/05-fabric.yml` | the mesh, upstream and update hosts this pod joins |
 | `host_vars/<pod>/10-pod.yml` | pen name, upstream slot anchor, the release gate |
-| `host_vars/<pod>/20-peers.yml` | publishers that already speak Zenoh |
+| `host_vars/<pod>/20-peers.yml` | publishers that already implement Zenoh |
 | `host_vars/<pod>/30-arms.yml` | publishers that send bytes at a socket |
 
 The six examples plus the generated `40-egress.yml` make up the seven identity files.

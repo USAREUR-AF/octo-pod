@@ -24,6 +24,7 @@ The signature is ECDSA P-256 over SHA-256 of the profile's canonical CBOR withou
 bytes. The fingerprint is SHA-256 over the key's uncompressed point, written
 SHA256:<hex>, and compared without regard to case, colons, spaces or the prefix.
 """
+from octo_pod_i18n import critical as _critical
 import base64
 import hashlib
 import pathlib
@@ -70,12 +71,11 @@ def slot_material(slot):
     profile. Exactly one set of roots must be found, or nothing is chosen."""
     slot = pathlib.Path(slot).expanduser()
     if not slot.is_dir():
-        raise SlotError(f"no such directory: {slot}")
+        raise SlotError(_critical('no such directory: {v0}', v0=slot))
     certs = sorted(slot.glob("*-cert.pem"))
     keys = sorted(slot.glob("*-key.pem"))
     if len(certs) != 1 or len(keys) != 1:
-        raise SlotError(f"expected exactly one *-cert.pem and one *-key.pem in {slot}, "
-                        f"found {len(certs)} and {len(keys)}")
+        raise SlotError(_critical('expected exactly one *-cert.pem and one *-key.pem in {v0}, found {v1} and {v2}', v0=slot, v1=len(certs), v2=len(keys)))
     signers = sorted(slot.glob("*-goat-cli-ca.pem"))
     profiles = sorted(slot.glob("*-goat-cli.cbor"))
     roots = sorted(c for c in slot.glob("*.pem") if "ca-root" in c.name.lower())
@@ -85,16 +85,12 @@ def slot_material(slot):
     cas = roots or sorted(c for c in slot.glob("*.pem")
                           if "ca" in c.name.lower() and c not in known)
     if len(cas) != 1:
-        raise SlotError(f"expected one CA roots file in {slot} (a *ca-root*.pem), "
-                        f"found {[c.name for c in cas]}")
+        raise SlotError(_critical('expected one CA roots file in {v0} (a *ca-root*.pem), found {v1}', v0=slot, v1=[c.name for c in cas]))
     anchor = certs[0].name[: -len("-cert.pem")]
     if not re.match(r"^[0-9a-f]{8,}$", anchor):
-        raise SlotError(f"cert filename gives anchor {anchor!r}, which is not hex; "
-                        "is this the right bundle?")
+        raise SlotError(_critical('cert filename gives anchor {v0!r}, which is not hex; is this the right bundle?', v0=anchor))
     if len(signers) > 1 or len(profiles) > 1 or len(signers) != len(profiles):
-        raise SlotError(f"a signed profile is one *-goat-cli.cbor and the one *-goat-cli-ca.pem "
-                        f"that signs it; {slot} has {[p.name for p in profiles + signers]}. "
-                        "Copy the whole bundle again.")
+        raise SlotError(_critical('a signed profile is one *-goat-cli.cbor and the one *-goat-cli-ca.pem that signs it; {v0} has {v1}. Copy the whole bundle again.', v0=slot, v1=[p.name for p in profiles + signers]))
     endpoint = ""
     notes = slot / "NOTES.md"
     if notes.exists():
@@ -111,8 +107,7 @@ def normalize(fingerprint):
     s = re.sub(r"[\s:]", "", str(fingerprint)).lower()
     s = re.sub(r"^(sha256)?(fingerprint)?=?", "", s)
     if not re.fullmatch(r"[0-9a-f]{64}", s):
-        raise SlotError(f"{fingerprint!r} is not a SHA-256 fingerprint "
-                        "(64 hex characters, colons allowed, optional SHA256: prefix)")
+        raise SlotError(_critical('{v0!r} is not a SHA-256 fingerprint (64 hex characters, colons allowed, optional SHA256: prefix)', v0=fingerprint))
     return s
 
 
@@ -132,15 +127,14 @@ def signer_key(pem_path):
     text = pathlib.Path(pem_path).read_text(errors="replace")
     blocks = re.findall(r"-----BEGIN PUBLIC KEY-----(.*?)-----END PUBLIC KEY-----", text, re.S)
     if len(blocks) != 1:
-        raise SlotError(f"{pem_path} must hold exactly one public key")
+        raise SlotError(_critical('{v0} must hold exactly one public key', v0=pem_path))
     body = "".join(ln.strip() for ln in blocks[0].splitlines() if ln.strip() and ":" not in ln)
     try:
         der = base64.b64decode(body, validate=True)
     except ValueError as exc:
-        raise SlotError(f"{pem_path} is not valid base64") from exc
+        raise SlotError(_critical('{v0} is not valid base64', v0=pem_path)) from exc
     if len(der) != len(P256_SPKI) + 65 or not der.startswith(P256_SPKI) or der[len(P256_SPKI)] != 4:
-        raise SlotError(f"{pem_path} is not an uncompressed P-256 public key, which is what "
-                        "goat signs profiles with")
+        raise SlotError(_critical('{v0} is not an uncompressed P-256 public key, which is what goat signs profiles with', v0=pem_path))
     pem = "-----BEGIN PUBLIC KEY-----\n" + "\n".join(
         body[i:i + 64] for i in range(0, len(body), 64)) + "\n-----END PUBLIC KEY-----\n"
     return hashlib.sha256(der[len(P256_SPKI):]).hexdigest(), pem
@@ -221,7 +215,7 @@ def read_profile(path):
     """(signed bytes, signature, fields) of a signed profile, or raise."""
     data = pathlib.Path(path).read_bytes()
     if len(data) > PROFILE_MAX:
-        raise SlotError(f"{path} is {len(data)} bytes, too large to be a signed profile")
+        raise SlotError(_critical('{v0} is {v1} bytes, too large to be a signed profile', v0=path, v1=len(data)))
     try:
         mt, n, i = _head(data, 0)
         if mt != 5:
@@ -244,9 +238,9 @@ def read_profile(path):
         if i != len(data):
             raise ValueError("bytes after the map")
     except (IndexError, ValueError, UnicodeDecodeError, RecursionError) as exc:
-        raise SlotError(f"{path} is not a valid signed profile ({exc})") from None
+        raise SlotError(_critical('{v0} is not a valid signed profile ({v1})', v0=path, v1=exc)) from None
     if not isinstance(signature, bytes) or not signature:
-        raise SlotError(f"{path} carries no signature")
+        raise SlotError(_critical('{v0} carries no signature', v0=path))
     return _map_head(len(kept)) + b"".join(kept), signature, fields
 
 
@@ -264,12 +258,10 @@ def verify_signature(pem, signed, signature, path):
                                 "-signature", str(sig)],
                                input=signed, capture_output=True, check=False)
         except FileNotFoundError:
-            raise SlotError("openssl is needed to check the signed profile, and it is not "
-                            "installed") from None
+            raise SlotError(_critical("openssl is needed to check the signed profile, and it is not "
+                            "installed")) from None
     if r.returncode != 0:
-        raise SlotError(f"{path.name} does not carry a valid signature from "
-                        "the key beside it. The profile was changed after it was signed, or the "
-                        "key is not the one that signed it. Nothing was changed.")
+        raise SlotError(_critical('{v0} does not carry a valid signature from the key beside it. The profile was changed after it was signed, or the key is not the one that signed it. Nothing was changed.', v0=path.name))
 
 
 # ------------------------------------------------------------------ the decision
@@ -281,7 +273,7 @@ def _confirm(ask, what, value):
         "  channel, not the bundle this file came from.\n"
         "  Type yes if they match exactly: ")
     if answer.strip().lower() != "yes":
-        raise SlotError("not confirmed. Nothing was changed.")
+        raise SlotError(_critical("not confirmed. Nothing was changed."))
 
 
 def trust(slot, expected=None, pinned_ca="", pinned_roots="", ask=None, now=None):
@@ -304,44 +296,34 @@ def trust(slot, expected=None, pinned_ca="", pinned_roots="", ask=None, now=None
         want = normalize(expected)
         if want != actual:
             raise SlotError(
-                f"{who} has fingerprint {shown(actual)}, not the {shown(want)} you passed. "
-                "Either the bundle is from another goatnet or someone substituted the key. Ask "
-                "the goatnet's operators which key signs your bundle. Nothing was changed.")
+                _critical("{v0} has fingerprint {v1}, not the {v2} you passed. Either the bundle is from another goatnet or someone substituted the key. Ask the goatnet's operators which key signs your bundle. Nothing was changed.", v0=who, v1=shown(actual), v2=shown(want)))
         if pinned_ca and normalize(pinned_ca) != actual:
             warnings.append(f"the goatnet's signing key changes from "
                             f"{shown(normalize(pinned_ca))} to {shown(actual)}, as you passed")
     elif pinned_ca:
         if normalize(pinned_ca) != actual:
             raise SlotError(
-                f"{who} has fingerprint {shown(actual)}, but this pod pinned "
-                f"{shown(normalize(pinned_ca))}. If the goatnet has changed its signing key, "
-                "pass the new fingerprint with --ca-fingerprint. Nothing was changed.")
+                _critical('{v0} has fingerprint {v1}, but this pod pinned {v2}. If the goatnet has changed its signing key, pass the new fingerprint with --ca-fingerprint. Nothing was changed.', v0=who, v1=shown(actual), v2=shown(normalize(pinned_ca))))
     elif ask is not None:
         _confirm(ask, "Signing key fingerprint", shown(actual))
     else:
         raise SlotError(
-            f"there is no fingerprint to check this bundle's signing key against. Its "
-            f"fingerprint is {shown(actual)}. Compare it with the one the goatnet's operators "
-            "gave you through another channel, then re-run with "
-            f"--ca-fingerprint {shown(actual)}. Nothing was changed.")
+            _critical("there is no fingerprint to check this bundle's signing key against. Its fingerprint is {v0}. Compare it with the one the goatnet's operators gave you through another channel, then re-run with --ca-fingerprint {v1}. Nothing was changed.", v0=shown(actual), v1=shown(actual)))
 
     signed, signature, fields = read_profile(slot.profile)
     verify_signature(pem, signed, signature, slot.profile)
     extras = fields.get("goat_cli_extras")
     if not isinstance(extras, dict):
-        raise SlotError(f"{slot.profile.name} is signed but carries no profile "
-                        "(goat_cli_extras). Ask for the bundle again.")
+        raise SlotError(_critical('{v0} is signed but carries no profile (goat_cli_extras). Ask for the bundle again.', v0=slot.profile.name))
     for label, path, field in (("certificate", slot.cert, "mtls_cert"),
                                ("private key", slot.key, "mtls_key"),
                                ("CA roots", slot.ca, "ca_roots")):
         if extras.get(field) != path.read_bytes():
             raise SlotError(
-                f"{path.name} is not the {label} the signed profile carries. It was changed "
-                "after the bundle was signed, or it comes from another bundle. Nothing was "
-                "changed.")
+                _critical('{v0} is not the {v1} the signed profile carries. It was changed after the bundle was signed, or it comes from another bundle. Nothing was changed.', v0=path.name, v1=label))
     endpoint = extras.get("router_endpoint")
     if not isinstance(endpoint, str) or not endpoint.startswith("tls/"):
-        raise SlotError(f"{slot.profile.name} carries no tls/ router endpoint")
+        raise SlotError(_critical('{v0} carries no tls/ router endpoint', v0=slot.profile.name))
     if pinned_roots and normalize(pinned_roots) != roots:
         warnings.append(f"the fabric's CA roots change from {normalize(pinned_roots)} to "
                         f"{roots}; the signed profile vouches for the new ones")
@@ -357,22 +339,15 @@ def _trust_unsigned(slot, roots, expected, pinned_ca, pinned_roots, ask):
     name = f"{slot.anchor}-goat-cli.cbor and {slot.anchor}-goat-cli-ca.pem"
     if expected:
         raise SlotError(
-            f"this bundle has no signed profile ({name}), so there is nothing to check "
-            "--ca-fingerprint against. Ask the goatnet's operators for the whole bundle. "
-            "Nothing was changed.")
+            _critical("this bundle has no signed profile ({v0}), so there is nothing to check --ca-fingerprint against. Ask the goatnet's operators for the whole bundle. Nothing was changed.", v0=name))
     if pinned_roots and normalize(pinned_roots) == roots:
         return Trusted("", roots, slot.notes_endpoint, [])
     if pinned_ca:
         raise SlotError(
-            f"this pod checks its bundles against the goatnet's signing key, and this bundle "
-            f"has no signed profile ({name}) and CA roots it has not seen. Ask the goatnet's "
-            "operators for the whole bundle. Nothing was changed.")
+            _critical("this pod checks its bundles against the goatnet's signing key, and this bundle has no signed profile ({v0}) and CA roots it has not seen. Ask the goatnet's operators for the whole bundle. Nothing was changed.", v0=name))
     if ask is None:
         raise SlotError(
-            f"this bundle has no signed profile ({name}), so only you can vouch for its CA "
-            f"roots. Their SHA-256 is {roots}. Run release at a terminal to compare it with "
-            "the digest the goatnet's operators gave you, or ask them for the whole bundle. "
-            "Nothing was changed.")
+            _critical("this bundle has no signed profile ({v0}), so only you can vouch for its CA roots. Their SHA-256 is {v1}. Run release at a terminal to compare it with the digest the goatnet's operators gave you, or ask them for the whole bundle. Nothing was changed.", v0=name, v1=roots))
     _confirm(ask, f"{slot.ca.name} SHA-256", roots)
     return Trusted("", roots, slot.notes_endpoint,
                    ["this bundle has no signed profile: its CA roots are trusted on your word"])

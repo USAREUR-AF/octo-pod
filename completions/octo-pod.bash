@@ -64,6 +64,26 @@ _octo_pod_pods() {
 }
 
 _octo_pod() {
+  # Normalize global options before the verb so every existing positional completion
+  # uses the same indexes. Candidate strings are never translated.
+  local lang_codes="en bg cnr cs da de el es et fi fr hr hu is it lb lt lv mk nb nl pl pt ro sk sl sq sv tr uk"
+  local global_index=1
+  while [ "$global_index" -lt "$COMP_CWORD" ]; do
+    case "${COMP_WORDS[global_index]}" in
+      --lang)
+        if [ "$COMP_CWORD" -eq "$((global_index + 1))" ]; then
+          _octo_pod_reply < <(compgen -W "$lang_codes" -- "${COMP_WORDS[COMP_CWORD]}"); return
+        fi
+        global_index=$((global_index + 2)) ;;
+      --lang=*|--bilingual) global_index=$((global_index + 1)) ;;
+      *) break ;;
+    esac
+  done
+  if [ "$global_index" -gt 1 ]; then
+    local -a normalized=("${COMP_WORDS[0]}" "${COMP_WORDS[@]:global_index}")
+    COMP_CWORD=$((COMP_CWORD - global_index + 1))
+    COMP_WORDS=("${normalized[@]}")
+  fi
   local cur prev verb i
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
@@ -82,7 +102,7 @@ _octo_pod() {
   done
 
   if [ -z "$verb" ]; then
-    _octo_pod_reply < <(compgen -W "$verbs" -- "$cur")
+    _octo_pod_reply < <(compgen -W "$verbs --lang --bilingual" -- "$cur")
     return
   fi
 

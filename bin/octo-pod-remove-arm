@@ -28,6 +28,7 @@ still be resolved to who it was. Removing a publisher should not make its past
 unreadable. --keep-key exists for the case where you are moving an arm rather than
 retiring it.
 """
+from octo_pod_i18n import t as _tr, critical as _critical
 import argparse
 import os
 import re
@@ -51,7 +52,7 @@ ARM_PREFIXES = ("octo-udp-ingest-", "octo-tcp-ingest-", "octo-tcp-connect-")
 
 
 def die(msg):
-    print(f"\nERROR: {msg}", file=sys.stderr)
+    print(_critical('\nERROR: {v0}', v0=msg), file=sys.stderr)
     sys.exit(1)
 
 
@@ -67,9 +68,9 @@ def pod_dir():
     hv = ETC / "host_vars"
     pods = [p for p in hv.iterdir() if p.is_dir()] if hv.is_dir() else []
     if not pods:
-        die(f"no pod identity under {hv} — this box is not a pod yet")
+        die(_critical('no pod identity under {v0} — this box is not a pod yet', v0=hv))
     if len(pods) > 1:
-        die(f"more than one pod under {hv}: {[p.name for p in pods]}")
+        die(_critical('more than one pod under {v0}: {v1}', v0=hv, v1=[p.name for p in pods]))
     return pods[0]
 
 
@@ -77,7 +78,7 @@ def load(path):
     try:
         import yaml
     except ImportError:
-        die("pyyaml missing — apt install python3-yaml")
+        die(_critical("pyyaml missing — apt install python3-yaml"))
     try:
         return yaml.safe_load(path.read_text()) or {}
     except (OSError, Exception):  # noqa: BLE001 — a broken file must not wedge removal
@@ -121,15 +122,15 @@ def strip_arm_block(text, arm_id):
 def main():
     ap = argparse.ArgumentParser(prog="octo-pod remove-arm|remove-peer")
     ap.add_argument("verb", nargs="?", choices=["arm", "peer"],
-                    help="which the caller believes it is; checked against the declaration")
+                    help=_tr("which the caller believes it is; checked against the declaration"))
     ap.add_argument("id")
-    ap.add_argument("--yes", action="store_true", help="do not ask (for scripts)")
+    ap.add_argument("--yes", action="store_true", help=_tr("do not ask (for scripts)"))
     ap.add_argument("--keep-key", action="store_true",
-                    help="keep the private key — for moving an arm, not retiring it")
+                    help=_tr("keep the private key — for moving an arm, not retiring it"))
     args = ap.parse_args()
 
     if os.geteuid() != 0:
-        die("run with sudo — this stops containers and deletes keys")
+        die(_critical("run with sudo — this stops containers and deletes keys"))
 
     d = pod_dir()
     # An id is declared as one or the other, never both — add-arm/add-peer reject a
@@ -141,8 +142,7 @@ def main():
     kind = "arm" if arm else ("peer" if peer else None)
     entry, decl_file = (arm, arms_file) if arm else (peer, peers_file)
     if kind and args.verb and args.verb != kind:
-        die(f"{args.id} is declared as a {kind}, not a{'n' if args.verb == 'arm' else ''} "
-            f"{args.verb}. Use: octo-pod remove-{kind} {args.id}")
+        die(_critical('{v0} is declared as a {v1}, not a{v2} {v3}. Use: octo-pod remove-{v4} {v5}', v0=args.id, v1=kind, v2='n' if args.verb == 'arm' else '', v3=args.verb, v4=kind, v5=args.id))
     running = running_containers()
 
     containers = [n for n in running if any(n == p + args.id for p in ARM_PREFIXES)]
@@ -181,8 +181,7 @@ def main():
     # with "nothing to remove", while two usable private keys sat on disk.
     strays = [q for q in (key, armkey, bundlekey) if q.exists()]
     if entry is None and not containers and not has_sink and not strays:
-        die(f"nothing to remove: {args.id} is not declared, no container of that name is "
-            f"running, and no key material for it is on disk")
+        die(_critical('nothing to remove: {v0} is not declared, no container of that name is running, and no key material for it is on disk', v0=args.id))
 
     # An orphan is a legitimate target: it is the exact state `status` reports when a
     # declaration was removed by hand and the container was left behind.
@@ -221,7 +220,7 @@ def main():
 
     if not args.yes:
         try:
-            if input("\nproceed? [y/N] ").strip().lower() not in ("y", "yes"):
+            if input(_critical("\nproceed? [y/N] ")).strip().lower() not in ("y", "yes"):
                 print("nothing was changed.")
                 return 0
         except (EOFError, KeyboardInterrupt):

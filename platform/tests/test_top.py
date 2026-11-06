@@ -22,6 +22,7 @@ import tempfile
 import time
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "bin"))
 TOP = REPO / "bin" / "octo-pod-top"
 
 
@@ -65,14 +66,14 @@ def egress_line(t, dest, sent, consumers):
 
 
 NETBIRD = {
-    "netbirdIp": "100.127.0.10/16",
+    "netbirdIp": "100.127.0.8/16",
     "management": {"url": "https://mgmt.example:443", "connected": True},
     "signal": {"url": "https://signal.example:443", "connected": True},
     "peers": {"total": 2, "connected": 1, "details": [
-        {"fqdn": "consumer-a.mesh.example", "netbirdIp": "100.127.0.18", "status": "Connected",
+        {"fqdn": "consumer-a.mesh.example", "netbirdIp": "100.127.0.16", "status": "Connected",
          "connectionType": "P2P", "latency": 4200000,
          "lastWireguardHandshake": "", "transferReceived": 2048, "transferSent": 4096},
-        {"fqdn": "laptop-b.mesh.example", "netbirdIp": "100.127.0.19", "status": "Connecting",
+        {"fqdn": "laptop-b.mesh.example", "netbirdIp": "100.127.0.17", "status": "Connecting",
          "connectionType": "-", "latency": 0,
          "lastWireguardHandshake": "0001-01-01T00:00:00Z", "transferReceived": 0,
          "transferSent": 0}]},
@@ -320,7 +321,7 @@ def run_checks(repo, check):
                         key=lambda s: s != "bad"))
         check("podman stats gives the container's CPU and memory",
               r1.get("cpu") == "1.25%" and r1.get("mem") == "12.3MB", str(r1))
-        check("the mesh is in the document", (doc.get("mesh") or {}).get("ip") == "100.127.0.10/16")
+        check("the mesh is in the document", (doc.get("mesh") or {}).get("ip") == "100.127.0.8/16")
 
         r = subprocess.run([sys.executable, str(TOP), "--once"], env=env, capture_output=True, check=False,
                            text=True, timeout=60)

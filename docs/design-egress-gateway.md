@@ -12,14 +12,14 @@ in front of a system may hold its credential · goat's release lanes
 
 ## Context and scope
 
-A pod was built for one direction. Sensors that speak no security protocol send bytes to a
+A pod was built for one direction. Sensors that implement no security protocol send bytes to a
 socket; the pod gives each one an identity and forwards what someone releases onto the
 fabric. goat ADR 1122 makes that the fleet's aggregation tier: one mesh peer, a local
 router and per-protocol arms, "fronting site systems that never enroll in the mesh
 themselves."
 
 The same sites have systems that need the fabric's data back out: a track correlator, a C2
-system, a display. Most of them have the same constraints as the sensors. They speak no
+system, a display. Most of them have the same constraints as the sensors. They do not implement
 Zenoh. Their owners will not, or may not, put a mesh client, a credential or new code on
 them. Some must not hold a fabric credential at all, because their data is handled under a
 stricter policy than the fabric's.
@@ -61,8 +61,8 @@ GOAT release policy; this document remains the detailed egress design.
 
 ### A destination mirrors an arm
 
-Ingest has three socket shapes, set by how the sensor behaves. Egress has the same three,
-set by how the receiver behaves, because the receiver already expects to talk to a sensor.
+Ingest has three socket connection types, set by how the sensor behaves. Egress has the same three,
+set by how the receiver behaves, because the receiver already expects to communicate with a sensor.
 SAPIENT adds a session-aware destination:
 
 | Arm (in) | Destination (out) | Who connects |
@@ -137,7 +137,7 @@ a shared credential is an unattributed feed. Until the pod can hold a
 fabric identity per destination, each receiver gets its own pod.
 
 Data leaving for a system outside the organization is a release in goat's terms: either it
-rides the release machinery or it is an egress nobody sees. The pod's
+uses the release controls or it is an egress path without release visibility. The pod's
 own audit records every send, but only a lane makes the release visible to the data's
 owners, so a pod that feeds an outside system reads from that system's lane.
 
@@ -146,7 +146,7 @@ owners, so a pod that feeds an outside system reads from that system's lane.
 Tested against a track correlator's ASTERIX UDP input and its TCP-client radar-one
 input, with the pod's firewall on. Both inputs received data from the pod alone. A
 receiver that queues its retries opens several connections in its first minute; the
-destination keeps the newest, and one connection then holds.
+destination keeps the newest, and one connection then stays open.
 
 ## Alternatives considered
 
@@ -182,10 +182,10 @@ much as the pod's. Settle these with them first:
 
 ## Cross-cutting concerns
 
-**Security.** The downlink bridge trusts whatever router the fabric's CA roots vouch for,
+**Security.** The downlink bridge trusts whatever router the fabric's CA roots authenticate,
 so a substituted root would let an impostor feed every destination. `release --slot`
 therefore trusts no file in the bundle until the key that signs it matches the
-fingerprint the goatnet's operators gave out of band, the signature holds, and the files
+fingerprint the goatnet's operators gave out of band, the signature verifies, and the files
 are the ones it signed; it pins the CA roots' SHA-256, and `apply` refuses any other
 roots. A UDP receiver's allow list is an address, and an address can be forged from
 the same link, so a dedicated link or VLAN, with port security, carries the destination.
@@ -204,8 +204,8 @@ shows whether the two gates agree.
   different data. The downlink bridge would hold one session per identity.
 - **Failover.** A second pod needs a floating address for serve destinations, and push
   destinations active on one pod only, or the receiver gets every datagram twice.
-- **Replacement policy.** Newest-wins let the correlator's queued retries churn for a
-  minute. Replacing only an idle or failed connection would avoid it.
+- **Replacement policy.** Replacing the oldest connection let the correlator’s queued
+  retries replace connections repeatedly for a minute. Replacing only an idle or failed connection would avoid it.
 - **Zenoh session hardening.** The pod's sessions leave multicast scouting at Zenoh's
   default, and sessions to the pen skip the certificate name check.
 - **A pod class.** A pod with destinations fits a dedicated pod-appliance class better

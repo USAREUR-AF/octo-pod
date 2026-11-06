@@ -21,6 +21,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The session, framing and wire modules are a library so the fuzz targets in ../fuzz
+# exercise the code the binary runs. The binary is unchanged.
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "sapient"
 path = "src/main.rs"

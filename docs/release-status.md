@@ -29,6 +29,6 @@ Published artifacts, deployed versions and end-to-end acceptance are separate st
 | **Translate sensor data** | Producers supply the receiver's payload format. Byte arms relay payloads unchanged. The SAPIENT arm parses the protocol envelope, filters message types and manages the session without translating detection or alert contents |
 | **Send receiver traffic back through egress** | Byte destinations discard receiver data or do not read it. SAPIENT egress consumes session replies locally and rejects tasks. Its pen grant is read-only; no receiver frame is published through this path |
 | **Store and forward** | The buffer discards rather than grows. Stale tracks are not replayed |
-| **Survive its own restart invisibly** | One router per pod. Restarting it is a pod-wide event that arms ride out |
+| **Restart without interrupting service** | One router per pod. Restarting it affects all arms; they reconnect automatically |
 | **Apply changes on its own** | Timers repair runtime faults. They never apply a configuration change |
 | **Manage other pods** | A pod converges itself. Nothing reaches into it |

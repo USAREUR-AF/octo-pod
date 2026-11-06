@@ -16,6 +16,7 @@ write, not to make applying it invisible.
 Validation is deliberately here AND in the playbook. Here it is a fast, friendly error
 before anything is written; there it is the gate that cannot be bypassed.
 """
+from octo_pod_i18n import t as _tr, critical as _critical
 import argparse
 import ipaddress
 import datetime
@@ -35,16 +36,16 @@ FEED_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def die(msg):
-    sys.exit(f"error: {msg}")
+    sys.exit(_critical('error: {v0}', v0=msg))
 
 
 def pod_dir():
     hv = ETC / "host_vars"
     pods = [p for p in hv.iterdir() if p.is_dir()] if hv.is_dir() else []
     if not pods:
-        die(f"no pod identity under {hv} — run 'octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>' first")
+        die(_critical("no pod identity under {v0} — run 'octo-pod join --setup-key-file <PATH> --mgmt <URL> --pod <name>' first", v0=hv))
     if len(pods) > 1:
-        die(f"more than one pod under {hv}: {[p.name for p in pods]}")
+        die(_critical('more than one pod under {v0}: {v1}', v0=hv, v1=[p.name for p in pods]))
     return pods[0]
 
 
@@ -52,7 +53,7 @@ def load(path):
     try:
         import yaml
     except ImportError:
-        die("pyyaml missing — apt install python3-yaml")
+        die(_critical("pyyaml missing — apt install python3-yaml"))
     return yaml.safe_load(path.read_text()) or {}
 
 
@@ -99,43 +100,43 @@ def main():
     ap.add_argument("verb", choices=["add-arm", "add-peer", "set-lan", "set-mesh", "set-firewall",
                                     "release"])
     ap.add_argument("id", nargs="?")
-    ap.add_argument("--udp", type=int, help="UDP port this publisher sends to")
-    ap.add_argument("--tcp", type=int, help="TCP port this publisher connects to")
+    ap.add_argument("--udp", type=int, help=_tr("UDP port this publisher sends to"))
+    ap.add_argument("--tcp", type=int, help=_tr("TCP port this publisher connects to"))
     # The inverse direction, and the one people get wrong. A sensor that serves its own
     # stream (radar-one class) never dials us; pointing a listening arm at one gives two
     # servers and no connection, which looks exactly like a dead feed. Declaring it was
     # a hand-edit of 30-arms.yml until this flag existed — and hand-edits are the thing
     # these commands exist to remove.
     ap.add_argument("--dial", metavar="HOST:PORT",
-                    help="dial OUT to a sensor that serves its own stream (radar-one shape)")
+                    help=_tr("dial OUT to a sensor that serves its own stream (radar-one shape)"))
     ap.add_argument("--from", dest="src",
-                    help="add-arm: their static source IP, the ONLY access control an arm has. "
+                    help=_tr("add-arm: their static source IP, the ONLY access control an arm has. "
                          "add-peer: the IPv4 addresses that may dial the pen over the LAN "
-                         "(without it a peer is mesh-only)")
-    ap.add_argument("--bind", help="address this arm listens on. Defaults to the address publishers "
+                         "(without it a peer is mesh-only)"))
+    ap.add_argument("--bind", help=_tr("address this arm listens on. Defaults to the address publishers "
                                    "reach the pod on, which is the mesh when the pod is on one — so a "
-                                   "sensor on the LAN needs this set to the pod's LAN address")
-    ap.add_argument("--feed", default="feed1", help="feed label, [A-Za-z0-9_-]")
+                                   "sensor on the LAN needs this set to the pod's LAN address"))
+    ap.add_argument("--feed", default="feed1", help=_tr("feed label, [A-Za-z0-9_-]"))
     # TCP only. Start with stream — nothing is lost, only unit boundaries — then capture a
     # few samples and set this to what you see. Without the flag a non-default framing was
     # a hand-edit, which is the one thing these commands exist to avoid.
     ap.add_argument("--framing", choices=["stream", "newline", "len32be", "len32le"],
-                    help="TCP framing (default stream). Ignored for --udp")
+                    help=_tr("TCP framing (default stream). Ignored for --udp"))
     ap.add_argument("--description", default="")
-    ap.add_argument("--iface", help="set-lan: interface your sensors reach you on")
-    ap.add_argument("--addr", help="set-lan: this box's address on it, e.g. 10.1.2.10/24")
-    ap.add_argument("--ssh-from", help="set-lan: address or CIDR list that may SSH to the pod from "
+    ap.add_argument("--iface", help=_tr("set-lan: interface your sensors reach you on"))
+    ap.add_argument("--addr", help=_tr("set-lan: this box's address on it, e.g. 10.1.2.10/24"))
+    ap.add_argument("--ssh-from", help=_tr("set-lan: address or CIDR list that may SSH to the pod from "
                                        "the LAN, e.g. a jump host; the pod firewall closes SSH to "
-                                       "everything else except the mesh")
-    ap.add_argument("--slot", help="release: the bundle directory the operator sent (PEMs, signed "
-                                   "profile, NOTES.md)")
+                                       "everything else except the mesh"))
+    ap.add_argument("--slot", help=_tr("release: the bundle directory the operator sent (PEMs, signed "
+                                   "profile, NOTES.md)"))
     ap.add_argument("--ca-fingerprint",
-                    help="release: the fingerprint of the key that signs the bundle, as the goatnet's "
-                         "operators gave it to you and `goat ca add` prints it (SHA256:<hex>)")
-    ap.add_argument("--mgmt", help="set-mesh: the mesh management server, e.g. https://netbird.example.net")
-    ap.add_argument("--repo", help="set-mesh: where octo-pod upgrade fetches releases from")
-    ap.add_argument("--portal", help="set-mesh: where publish-to-portal registers schemas")
-    ap.add_argument("--mirror", help="set-mesh: registry this pod pulls images from, e.g. localhost:5000")
+                    help=_tr("release: the fingerprint of the key that signs the bundle, as the goatnet's "
+                         "operators gave it to you and `goat ca add` prints it (SHA256:<hex>)"))
+    ap.add_argument("--mgmt", help=_tr("set-mesh: the mesh management server, e.g. https://netbird.example.net"))
+    ap.add_argument("--repo", help=_tr("set-mesh: where octo-pod upgrade fetches releases from"))
+    ap.add_argument("--portal", help=_tr("set-mesh: where publish-to-portal registers schemas"))
+    ap.add_argument("--mirror", help=_tr("set-mesh: registry this pod pulls images from, e.g. localhost:5000"))
     args = ap.parse_args()
 
     d = pod_dir()
@@ -146,7 +147,7 @@ def main():
     if args.verb == "set-firewall":
         state = (args.id or "").lower()
         if state not in ("on", "off"):
-            die("usage: octo-pod set-firewall on|off")
+            die(_critical("usage: octo-pod set-firewall on|off"))
         pod_file = d / "10-pod.yml"
         text = pod_file.read_text() if pod_file.exists() else ""
         val = "true" if state == "on" else "false"
@@ -175,9 +176,9 @@ def main():
     # hand-edit left in the install path, and hand-edits are where typos live.
     if args.verb == "set-lan":
         if not (args.iface and args.addr):
-            die("usage: octo-pod set-lan --iface eth1 --addr 10.1.2.10/24")
+            die(_critical("usage: octo-pod set-lan --iface eth1 --addr 10.1.2.10/24"))
         if "/" not in args.addr:
-            die(f"--addr {args.addr!r} needs a prefix, e.g. 10.1.2.10/24")
+            die(_critical('--addr {v0!r} needs a prefix, e.g. 10.1.2.10/24', v0=args.addr))
         ip, prefix = args.addr.split("/", 1)
         try:
             # IPv4Address, not ip_address: the prefix bound and the message are IPv4, and
@@ -186,7 +187,7 @@ def main():
             if not 0 < int(prefix) <= 32:
                 raise ValueError
         except ValueError:
-            die(f"--addr {args.addr!r} is not a valid IPv4 address with prefix")
+            die(_critical('--addr {v0!r} is not a valid IPv4 address with prefix', v0=args.addr))
 
         ssh_from = []
         for cidr in (args.ssh_from or "").split(","):
@@ -196,10 +197,9 @@ def main():
             try:
                 net = ipaddress.ip_network(cidr, strict=False)
             except ValueError:
-                die(f"--ssh-from {cidr!r} is not an address or CIDR")
+                die(_critical('--ssh-from {v0!r} is not an address or CIDR', v0=cidr))
             if net.version != 4 or net.prefixlen < 8:
-                die(f"--ssh-from {cidr!r} must be IPv4 and no wider than /8: SSH is the "
-                    "management door, and a wide range opens it to a whole network")
+                die(_critical('--ssh-from {v0!r} must be IPv4 and no wider than /8: SSH is the management door, and a wide range opens it to a whole network', v0=cidr))
             ssh_from.append(str(net))
 
         site = d / "00-site.yml"
@@ -231,16 +231,14 @@ def main():
     # arrives separately — so they stay separate commands. This prints the one that follows.
     if args.verb == "set-mesh":
         if not (args.mgmt or args.repo or args.portal or args.mirror):
-            die("usage: octo-pod set-mesh --mgmt https://<netbird-host>\n"
+            die(_critical("usage: octo-pod set-mesh --mgmt https://<netbird-host>\n"
                 "       optionally --repo <release surface>  --portal <portal url>\n"
-                "                  --mirror <registry>  (e.g. localhost:5000)")
+                "                  --mirror <registry>  (e.g. localhost:5000)"))
         if args.mgmt and not args.mgmt.startswith(("http://", "https://")):
-            die(f"--mgmt {args.mgmt!r} must be a URL, e.g. https://netbird.example.net.\n"
-                "  It must also be the address that resolves from OUTSIDE the mesh: a name\n"
-                "  that only resolves once you are already on it cannot be used to join.")
+            die(_critical('--mgmt {v0!r} must be a URL, e.g. https://netbird.example.net.\n  It must also be the address that resolves from OUTSIDE the mesh: a name\n  that only resolves once you are already on it cannot be used to join.', v0=args.mgmt))
         for u in (args.repo, args.portal):
             if u and not u.startswith(("http://", "https://")):
-                die(f"{u!r} must be a URL")
+                die(_critical('{v0!r} must be a URL', v0=u))
 
         fab = d / "05-fabric.yml"
         text = fab.read_text() if fab.exists() else ""
@@ -248,8 +246,7 @@ def main():
         # image_mirror is a registry HOST:PORT, not a URL: it is prefixed onto an image
         # reference, and "https://" in front of one produces a name the registry client cannot resolve.
         if args.mirror and args.mirror.startswith(("http://", "https://")):
-            die(f"--mirror {args.mirror!r} is a registry host:port, not a URL.\n"
-                "  It is prefixed onto image references, so drop the scheme: localhost:5000")
+            die(_critical('--mirror {v0!r} is a registry host:port, not a URL.\n  It is prefixed onto image references, so drop the scheme: localhost:5000', v0=args.mirror))
 
         for key, val in (("netbird_mgmt_host", args.mgmt),
                          ("octo_repo_url", args.repo),
@@ -279,9 +276,9 @@ def main():
     # rather than applying, because apply is still a deliberate act you read first.
     if args.verb == "release":
         if not args.id:
-            die("usage: octo-pod release <publisher-id> --slot <dir>")
+            die(_critical("usage: octo-pod release <publisher-id> --slot <dir>"))
         if not args.slot:
-            die("--slot <dir> is required: the bundle directory the operator sent")
+            die(_critical("--slot <dir> is required: the bundle directory the operator sent"))
         slot = pathlib.Path(args.slot).expanduser()
 
         # The operator's bundle names the cert for the anchor, so the anchor is derivable
@@ -304,7 +301,7 @@ def main():
 
         ids = existing_ids(d)
         if args.id not in ids:
-            die(f"{args.id} is not declared on this pod. Known: {', '.join(sorted(ids)) or 'none'}")
+            die(_critical('{v0} is not declared on this pod. Known: {v1}', v0=args.id, v1=', '.join(sorted(ids)) or 'none'))
 
         # gate 1 — the publisher's own consent, in its entry
         opened = False
@@ -330,14 +327,14 @@ def main():
                 if not n:
                     new_block = block
                 if new_block == block:
-                    die(f"{args.id} in {fn} has no 'release: to_fabric:' line to open")
+                    die(_critical("{v0} in {v1} has no 'release: to_fabric:' line to open", v0=args.id, v1=fn))
                 text = text[:block_start] + new_block + text[block_end:]
                 f.write_text(text)
                 print(f"opened release.to_fabric for {args.id} in {fn}")
             opened = True
             break
         if not opened:
-            die(f"could not find {args.id} in 30-arms.yml or 20-peers.yml")
+            die(_critical('could not find {v0} in 30-arms.yml or 20-peers.yml', v0=args.id))
 
         # gate 2 — the pod's namespace allowlist
         pod_file = d / "10-pod.yml"
@@ -345,7 +342,7 @@ def main():
         ns = f"raw/{args.id}/**"
         m = re.search(r'^bridge_allow:\s*"([^"]*)"', text, re.M)
         if not m:
-            die(f"no bridge_allow line in {pod_file}")
+            die(_critical('no bridge_allow line in {v0}', v0=pod_file))
         current = [x for x in m.group(1).split(",") if x]
         if ns in current:
             print(f"already allowed: {ns} in bridge_allow")
@@ -364,7 +361,7 @@ def main():
         text = pod_file.read_text()
         am = re.search(r'^fabric_slot_anchor:\s*"[^"]*"', text, re.M)
         if not am:
-            die(f"no fabric_slot_anchor line in {pod_file}")
+            die(_critical('no fabric_slot_anchor line in {v0}', v0=pod_file))
         if f'fabric_slot_anchor: "{anchor}"' in text:
             print("already set: fabric_slot_anchor in 10-pod.yml")
         else:
@@ -409,9 +406,9 @@ to confirm arrival.""")
         return 0
 
     if not re.match(r"^[a-z0-9][a-z0-9-]*$", args.id or ""):
-        die(f"id {args.id!r} must be lowercase alphanumeric/dashes — it becomes a namespace and a CN")
+        die(_critical('id {v0!r} must be lowercase alphanumeric/dashes — it becomes a namespace and a CN', v0=args.id))
     if args.id in existing_ids(d, egress=True):
-        die(f"{args.id} is already declared in {d}")
+        die(_critical('{v0} is already declared in {v1}', v0=args.id, v1=d))
 
     if args.verb == "add-arm":
         # `is not None`, not truthiness: --udp 0 is a value given, and it must reach the
@@ -427,7 +424,7 @@ to confirm arrival.""")
             # the sensor. `target`, not `port`, is what the arm is given.
             host, _, dport = args.dial.rpartition(":")
             if not host or not dport.isdigit() or not 0 < int(dport) < 65536:
-                die(f"--dial {args.dial!r} must be HOST:PORT, e.g. 192.0.2.104:9000")
+                die(_critical('--dial {v0!r} must be HOST:PORT, e.g. 192.0.2.104:9000', v0=args.dial))
             transport, kind, locus = "tcp", "tcp-connect", f'target: "{args.dial}"'
             # The target already names who we talk to, so --from is redundant when it is
             # an address. Derive it rather than make the operator repeat it — and say so.
@@ -435,8 +432,7 @@ to confirm arrival.""")
                 try:
                     ipaddress.ip_address(host)
                 except ValueError:
-                    die("--from is required when --dial names a hostname: allow_sources is "
-                        f"matched against the address {host!r} actually answers on")
+                    die(_critical('--from is required when --dial names a hostname: allow_sources is matched against the address {v0!r} actually answers on', v0=host))
                 args.src = host
                 print(f"note: allow_sources taken from --dial ({host})")
         else:
@@ -446,11 +442,11 @@ to confirm arrival.""")
             # The playbook checks listener ports for clashes, not range, so an out-of-range
             # port surfaced only as an arm that cannot bind. --dial has the same bound.
             if not 0 < port < 65536:
-                die(f"--{transport} {port} must be a port number, 1-65535")
+                die(_critical('--{v0} {v1} must be a port number, 1-65535', v0=transport, v1=port))
             if port in existing_ports(d):
-                die(f"port {port} is already used by another arm on this pod")
+                die(_critical('port {v0} is already used by another arm on this pod', v0=port))
             if port in (7447, 22):
-                die(f"port {port} is reserved (pen listener / ssh)")
+                die(_critical('port {v0} is reserved (pen listener / ssh)', v0=port))
 
         # WHICH LEG THIS ARM LISTENS ON. The default is the address publishers reach the
         # pod on, and that prefers the MESH when the pod has one. Right for a peer dialling
@@ -461,23 +457,22 @@ to confirm arrival.""")
             try:
                 ipaddress.ip_address(args.bind)
             except ValueError:
-                die(f"--bind {args.bind!r} is not an IP address. It is the address on THIS "
-                    "pod that the sensor sends to, usually the pod's address on the ingest LAN.")
+                die(_critical("--bind {v0!r} is not an IP address. It is the address on THIS pod that the sensor sends to, usually the pod's address on the ingest LAN.", v0=args.bind))
 
         if not FEED_RE.match(args.feed):
-            die(f"--feed {args.feed!r} must match [A-Za-z0-9_-] — the arm rejects slashes and crash-loops")
+            die(_critical('--feed {v0!r} must match [A-Za-z0-9_-] — the arm rejects slashes and crash-loops', v0=args.feed))
         if not args.src:
-            die("--from is required: an arm's publisher presents no credential, so its source "
-                "IP is both the access control and the provenance stamped into every key")
+            die(_critical("--from is required: an arm's publisher presents no credential, so its source "
+                "IP is both the access control and the provenance stamped into every key"))
         for ip in args.src.split(","):
             try:
                 ipaddress.ip_address(ip.strip())
             except ValueError:
-                die(f"--from {ip.strip()!r} is not an IP address")
+                die(_critical('--from {v0!r} is not an IP address', v0=ip.strip()))
 
         today = datetime.date.today().isoformat()
         if args.framing and transport != "tcp":
-            die("--framing applies to --tcp or --dial only; a UDP datagram is already one unit")
+            die(_critical("--framing applies to --tcp or --dial only; a UDP datagram is already one unit"))
         framing_line = f"\n    framing: {args.framing}" if args.framing else ""
         how = "dials out to" if args.dial else f"{transport} publisher"
         # Omitted entirely when not given, so the arm keeps defaulting to the address
@@ -506,10 +501,10 @@ to confirm arrival.""")
         # `transport` belongs to the add-arm branch above; this used to reference it and
         # died with an UnboundLocalError traceback instead of saying what was wrong.
         if args.framing:
-            die("--framing applies to an arm, not a peer — a peer speaks zenoh already, "
-                "so it frames its own messages")
+            die(_critical("--framing applies to an arm, not a peer — a peer speaks zenoh already, "
+                "so it frames its own messages"))
         if args.dial or args.udp or args.tcp:
-            die("--udp/--tcp/--dial apply to add-arm — a peer connects to us on its own")
+            die(_critical("--udp/--tcp/--dial apply to add-arm — a peer connects to us on its own"))
         # --from opens the pen to this peer over the LAN, from exactly these addresses.
         # Without it the peer reaches the pen over the mesh only, as before. Literal IPv4,
         # because the firewall and the playbook's declaration gate hold the same rule.
@@ -520,9 +515,9 @@ to confirm arrival.""")
                 try:
                     addr = ipaddress.IPv4Address(ip)
                 except ValueError:
-                    die(f"--from {ip!r} is not a literal IPv4 address")
+                    die(_critical('--from {v0!r} is not a literal IPv4 address', v0=ip))
                 if addr.is_unspecified:
-                    die("--from 0.0.0.0 would open the pen to anyone on the LAN")
+                    die(_critical("--from 0.0.0.0 would open the pen to anyone on the LAN"))
                 ips.append(str(addr))
             sources = f'\n    allow_sources: "{", ".join(ips)}"   # dials the pen over the LAN from these only'
         entry = f"""
@@ -556,10 +551,10 @@ to confirm arrival.""")
         import yaml
         back = yaml.safe_load(target.read_text()) or {}
     except Exception as e:
-        die(f"wrote invalid YAML to {target}: {e}")
+        die(_critical('wrote invalid YAML to {v0}: {v1}', v0=target, v1=e))
     ids = [x.get("id") for x in (back.get(key) or [])]
     if args.id not in ids:
-        die(f"{target} does not contain {args.id} after the write — file left as is, inspect it")
+        die(_critical('{v0} does not contain {v1} after the write — file left as is, inspect it', v0=target, v1=args.id))
 
     print(f"declared {args.id} in {target}")
     print("\nNothing on the pod has changed yet. Next:")

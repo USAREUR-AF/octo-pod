@@ -29,8 +29,8 @@ fabric_endpoint: "tls/zenoh.example.net:7447"
 # One line per address. The `names` string may hold several names for one host, space
 # separated, exactly as /etc/hosts wants them.
 fabric_host_pins:
-  - { ip: "100.127.0.10", names: "netbird.example.net" }
-  - { ip: "100.127.0.11", names: "zenoh.example.net portal.example.net" }
+  - { ip: "100.127.0.8", names: "netbird.example.net" }
+  - { ip: "100.127.0.9", names: "zenoh.example.net portal.example.net" }
 
 # Where publish-to-portal.yml registers topics and data dictionaries. A different control
 # plane from the bridge, and a different credential; the pod itself never calls it.
