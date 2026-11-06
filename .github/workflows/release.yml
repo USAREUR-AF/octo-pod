@@ -448,6 +448,32 @@ jobs:
             gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --latest
           fi
 
+      # THE SAME FLAKE CAN DROP A FILE. After a large upload the uploader updates the file's
+      # metadata, GitHub has not indexed the file yet, the call returns Not Found, and the
+      # uploader continues. 0.6.0 lost octo-pod-images-0.6.0.tar.gz.sha256 this way. Every
+      # file the publish step was asked to attach, and that the release does not have, is
+      # uploaded again here from dist/. Nothing that is already present is replaced, so a
+      # file already published is never swapped for another. The gate below still judges
+      # the result.
+      - name: publish — upload again any file the uploader lost
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tag="octo-pod-v${{ steps.v.outputs.version }}"
+          have="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          # The same files the publish step's `files:` list names.
+          for f in dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.deb dist/*.deb.sha256 \
+                   dist/SHA256SUMS* dist/index.html dist/LATEST; do
+            name="$(basename "$f")"
+            if ! printf '%s\n' "$have" | grep -qxF "$name"; then
+              echo "::warning::${name} is missing from ${tag}; uploading it again"
+              gh release upload "$tag" "$f" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+
       # THE ACTUAL RELEASE GATE. Everything above produced artifacts and pushed them; this
       # asks the published release what it now contains, and fails only on an answer that is
       # wrong. Verified the way a consumer verifies it — downloaded back out of the release,

@@ -209,6 +209,65 @@ def release_signed_tag_checks():
           r.returncode == 1 and "does not point at the commit" in r.stdout, (r.stdout + r.stderr).strip())
 
 
+def release_lost_asset_checks():
+    """A file the uploader lost to a flaky metadata call is uploaded again, and nothing
+    already published is replaced. Runs the workflow's own step against a stub `gh`."""
+    import os
+    import shutil
+    import yaml
+    print("\nrelease lost-file repair: .github/workflows/release.yml")
+    wf = yaml.safe_load((REPO / ".github" / "workflows" / "release.yml").read_text())
+    steps = wf["jobs"]["build"]["steps"]
+    names = [s.get("name") or s.get("id") or s.get("uses", "") for s in steps]
+    repair = "publish — upload again any file the uploader lost"
+    draft = "publish — the uploader leaves it a draft when its last call flakes"
+    gate = "the release is complete and verifiable"
+    check("the build job uploads again any file the uploader lost", repair in names)
+    if repair not in names:
+        return
+    check("it runs after the draft repair and before the release gate",
+          names.index(draft) < names.index(repair) < names.index(gate), str(names))
+    step = steps[names.index(repair)]
+    check("it never replaces a published file", "--clobber" not in step["run"])
+    script = step["run"].replace("${{ steps.v.outputs.version }}", "9.9.9")
+    dist_files = ["octo-pod-9.9.9.tar.gz", "octo-pod-9.9.9.tar.gz.sha256", "octo-pod_9.9.9_all.deb",
+                  "octo-pod_9.9.9_all.deb.sha256", "octo-pod-images-9.9.9.tar.gz",
+                  "octo-pod-images-9.9.9.tar.gz.sha256", "SHA256SUMS", "SHA256SUMS.cosign-bundle",
+                  "SHA256SUMS.sigstore.json", "index.html", "LATEST"]
+
+    def run(published):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp)
+            (work / "dist").mkdir()
+            for f in dist_files:
+                (work / "dist" / f).write_text(f)
+            bindir = work / "bin"
+            bindir.mkdir()
+            (work / "assets").write_text("".join(f + "\n" for f in published))
+            log = work / "uploads"
+            stub = bindir / "gh"
+            stub.write_text(
+                "#!/bin/sh\n"
+                f'if [ "$1 $2" = "release view" ]; then cat "{work}/assets"; exit 0; fi\n'
+                f'if [ "$1 $2" = "release upload" ]; then echo "$*" >> "{log}"; exit 0; fi\n'
+                'echo "unexpected: $*" >&2; exit 1\n')
+            stub.chmod(0o755)
+            env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}",
+                       GITHUB_REPOSITORY="example/octo-pod")
+            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, cwd=work)
+            uploads = log.read_text().splitlines() if log.exists() else []
+            return r, uploads
+
+    lost = "octo-pod-images-9.9.9.tar.gz.sha256"
+    r, uploads = run([f for f in dist_files if f != lost])
+    check("only the lost file is uploaded again",
+          r.returncode == 0 and len(uploads) == 1 and f"dist/{lost}" in uploads[0]
+          and "--clobber" not in uploads[0], (r.stdout + r.stderr + str(uploads)).strip())
+    r, uploads = run(dist_files)
+    check("a complete release uploads nothing", r.returncode == 0 and uploads == [],
+          (r.stdout + r.stderr + str(uploads)).strip())
+
+
 def release_provenance_checks():
     """The release's provenance describes exactly what the signed manifest lists.
 
@@ -425,6 +484,7 @@ def main():
                                      "ansible-core", "bash-completion")), depends)
 
     release_signed_tag_checks()
+    release_lost_asset_checks()
     release_provenance_checks()
     release_docs_checks()
     release_reproducible_checks()
