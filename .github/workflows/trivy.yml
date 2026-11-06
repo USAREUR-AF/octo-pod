@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+#
+# Scan the container images that pods run for known vulnerabilities: every image pinned
+# by digest in platform/group_vars/all/10-infrastructure.yml, the arms and the upstream
+# router and audit images alike. cargo-audit, cargo-deny, osv-scanner and pip-audit cover
+# the dependency files; nothing else looks inside the built images.
+#
+# REPORT ONLY for now: findings never fail this workflow, only a scan that cannot run.
+# It becomes a gate once the first findings are triaged.
+#
+# NOTHING DETAILED GOES IN THIS LOG. When the repository is public, anyone can read
+# workflow logs, run summaries and workflow artifacts. The log and the run summary carry
+# counts only, and no artifact is uploaded. The full findings go to code scanning, which
+# only maintainers and security roles can read. That upload runs when the repository has
+# code scanning, which is from the day it is public.
+name: trivy
+
+on:
+  schedule:
+    - cron: '23 5 * * *'   # daily: new advisories appear without any change here
+  push:
+    branches: [main]
+    paths: ['platform/group_vars/all/10-infrastructure.yml', '.github/workflows/trivy.yml']
+  pull_request:
+    paths: ['.github/workflows/trivy.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  list:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      images: ${{ steps.pins.outputs.images }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: the images pods run
+        id: pins
+        run: |
+          set -euo pipefail
+          images=$(sed -n 's/^[a-z_]*_image_upstream: *"\([^"]*@sha256:[0-9a-f]\{64\}\)".*/\1/p' \
+                     platform/group_vars/all/10-infrastructure.yml | sort -u | jq -R . | jq -sc .)
+          [ "$(jq length <<<"$images")" -gt 0 ] || { echo "::error::no pinned images found"; exit 1; }
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: list
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read          # the arm images are private packages until the flip
+      security-events: write  # the SARIF upload to code scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.list.outputs.images) }}
+    env:
+      # Pinned by digest, like semgrep. 0.76.1, released 2026-10-21.
+      TRIVY: aquasec/trivy@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+      IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: scan (counts only in this log)
+        id: scan
+        run: |
+          set -euo pipefail
+          name="$(basename "${IMAGE%@*}")"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          trivy() {
+            docker run --rm -v "$HOME/.docker/config.json:/root/.docker/config.json:ro" \
+              -v "$PWD/out:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" "$@"
+          }
+          trivy image --quiet --format json --output "/out/$name.json" "$IMAGE" >/dev/null
+          trivy convert --format sarif --output "/out/$name.sarif" "/out/$name.json" >/dev/null
+          read -r crit high fixable < <(jq -r '[.Results[]?.Vulnerabilities[]?]
+            | [ (map(select(.Severity == "CRITICAL")) | length),
+                (map(select(.Severity == "HIGH")) | length),
+                (map(select((.Severity == "HIGH" or .Severity == "CRITICAL")
+                            and ((.FixedVersion // "") != ""))) | length) ] | @tsv' "out/$name.json")
+          echo "trivy: $name critical=$crit high=$high fixable_high_or_critical=$fixable"
+          {
+            echo "| Image | Critical | High | High or critical with a fix |"
+            echo "|---|---:|---:|---:|"
+            echo "| $name | $crit | $high | $fixable |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: full findings to code scanning (maintainers only)
+        if: github.event.repository.visibility == 'public'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
+        with:
+          sarif_file: out/${{ steps.scan.outputs.name }}.sarif
+          category: trivy-${{ steps.scan.outputs.name }}
