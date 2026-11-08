@@ -52,6 +52,17 @@ and its CVE identifier. Reporters are credited by name unless they ask not to be
 
 If the maintainers decide that a report is not a vulnerability, they tell you why.
 
+Confirmed critical vulnerabilities take priority and receive urgent remediation.
+Do not publish a production release knowingly retaining an applicable medium-or-higher
+vulnerability that has been public for more than 60 days. Triage static and dynamic
+analysis findings and fix confirmed exploitable findings promptly. Any determination
+that a finding does not apply must record the affected versions, rationale, owner
+and review date; suppressing a finding is not a fix.
+
+Keep report receipt, initial response, confirmation and remediation timestamps in the
+private tracker. These records establish response performance; the targets above
+alone do not prove historical compliance.
+
 ## Supported Versions
 
 | Version | Security fixes |

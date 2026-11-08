@@ -39,11 +39,15 @@ status: enforced by the platform, automated, done by hand, or not yet in place.
 7. **Approve.** The release job waits in the `release` environment until a release
    approver other than the person who pushed the tag approves it.
 8. **Release.** `release.yml` refuses a tag that is lightweight, that GitHub does not
-   verify as signed, or that does not match `VERSION`. It then builds the package and
+   verify as signed, or that does not match `VERSION`. It requires successful CI and
+   default CodeQL runs for the exact commit on `main`, taking the latest attempt of
+   each workflow, and successful batch fuzzing of the tag before building. It then builds the package and
    the carried image bundle, refuses a bundle that does not carry every pinned digest,
    signs `SHA256SUMS` with a keyless Sigstore certificate issued to this repository's
    release workflow, verifies that signature the way a pod will, publishes the release,
    and attaches SLSA provenance for every file that `SHA256SUMS` lists.
+   The release page includes the version's human-written CHANGELOG.md section;
+   missing, duplicate or empty sections prevent publication.
 9. **Install.** `tools/install-to-pod.sh` downloads the release, verifies the signature
    on `SHA256SUMS`, checks each file against it, and only then copies the package to the
    pod. It checks the hash again before `dpkg` reads the file. The checks have no skip
@@ -104,6 +108,9 @@ sha256sum -c --ignore-missing SHA256SUMS
 | Signed provenance attestation on each image | Automated after merge |
 | Image digest pins signed by `images.yml` on `main` (`signed-pins`) | Runs on every pull request; not yet required |
 | Signed, verified release tag | Enforced by the release workflow |
+| Exact-commit CI and CodeQL results, latest attempt successful | Enforced by the release workflow on tags |
+| Batch fuzzing with AddressSanitizer and debug assertions | Required before tag release builds |
+| Human-readable version notes | Extracted from CHANGELOG.md; missing or empty sections refused |
 | Approval before a release, by a second person | Enforced by the `release` environment; administrators can bypass |
 | Release signing and self-verification | Automated |
 | SLSA provenance for every release file | Automated |
