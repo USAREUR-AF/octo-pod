@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 <!-- badges: the public repository's live status. The documentation book leaves this block out. -->
 [![CI](https://github.com/USAREUR-AF/octo-pod/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/USAREUR-AF/octo-pod/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/USAREUR-AF/octo-pod/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/USAREUR-AF/octo-pod/actions/workflows/codeql.yml)
+[![CodeQL](https://github.com/USAREUR-AF/octo-pod/actions/workflows/github-code-scanning/codeql/badge.svg?branch=main)](https://github.com/USAREUR-AF/octo-pod/actions/workflows/github-code-scanning/codeql)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/USAREUR-AF/octo-pod/badge)](https://scorecard.dev/viewer/?uri=github.com/USAREUR-AF/octo-pod)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/USAREUR-AF/octo-pod?sort=semver)](https://github.com/USAREUR-AF/octo-pod/releases/latest)
