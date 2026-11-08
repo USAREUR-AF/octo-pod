@@ -214,8 +214,6 @@ sudo octo-pod top
 
 ## Development
 
-For maintainers: [open-source and OpenSSF pocket guides](https://github.com/USAREUR-AF/octo-pod/tree/main/docs/pocket-guides) explain test validation, public release preparation, and ongoing project ownership.
-
 See [Contributing](https://github.com/usareur-af/octo-pod/blob/main/CONTRIBUTING.md)
 for source builds, tests and image publishing. The [changelog](CHANGELOG.md) records
 released and unreleased changes.
