@@ -707,6 +707,9 @@ def main():
     from test_audit_shell import run_checks as run_audit_shell_checks
     run_audit_shell_checks(REPO, check)
 
+    from test_deprovision import run_checks as run_deprovision_checks
+    run_deprovision_checks(REPO, check)
+
     from test_audit_tools import run_checks as run_audit_tools_checks
     run_audit_tools_checks(REPO, check)
 

@@ -57,7 +57,7 @@ done
 
   <user@host>   the pod, over ssh. Omit only with --print.
   --pod <name>  the machine handle. Read from the pod's identity when it has one,
-                which it does not immediately after a deprovision, so pass it then.
+                which it does not after deprovision --purge-data, so pass it then.
   --print       print the key instead of staging it, for a pod you cannot ssh to.
                 It goes to stdout so you can pipe it; nothing else does.
   --dest        where to write it on the pod (default $DEST). /root is deliberate:
@@ -74,7 +74,7 @@ command -v goat >/dev/null 2>&1 \
 # does not use is a false alarm, and a warning that fires on every successful run teaches
 # people to ignore warnings. Verified: mesh-key succeeds with neither variable set.
 
-# THE POD NAME, from the identity when there is one. After a deprovision there is not,
+# THE POD NAME, from the identity when there is one. After deprovision --purge-data there is not,
 # which is exactly when you need a key, so --pod covers it.
 if [ -z "$POD" ] && [ -n "$TARGET" ]; then
   POD="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" \
@@ -82,7 +82,7 @@ if [ -z "$POD" ] && [ -n "$TARGET" ]; then
   [ -n "$POD" ] && ok "pod name from its identity: $POD"
 fi
 [ -n "$POD" ] || die "could not tell which machine this is. The pod has no identity yet,
-  which is normal right after a deprovision. Name it:
+  which is normal after deprovision --purge-data. Name it:
     $0 $TARGET --pod <machine-handle>"
 
 step 1/2 "mint a one-off key for '$POD'"

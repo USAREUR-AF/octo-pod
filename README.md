@@ -205,6 +205,7 @@ sudo octo-pod top
 | Publish captured feeds to the fabric | [Publishing upstream](docs/operations.md#publishing-upstream) |
 | Deliver fabric data to a receiver | [Egress](docs/operations.md#sending-fabric-data-to-a-system-that-cannot-join) |
 | Connect a Zenoh-native partner | [Partner guide](docs/guide-zenoh-partners.md) |
+| Remove or retire a pod | [Removal and rebuild](docs/upgrading.md#remove-or-rebuild-a-pod) |
 | Enforce source-address rules | [Firewall](docs/operations.md#the-pod-firewall) |
 | Upgrade or rebuild an existing pod | [Upgrades](docs/upgrading.md) |
 | Diagnose a failed step | [Troubleshooting](docs/operations.md#troubleshooting) |
