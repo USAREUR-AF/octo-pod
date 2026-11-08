@@ -31,3 +31,6 @@ dist/
 
 # Python coverage output (platform/tests/run_with_coverage.py)
 /coverage/
+
+# Locally rendered pocket editions.
+docs/pocket-guides/build/

@@ -24,6 +24,9 @@ Use the private process in SECURITY.md for vulnerabilities.
 The [OpenSSF evidence worksheet](docs/openssf-passing.md) records assessed practices
 and outstanding evidence. It is not a claim that the project has earned a badge.
 
+Read the [open-source and OpenSSF pocket guides](docs/pocket-guides/README.md) for
+practical test design, release evidence, and maintainer responsibilities.
+
 ## First-Time Setup
 
 Every commit on `main` is signed, and every commit carries a Developer Certificate of

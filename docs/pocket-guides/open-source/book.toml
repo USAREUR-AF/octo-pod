@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+theme = "field"
+title = "Open Sourcing a Repository: Pocket Guide"
+author = "Joshua Millett"
+subject = "Practical open-source engineering"
+trim = "pocket"
+source = "chapters"
+output = "../build/open-source.pdf"
+html_output = "../build/open-source/index.html"
+fail_on_dashes = true
+honor_col_widths = true
+
+[cover]
+title = "Open Sourcing a Repository"
+series = "Pocket Guide"
+dek = "Prepare, test, publish, and maintain a project people can use"
+topline = "EDITORIAL DRAFT"
+brand = "PLATFORM FIELD MANUAL"
+brandsub = "POCKET GUIDES"
+edition = "FIRST EDITION · %B %Y"
