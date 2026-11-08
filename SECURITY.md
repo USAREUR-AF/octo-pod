@@ -134,10 +134,10 @@ standard Sigstore bundle that releases from 0.6.0 carry, and the keys in a check
 this repository:
 
 ```sh
-gh release download octo-pod-v<version> --repo DesertGOAT/octo-pod -p SHA256SUMS.sigstore.json
+gh release download octo-pod-v<version> --repo usareur-af/octo-pod -p SHA256SUMS.sigstore.json
 cosign verify-blob --new-bundle-format --bundle SHA256SUMS.sigstore.json \
   --trusted-root platform/sigstore/trusted_root.json \
-  --certificate-identity-regexp '^https://github\.com/(?i:DesertGOAT/octo-pod)/\.github/workflows/release\.yml@refs/tags/octo-pod-v' \
+  --certificate-identity-regexp '^https://github\.com/(?i:usareur-af/octo-pod)/\.github/workflows/release\.yml@refs/tags/octo-pod-v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
 ```
 
