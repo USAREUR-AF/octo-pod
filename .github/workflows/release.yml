@@ -49,7 +49,17 @@ permissions:
   contents: read   # read-only by default; jobs that need more ask for it
 
 jobs:
+  release-fuzz:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/cflite_batch.yml
+    permissions:
+      contents: read
+      actions: read
+
   build:
+    needs: release-fuzz
+    # A skipped tag-only fuzz job must not suppress manual build-only dry runs.
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs.release-fuzz.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     # A RELEASE NEEDS A SECOND PERSON. Tag runs wait in the protected `release`
@@ -120,6 +130,12 @@ jobs:
           fi
           echo "${GITHUB_REF_NAME} is signed by $(jq -r '.tagger.name' <<<"$tag"), and GitHub verifies the signature"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: exact release commit passed CI and CodeQL
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/release-evidence.py checks --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA"
 
       - name: version — the tag and the tree agree
         id: v
@@ -379,6 +395,59 @@ jobs:
       #
       # So the upload is allowed to be flaky and the step AFTER it decides, by asking the
       # published release what it actually contains. Prove function, not process.
+      - name: human-written release notes
+        if: startsWith(github.ref, 'refs/tags/octo-pod-v')
+        env:
+          RELEASE_VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 tools/release-evidence.py notes --version "$RELEASE_VERSION" --output "$RUNNER_TEMP/release-notes.md"
+          cat >> "$RUNNER_TEMP/release-notes.md" <<'GUIDANCE'
+
+          ## Verify first
+
+              cosign verify-blob \
+                --bundle SHA256SUMS.cosign-bundle \
+                --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                SHA256SUMS
+              sha256sum -c --ignore-missing SHA256SUMS
+
+          `SHA256SUMS.sigstore.json` carries the same signature in the standard Sigstore
+          bundle format, for `cosign verify-blob --new-bundle-format` and other Sigstore
+          clients.
+
+          ## Verify build provenance (SLSA Build Level 3)
+
+              slsa-verifier verify-artifact octo-pod-${{ steps.v.outputs.version }}.tar.gz \
+                --provenance-path octo-pod-${{ steps.v.outputs.version }}.intoto.jsonl \
+                --source-uri github.com/${{ github.repository }} \
+                --source-tag ${{ github.ref_name }}
+
+          `octo-pod-docs-${{ steps.v.outputs.version }}.tar.gz`, when present, is the
+          documentation site for this release. Unpack it and open `index.html`.
+
+          ## Install on a pod
+
+              sudo mkdir -p /opt/octo-pod-${{ steps.v.outputs.version }}
+              sudo tar -xzf octo-pod-${{ steps.v.outputs.version }}.tar.gz \
+                -C /opt/octo-pod-${{ steps.v.outputs.version }}
+              sudo ln -sfn /opt/octo-pod-${{ steps.v.outputs.version }} /opt/octo-pod
+              sudo /opt/octo-pod/bin/octo-pod bootstrap
+
+          Or install the `.deb` **by file** — there is no `octo-pod` apt repository, so
+          nothing below goes looking for one. The second line installs the three
+          dependencies the first will report as missing:
+
+              sudo dpkg -i ./octo-pod_${{ steps.v.outputs.version }}_all.deb
+              sudo apt-get install -f -y
+
+          After that, `sudo octo-pod upgrade` handles every later version and verifies
+          this same signature itself.
+
+          A pod's identity in /etc/octo-pod is not touched by installing or upgrading.
+          GUIDANCE
+
       - name: publish
         id: publish
         continue-on-error: true
@@ -397,49 +466,7 @@ jobs:
             dist/SHA256SUMS*
             dist/index.html
             dist/LATEST
-          body: |
-            ## Verify first
-
-                cosign verify-blob \
-                  --bundle SHA256SUMS.cosign-bundle \
-                  --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \
-                  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-                  SHA256SUMS
-                sha256sum -c --ignore-missing SHA256SUMS
-
-            `SHA256SUMS.sigstore.json` carries the same signature in the standard Sigstore
-            bundle format, for `cosign verify-blob --new-bundle-format` and other Sigstore
-            clients.
-
-            ## Verify build provenance (SLSA Build Level 3)
-
-                slsa-verifier verify-artifact octo-pod-${{ steps.v.outputs.version }}.tar.gz \
-                  --provenance-path octo-pod-${{ steps.v.outputs.version }}.intoto.jsonl \
-                  --source-uri github.com/${{ github.repository }} \
-                  --source-tag ${{ github.ref_name }}
-
-            `octo-pod-docs-${{ steps.v.outputs.version }}.tar.gz`, when present, is the
-            documentation site for this release. Unpack it and open `index.html`.
-
-            ## Install on a pod
-
-                sudo mkdir -p /opt/octo-pod-${{ steps.v.outputs.version }}
-                sudo tar -xzf octo-pod-${{ steps.v.outputs.version }}.tar.gz \
-                  -C /opt/octo-pod-${{ steps.v.outputs.version }}
-                sudo ln -sfn /opt/octo-pod-${{ steps.v.outputs.version }} /opt/octo-pod
-                sudo /opt/octo-pod/bin/octo-pod bootstrap
-
-            Or install the `.deb` **by file** — there is no `octo-pod` apt repository, so
-            nothing below goes looking for one. The second line installs the three
-            dependencies the first will report as missing:
-
-                sudo dpkg -i ./octo-pod_${{ steps.v.outputs.version }}_all.deb
-                sudo apt-get install -f -y
-
-            After that, `sudo octo-pod upgrade` handles every later version and verifies
-            this same signature itself.
-
-            A pod's identity in /etc/octo-pod is not touched by installing or upgrading.
+          body_path: ${{ runner.temp }}/release-notes.md
 
       # REPAIR THE KNOWN FLAKE BEFORE JUDGING IT. softprops/action-gh-release creates the
       # release as a DRAFT, uploads into it, then flips it to published as its last act.

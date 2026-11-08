@@ -14,6 +14,16 @@ merged, and how releases are published. Report security issues privately, as
 Open an issue before a large change, so the approach is agreed before the work. Small
 fixes can go straight to a pull request.
 
+Submit ordinary bugs and enhancement requests through the
+[issue tracker](https://github.com/USAREUR-AF/octo-pod/issues). Include the version,
+expected and actual behavior, and a minimal example without site data or credentials.
+English reports and comments are welcome. Maintainers aim to acknowledge ordinary
+reports within 14 days; issues and responses remain searchable in the public archive.
+Use the private process in SECURITY.md for vulnerabilities.
+
+The [OpenSSF evidence worksheet](docs/openssf-passing.md) records assessed practices
+and outstanding evidence. It is not a claim that the project has earned a badge.
+
 ## First-Time Setup
 
 Every commit on `main` is signed, and every commit carries a Developer Certificate of
@@ -279,6 +289,17 @@ Maintainers publish releases. The version is recorded in `VERSION` and follows
 [Semantic Versioning](https://semver.org/); while it is below 1.0, a minor version may
 break compatibility. A release is a signed tag `octo-pod-v<version>`, and a release
 candidate is `octo-pod-v<version>-rc.<n>`.
+
+Before tagging, wait for CI and default CodeQL analysis to succeed on the exact `main`
+commit. Tag releases also require the batch fuzz suite with AddressSanitizer and
+debug assertions before the build can proceed. Fix a failed candidate and rerun the
+checks; do not disable the gates. Manual dry runs do not publish releases.
+
+Write a nonempty version section in CHANGELOG.md describing major changes and upgrade
+impact. Include the identifiers of publicly known project vulnerabilities fixed by
+that release when those identifiers were assigned at release time. Keep embargoed
+details private until coordinated disclosure. The release page includes this section
+before its verification and installation instructions.
 
 Create the tag with your signing key. GitHub must be able to verify the signature, so
 the key must be registered on your GitHub account as a signing key:
