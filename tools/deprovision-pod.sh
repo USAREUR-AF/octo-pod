@@ -1,249 +1,204 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
 # SPDX-License-Identifier: Apache-2.0
-# deprovision-pod.sh — put a pod back to a bare box, so the install can be tested again.
-#
-#   tools/deprovision-pod.sh <user>@<pod-ip>
-#   tools/deprovision-pod.sh <user>@<pod-ip> --yes        skip the confirmation
-#   tools/deprovision-pod.sh <user>@<pod-ip> --wipe-stage also drop the carried bundle
-#
-# WHY THIS EXISTS. Testing the install path means running it on a box that has never had
-# it, and there is exactly one of those per box unless something puts it back. Doing that
-# by hand is nine commands, and the two that are easy to forget — the apt keyring
-# directory and the netbird agent — are the two whose absence the install is supposed to
-# handle. Forget them and you test the easy path every time, which is how a bug that only
-# bites a fresh box survives a dozen "clean" runs.
-#
-# THE COUNTERPART TO install-to-pod.sh, and driven the same way: from a laptop, over ssh.
-# That is not a stylistic choice. A deprovision that runs ON the pod would be removing the
-# package it is executing from, and bash reads a script incrementally — deleting it
-# mid-run is a hang or a syntax error at a random line, depending on timing.
-#
-# WHAT IT KEEPS BY DEFAULT. /opt/octo-stage — the carried image bundle. It is ~300 MB, it
-# is not what any of this is testing, and re-copying it over a LAN before every run turns
-# a two-minute test into a twenty-minute one. --wipe-stage when you want true bare metal.
-#
-# WHAT IT NEVER TOUCHES. The OS, the user, ssh, the network config. A box you cannot log
-# back into is not deprovisioned, it is bricked.
+# Run from the operator workstation: the target package is removed during cleanup.
 set -euo pipefail
-
 TARGET=""
 ASSUME_YES=0
+PURGE_DATA=0
 WIPE_STAGE=0
-KEEP_IMAGES=0
 KEEP_NETBIRD=0
 KEEP_PEER=0
-STAGE_DIR="/opt/octo-stage"
-
-# Same colour contract as install-to-pod.sh: off when stdout is not a terminal, off when
-# NO_COLOR is set. Green worked, yellow read this, red stopped.
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
-  C_RST=$'\033[0m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'
-  C_YEL=$'\033[33m'; C_CYA=$'\033[36m'; C_BLD=$'\033[1m'
-else
-  C_RST=""; C_RED=""; C_GRN=""; C_YEL=""; C_CYA=""; C_BLD=""
-fi
-
-die()  { printf '\n%sERROR:%s %s\n' "${C_RED}${C_BLD}" "$C_RST" "$*" >&2; exit 1; }
-step() { printf '\n%s[%s]%s %s\n' "$C_CYA" "$1" "$C_RST" "$2"; }
-ok()   { printf '    %s✓%s %s\n' "$C_GRN" "$C_RST" "$*"; }
-warn() { printf '    %s!%s %s\n' "$C_YEL" "$C_RST" "$*"; }
-indent() { sed 's/^/      /'; }
-
-while [ $# -gt 0 ]; do
+usage() {
+  cat <<'HELP'
+Usage: deprovision-pod.sh user@host [--yes] [--purge-data] [--wipe-stage]
+Remove octo-pod services and software, preserving identity, keys and retained data.
+  --purge-data     permanently erase pod identity, keys, data and NetBird state;
+                   also remove NetBird and attempt removal of its mesh peer
+  --wipe-stage     also erase /opt/octo-stage (independent of --purge-data)
+  --keep-netbird   with --purge-data, preserve NetBird and its peer/state
+  --keep-peer      skip server-side peer removal; requires manual retirement
+  --keep-images   accepted for compatibility; shared container images always stay
+  --yes, -y       skip confirmation, but never bypass preflight checks
+Use a LAN or console-accessible address for --purge-data. See docs/upgrading.md.
+HELP
+}
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+while [ "$#" -gt 0 ]; do
   case "$1" in
-    --yes|-y)      ASSUME_YES=1; shift ;;
-    --wipe-stage)  WIPE_STAGE=1; shift ;;
-    --keep-images) KEEP_IMAGES=1; shift ;;
-    --keep-docker) KEEP_IMAGES=1; shift ;;   # legacy alias, pre-podman
-    --keep-netbird) KEEP_NETBIRD=1; shift ;;
-    --keep-peer)   KEEP_PEER=1; shift ;;
-    -h|--help)     sed -n '2,8p' "$0"; exit 0 ;;
-    -*)            die "unknown option: $1" ;;
-    *)             TARGET="$1"; shift ;;
+    --yes|-y) ASSUME_YES=1 ;;
+    --purge-data) PURGE_DATA=1 ;;
+    --wipe-stage) WIPE_STAGE=1 ;;
+    --keep-netbird) KEEP_NETBIRD=1 ;;
+    --keep-peer) KEEP_PEER=1 ;;
+    --keep-images|--keep-docker) : ;;
+    --help|-h) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) [ -z "$TARGET" ] || die 'only one target is supported'; TARGET="$1" ;;
   esac
+  shift
 done
-
-[ -n "$TARGET" ] || die "usage: $0 <user@host> [--yes] [--wipe-stage] [--keep-images] [--keep-netbird]
-
-  <user@host>      the pod, over ssh. You must already be able to 'ssh <user@host>'.
-  --yes            do not ask. For scripted test loops.
-  --wipe-stage     also delete $STAGE_DIR, the carried image bundle (~300 MB).
-                   Without this the bundle is kept, so the next install can run
-                   airgapped without copying it again.
-  --keep-images    leave octo-pod's container images in podman storage. Faster,
-                   but then the next provision does NOT exercise the image path —
-                   which is where fresh-box bugs live. (The runtime itself always
-                   stays: podman belongs to the base image, not to octo-pod.)
-  --keep-netbird   leave the netbird agent installed. Same trade-off.
-  --keep-peer      leave this pod's peer registered on the mesh. Without this, the
-                   peer is cut, because a wiped box cannot cut its own."
-
-# WHAT IS ACTUALLY THERE, read before anything is destroyed rather than after. An
-# operator about to wipe a box should see what they are wiping, and a box that turns out
-# not to be a pod at all is the one where you want to notice before the rm.
-step 1/3 "what is on $TARGET"
-ssh -o ConnectTimeout=10 "$TARGET" 'test -f /etc/octo-pod/inventory.ini' \
-  || die "target has no octo-pod inventory; refusing to deprovision"
-INVENTORY="$(ssh -o ConnectTimeout=10 "$TARGET" '
-  v=$(dpkg -s octo-pod 2>/dev/null | sed -n "s/^Version: //p")
-  echo "octo-pod:   ${v:-not installed}"
-  echo "identity:   $([ -d /etc/octo-pod ] && echo "present ($(ls /etc/octo-pod/host_vars 2>/dev/null | tr "\n" " "))" || echo none)"
-  echo "pen state:  $([ -d /var/lib/octo-pen ] && du -sh /var/lib/octo-pen 2>/dev/null | cut -f1 || echo none)"
-  echo "containers: $(sudo -n podman ps -aq 2>/dev/null | wc -l | tr -d " ") "
-  echo "podman:     $(podman --version 2>/dev/null || echo "not installed")"
-  echo "netbird:    $(netbird version 2>/dev/null || echo "not installed")"
-  echo "bundle:     $([ -d '"$STAGE_DIR"' ] && du -sh '"$STAGE_DIR"' 2>/dev/null | cut -f1 || echo none)"
-')" || die "could not inspect $TARGET. Check you can 'ssh $TARGET'."
-
-# THE PEER NAME, read while the identity still exists. A pod enrols under its pod name
-# as hostname, and after the wipe there is nothing left on the box that knows what that
-# was. Captured here or not at all.
-POD_NAME="$(ssh -o ConnectTimeout=10 "$TARGET" 'ls /etc/octo-pod/host_vars 2>/dev/null | head -1' || true)"
-
-# THE MESH IP, and it is the selector rather than the name. Every rebuild of a pod
-# registers a NEW peer under the SAME hostname, so by the second rebuild the name matches
-# several and `goat admin peer cut` refuses a selector that is not unique. Cutting by the
-# address this box holds right now names exactly the peer this box is about to stop being.
-POD_MESH_IP="$(ssh -o ConnectTimeout=10 "$TARGET" \
-  'sudo -n netbird status 2>/dev/null | sed -n "s/.*NetBird IP: *\([0-9.]*\).*/\1/p" | head -1' || true)"
-printf '%s\n' "$INVENTORY" | indent
-
-if [ "$ASSUME_YES" != 1 ]; then
-  printf '\n  This DESTROYS the pod on %s: package, identity, pen CA and every\n' "$TARGET"
-  printf '  certificate it ever issued, all containers and images%s.\n' \
-    "$([ "$WIPE_STAGE" = 1 ] && echo ", and the carried bundle")"
-  printf '  The certificates cannot be recovered — publishers holding them will\n'
-  printf '  need new ones from the rebuilt pod.\n\n'
-  # NAME THE STRING, do not describe it. This asked for "the hostname part", which an
-  # operator reasonably read as the box's hostname (for example, pod-01) when the target
-  # was user@192.0.2.10 and the check wanted the address. A confirmation prompt whose
-  # answer you have to infer is a prompt people learn to fight rather than read, and this
-  # one guards an irreversible wipe.
-  printf '  Type %s to confirm: ' "${TARGET#*@}"
-  read -r CONFIRM
-  [ "$CONFIRM" = "${TARGET#*@}" ] || die "did not match, nothing was changed. Expected: ${TARGET#*@}"
+[ -n "$TARGET" ] || { usage >&2; exit 1; }
+# Disallow shell syntax in the SSH destination; flags never become remote code.
+[[ "$TARGET" =~ ^[a-zA-Z0-9_.@:%-]+$ ]] || die 'invalid SSH target'
+REMOVE_NETBIRD=0
+if [ "$PURGE_DATA" = 1 ] && [ "$KEEP_NETBIRD" = 0 ]; then REMOVE_NETBIRD=1; fi
+if [ "$REMOVE_NETBIRD" = 1 ] && [ "$KEEP_PEER" = 0 ]; then
+  command -v goat >/dev/null || die 'goat is required to retire the mesh peer; install it or plan manual retirement with --keep-peer'
+  goat admin peer ls >/dev/null || die 'cannot read mesh peers; resolve operator credentials before purging'
 fi
 
-step 2/3 "deprovision"
-# Ordered by dependency, not by importance: containers before the images they hold open,
-# images before the store that holds them, and every file path last so that a failure
-# part-way through still leaves a box whose remaining state is consistent.
-#
-# Every value expanded into this remote script is a flag parsed above, not operator
-# input — expanding client-side is the intent, not an oversight.
-# shellcheck disable=SC2029
-ssh "$TARGET" "
-  set -u
-  echo '-- containers (and the quadlet units that would resurrect them)'
-  sudo systemctl stop \$(systemctl list-units --no-legend 'octo-*' 2>/dev/null | awk '{print \$1}') 2>/dev/null || true
-  sudo rm -f /etc/containers/systemd/octo-*.container
-  for c in \$(sudo podman ps -a --format '{{.Names}}' | grep '^octo-'); do
-    sudo podman rm -f \"\$c\" || exit 1
-  done
-  echo '-- octo-pod package'
-  sudo apt-get purge -y octo-pod >/dev/null 2>&1 || true
-  echo '-- identity, pen CA, registry data'
-  sudo rm -rf /etc/octo-pod /var/lib/octo-pen /var/lib/octo-registry /var/lib/octo-pod
-  echo '-- systemd units this pod installed'
-  for u in pen-cert-expiry.timer pen-cert-expiry.service pen-cert-renew.timer \
-           pen-cert-renew.service octo-watchdog.timer octo-watchdog.service \
-           netbird-enrol-pending.timer netbird-enrol-pending.service; do
-    sudo systemctl disable --now \"\$u\" >/dev/null 2>&1 || true
-    sudo rm -f \"/etc/systemd/system/\$u\"
-  done
-  sudo rm -f /usr/local/sbin/netbird-enrol-pending.sh /usr/local/sbin/octo-watchdog.sh \
-             /usr/local/sbin/netbird-selfheal.sh /usr/local/sbin/pen-cert-*.sh
-  sudo systemctl daemon-reload 2>/dev/null || true
-  echo '-- netbird'
-  sudo netbird down >/dev/null 2>&1 || true
-  sudo systemctl stop netbird >/dev/null 2>&1 || true
-  sudo rm -rf /etc/netbird /var/lib/netbird
-  if [ '$KEEP_NETBIRD' != 1 ]; then
-    sudo apt-get purge -y netbird >/dev/null 2>&1 || true
-    sudo rm -f /etc/apt/sources.list.d/netbird.* /etc/apt/keyrings/netbird.asc
-  fi
-  echo '-- container runtime: kept, deliberately'
-  # podman comes from the device base image's package manifest, not from octo-pod — deprovisioning the appliance never
-  # uninstalls the substrate. Only octo-pod's images leave, so re-provision
-  # exercises the real image path.
-  if [ '$KEEP_IMAGES' != 1 ]; then
-    sudo podman rmi -f \$(sudo podman images -q --filter 'reference=*octo*' 2>/dev/null) 2>/dev/null || true
-    sudo podman rmi -f \$(sudo podman images -q --filter 'reference=*zenoh*' 2>/dev/null) 2>/dev/null || true
-    # legacy docker-era keys, if this box predates the contract base
-    sudo rm -f /etc/apt/sources.list.d/docker.* \
-               /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg
-  fi
-  # THE KEYRING DIRECTORY, deliberately. A fresh box may not have it, bootstrap must
-  # create it, and leaving it behind means every re-test silently skips the one task
-  # whose absence broke a Pi. Only removed when it is empty — apt keys that belong to
-  # something else on this box are not ours to delete.
-  if [ '$KEEP_IMAGES' != 1 ] && [ '$KEEP_NETBIRD' != 1 ]; then
-    sudo rmdir /etc/apt/keyrings 2>/dev/null || true
-  fi
-  if [ '$WIPE_STAGE' = 1 ]; then
-    echo '-- carried bundle'
-    sudo rm -rf '$STAGE_DIR'
-  fi
-  sudo apt-get autoremove -y >/dev/null 2>&1 || true
-" 2>&1 | indent
-
-# THE POD CANNOT CUT ITS OWN PEER. It holds no NetBird management credential, by design:
-# a box that can be stolen should not carry one. So the peer it registered outlives every
-# wipe, and a box rebuilt N times leaves N dead peers behind. Four accumulated in one
-# afternoon of testing before anyone noticed.
-#
-# This script runs on the operator's workstation, which is exactly where that credential
-# lives, so this is the only place in the whole flow that CAN do it. Advisory rather than
-# fatal: the box is already bare, and a leftover peer is untidy rather than dangerous. It
-# holds no certificate this pod will ever use again.
-if [ "$KEEP_PEER" != 1 ] && [ -n "$POD_NAME" ]; then
-  step "2b/3" "cut the mesh peer ${POD_MESH_IP:-for $POD_NAME}"
-  if ! command -v goat >/dev/null 2>&1; then
-    warn "goat is not on PATH, so the peer is still registered. Cut it with:"
-    printf '        goat admin peer cut %s\n' "$POD_NAME"
-  elif [ -z "${DEFAULT_NB_API_TOKEN:-}${GOAT_NB_API_TOKEN:-}" ]; then
-    warn "no NetBird admin token in the environment, so the peer is still registered."
-    printf '      That token is an admin secret and goat reads it from the environment,\n'
-    printf '      never a profile. Export it and re-run, or cut the peer by hand:\n'
-    printf '        goat admin peer cut %s\n' "$POD_NAME"
-  elif [ -z "$POD_MESH_IP" ]; then
-    warn "this pod had no mesh address, so there is no unique peer to name. If it did"
-    warn "enrol at some point, cut it by id from:"
-    printf '        goat admin peer ls | grep %s\n' "$POD_NAME"
-  elif goat admin peer cut -y "$POD_MESH_IP" >/dev/null 2>&1; then
-    ok "peer $POD_MESH_IP ('$POD_NAME') cut from the mesh"
-  else
-    warn "could not cut the peer at $POD_MESH_IP. It may already be gone. Check with:"
-    printf '        goat admin peer ls | grep %s\n' "$POD_NAME"
+# Preflight is read-only, including with --yes. Keep the route check outside sudo
+# so SSH_CONNECTION is available. NetBird uses wt0 by default; compare its address
+# to the route source as well to cover a renamed tunnel interface.
+ssh -o ConnectTimeout=10 "$TARGET" "bash -s -- $REMOVE_NETBIRD" <<'PREFLIGHT' || die 'preflight failed; refusing to deprovision'
+set -euo pipefail
+sudo -n true
+if ! sudo -n test -f /etc/octo-pod/inventory.ini && ! sudo -n test -f /var/lib/octo-uninstall/receipt; then
+  echo 'target has no octo-pod inventory or removal receipt; refusing to deprovision' >&2
+  exit 1
+fi
+if [ "$1" = 1 ]; then
+  client=${SSH_CONNECTION%% *}
+  [ -n "$client" ] || { echo 'cannot establish SSH route; use a direct connection' >&2; exit 1; }
+  route=$(ip route get "$client")
+  mesh=$(sudo -n netbird status 2>/dev/null | sed -n 's/.*NetBird IP: *\([^ /]*\).*/\1/p') || mesh=""
+  case " $route " in
+    *' dev wt0 '*|*' dev netbird'*) echo 'refusing to remove the SSH mesh connection; use a LAN address' >&2; exit 1 ;;
+  esac
+  if [ -n "$mesh" ] && [[ " $route " == *" src $mesh "* ]]; then
+    echo 'SSH uses the mesh address; use a LAN address' >&2; exit 1
   fi
 fi
+PREFLIGHT
 
-step 3/3 "what is left"
-ssh "$TARGET" '
-  s=$(dpkg -s octo-pod 2>/dev/null | sed -n "s/^Status: //p"); echo "octo-pod:   ${s:-removed}"
-  echo "identity:   $([ -d /etc/octo-pod ] && echo STILL PRESENT || echo gone)"
-  echo "pen state:  $([ -d /var/lib/octo-pen ] && echo STILL PRESENT || echo gone)"
-  echo "podman:     $(podman --version 2>/dev/null || echo gone)"
-  echo "netbird:    $(netbird version 2>/dev/null || echo gone)"
-  echo "keyrings:   $([ -d /etc/apt/keyrings ] && echo present || echo gone)"
-  echo "bundle:     $([ -d '"$STAGE_DIR"' ] && du -sh '"$STAGE_DIR"' 2>/dev/null | cut -f1 || echo gone)"
-' 2>&1 | indent
-
-cat <<NEXT
-
-────────────────────────────────────────────────────────
-  Bare box. To build it again:
-
-    tools/install-to-pod.sh $TARGET$([ "$WIPE_STAGE" = 1 ] && echo " --with-images")
-NEXT
-if [ "$WIPE_STAGE" != 1 ]; then
-cat <<KEPT
-    ssh $TARGET
-    sudo octo-pod bootstrap -e bootstrap_mode=airgap -e image_mirror=localhost:5000
-
-  The bundle was kept, so that bootstrap needs no network and no registry
-  credential — it re-seeds the on-pod registry from $STAGE_DIR.
-KEPT
+printf 'Target: %s\n' "$TARGET"
+if [ "$PURGE_DATA" = 1 ]; then
+  printf 'PURGE: permanently erase pod identity, CA, private keys, retained data and audit records.\n'
+else
+  printf 'REMOVE: stop pod services and remove software; retain identity, keys, data and NetBird.\n'
 fi
-printf '────────────────────────────────────────────────────────\n\n'
+[ "$REMOVE_NETBIRD" = 0 ] || printf 'NetBird will be stopped and removed; its mesh peer needs retirement.\n'
+[ "$WIPE_STAGE" = 0 ] || printf 'The carried image bundle will also be erased.\n'
+printf 'Podman, shared images, OS networking and system logs are retained.\n'
+printf 'Only standard installation paths are cleaned; custom paths require a separate cleanup plan.\n'
+if [ "$ASSUME_YES" = 0 ]; then
+  printf 'Type %s to confirm: ' "${TARGET#*@}"
+  read -r confirm
+  [ "$confirm" = "${TARGET#*@}" ] || die 'confirmation did not match; nothing changed'
+fi
+
+# The entire payload is delivered from the laptop, not read from the package being
+# removed. A protected receipt survives failures and records the mesh selector for retry.
+# shellcheck disable=SC2029 # only locally parsed boolean flags expand here
+ssh "$TARGET" "sudo -n bash -s -- $PURGE_DATA $WIPE_STAGE $REMOVE_NETBIRD" <<'CLEANUP'
+set -euo pipefail
+umask 077
+purge=$1
+wipe_stage=$2
+remove_netbird=$3
+mkdir -p /var/lib/octo-uninstall
+chmod 700 /var/lib/octo-uninstall
+if [ ! -f /var/lib/octo-uninstall/receipt ]; then
+  printf 'octo-pod removal started\n' > /var/lib/octo-uninstall/receipt
+fi
+if [ "$remove_netbird" = 1 ] && { [ -f /etc/octo-pod/inventory.ini ] || [ ! -f /var/lib/octo-uninstall/mesh-ip ]; }; then
+  mesh=$(netbird status 2>/dev/null | sed -n 's/.*NetBird IP: *\([^ /]*\).*/\1/p') || mesh=""
+  if [ -n "$mesh" ]; then
+    previous=$(cat /var/lib/octo-uninstall/mesh-ip 2>/dev/null || true)
+    if [ -f /etc/octo-pod/inventory.ini ] || [ "$mesh" != "$previous" ]; then
+      rm -f /var/lib/octo-uninstall/peer-retired
+    fi
+    printf '%s\n' "$mesh" > /var/lib/octo-uninstall/mesh-ip
+  fi
+fi
+# Stop producers and timers before touching credentials or removing the firewall.
+units=$(systemctl list-units --all --no-legend --plain 'octo-*' 'pen-cert-*' 'netbird-enrol-pending.*' 'net-isolation.service')
+while read -r unit rest; do
+  [ -n "$unit" ] || continue
+  systemctl stop "$unit"
+done <<< "$units"
+# Disable only file-backed units; Quadlet's generated services are removed by
+# deleting their source, not by attempting to disable a generated unit.
+for unit in /etc/systemd/system/octo-*.service /etc/systemd/system/octo-*.timer \
+            /etc/systemd/system/pen-cert-*.service /etc/systemd/system/pen-cert-*.timer \
+            /etc/systemd/system/netbird-enrol-pending.* /etc/systemd/system/net-isolation.service; do
+  [ -e "$unit" ] || continue
+  systemctl disable --now "${unit##*/}"
+  rm -f "$unit"
+done
+containers=$(podman ps -a --format '{{.Names}}')
+while read -r container; do
+  case "$container" in octo-*) podman rm -f "$container" ;; esac
+done <<< "$containers"
+containers=$(podman ps -a --format '{{.Names}}')
+if printf '%s\n' "$containers" | grep '^octo-' >/dev/null; then
+  echo 'pod containers remain; refusing firewall or data removal' >&2; exit 1
+fi
+rm -f /etc/containers/systemd/octo-*.container /etc/cron.d/netbird-selfheal
+rm -f /usr/local/sbin/netbird-enrol-pending.sh /usr/local/sbin/netbird-selfheal.sh \
+      /usr/local/sbin/octo-watchdog /usr/local/sbin/octo-watchdog.sh \
+      /usr/local/sbin/pen-cert-expiry-check /usr/local/sbin/pen-cert-renew \
+      /usr/local/sbin/pen-cert-*.sh
+# List succeeds first: permission/runtime failures must not be mistaken for absence.
+tables=$(nft list tables)
+for table in octo_pod net_isolation; do
+  if printf '%s\n' "$tables" | grep -Fx "table inet $table" >/dev/null; then
+    nft delete table inet "$table"
+  fi
+done
+rm -f /etc/octo-pod-firewall.nft /etc/octo-pod-firewall.nft.new \
+      /etc/nftables-net-isolation.nft /usr/local/sbin/octo-firewall-apply \
+      /etc/containers/registries.conf.d/50-octo-mirror.conf \
+      /etc/apt/sources.list.d/octo-pod.list /etc/apt/keyrings/octo-pod.asc
+systemctl daemon-reload
+# No autoremove and no image deletion: those resources can serve other workloads.
+package_present() {
+  local packages
+  packages=$(dpkg-query -W -f='${binary:Package} ${db:Status-Status}\n') || exit "$?"
+  printf '%s\n' "$packages" | grep -E "^$1 (installed|config-files)$" >/dev/null
+}
+if package_present octo-pod; then apt-get purge -y octo-pod; fi
+if [ "$remove_netbird" = 1 ]; then
+  if package_present netbird; then
+    systemctl disable --now netbird
+    apt-get purge -y netbird
+  fi
+  rm -rf /etc/netbird /var/lib/netbird
+  rm -f /etc/apt/sources.list.d/netbird.* /etc/apt/keyrings/netbird.asc
+fi
+if [ "$purge" = 1 ]; then
+  rm -rf /etc/octo-pod /var/lib/octo-pen /var/lib/octo-registry /var/lib/octo-pod \
+         /var/lib/octo-egress /etc/octo-arm /etc/octo-arm-* /etc/octo-egress-* \
+         /etc/octo-downlink /etc/fabric-uplink /etc/octo-pen-uplink
+fi
+if [ "$wipe_stage" = 1 ]; then rm -rf /opt/octo-stage; fi
+# Verify the properties we promise. Any failure exits nonzero; no success banner.
+if package_present octo-pod; then echo 'octo-pod package remains' >&2; exit 1; fi
+containers=$(podman ps -a --format '{{.Names}}')
+if printf '%s\n' "$containers" | grep '^octo-' >/dev/null; then echo 'pod containers remain' >&2; exit 1; fi
+tables=$(nft list tables)
+if printf '%s\n' "$tables" | grep -E '^table inet (octo_pod|net_isolation)$' >/dev/null; then
+  echo 'pod firewall tables remain' >&2; exit 1
+fi
+for file in /etc/containers/systemd/octo-*.container /etc/systemd/system/octo-* \
+            /etc/systemd/system/pen-cert-* /etc/systemd/system/netbird-enrol-pending.* \
+            /etc/systemd/system/net-isolation.service /etc/cron.d/netbird-selfheal; do
+  [ ! -e "$file" ] || { echo "cleanup incomplete: $file" >&2; exit 1; }
+done
+if [ "$remove_netbird" = 1 ] && package_present netbird; then echo 'NetBird package remains' >&2; exit 1; fi
+printf 'local cleanup verified\n' > /var/lib/octo-uninstall/receipt
+CLEANUP
+
+if [ "$REMOVE_NETBIRD" = 1 ] && [ "$KEEP_PEER" = 0 ]; then
+  mesh=$(ssh "$TARGET" 'sudo -n cat /var/lib/octo-uninstall/mesh-ip 2>/dev/null || true')
+  [[ "$mesh" =~ ^[0-9a-fA-F:.]+$ ]] || die 'local cleanup complete; no unique mesh address recorded. Retire the peer manually, then rerun with --keep-peer'
+  command -v goat >/dev/null || die 'local cleanup complete; goat is required on this workstation to retire the peer. Retry after installing it, or retire manually and use --keep-peer'
+  if ! ssh "$TARGET" 'sudo -n test -f /var/lib/octo-uninstall/peer-retired'; then
+    goat admin peer cut -y "$mesh" || die 'local cleanup complete; mesh peer retirement failed. Retry or verify retirement manually and use --keep-peer'
+    ssh "$TARGET" 'sudo -n touch /var/lib/octo-uninstall/peer-retired'
+  fi
+fi
+printf 'Removal complete. OS network configuration, shared images and runtime remain.\n'
+[ "$PURGE_DATA" = 1 ] || printf 'Identity, keys, retained data and NetBird remain. Use --purge-data only after preserving required records.\n'
+[ "$KEEP_PEER" = 0 ] || printf 'Mesh peer retirement was explicitly skipped; verify it separately.\n'

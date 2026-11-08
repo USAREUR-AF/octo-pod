@@ -118,10 +118,10 @@ esac''')
         calls.write_text('')
         code,out=run(['bash',str(repo/'tools/deprovision-pod.sh'),'pod@pod.invalid','--yes'],env)
         check('deprovision refuses non-pod even with yes',code!=0 and 'refusing to deprovision' in out and 'rm -' not in calls.read_text(),out)
-        stub(bin,'ssh','echo "$*" >> "$CALLS"; exit 0')
+        stub(bin,'ssh','echo "$*" >> "$CALLS"; cat >> "$CALLS"; exit 0')
         calls.write_text('')
         code,out=run(['bash',str(repo/'tools/deprovision-pod.sh'),'pod@pod.invalid','--yes','--keep-peer'],env)
-        check('deprovision selects only octo containers',"grep '^octo-'" in calls.read_text() and 'podman rm -f $(sudo podman ps -aq)' not in calls.read_text(),out)
+        check('deprovision selects only octo containers','case "$container" in octo-*)' in calls.read_text() and 'podman rm -f $(sudo podman ps -aq)' not in calls.read_text(),out)
         # Execute only the credential staging command in a scratch directory. sudo is a stub.
         dest=t/'key';secret='00000000-0000-0000-0000-000000000001'
         stub(bin,'goat','printf "%s\\n" "00000000-0000-0000-0000-000000000001"')

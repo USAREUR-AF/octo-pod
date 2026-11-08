@@ -349,7 +349,7 @@ octo-pod remote — act on a pod from your laptop, over ssh.
 
   octo-pod remote mint-key    <user>@<host> [--pod <name>]
   octo-pod remote install     <user>@<host> [--with-images] [--version X.Y.Z]
-  octo-pod remote deprovision <user>@<host> [--yes] [--wipe-stage]
+  octo-pod remote deprovision <user>@<host> [--yes] [--purge-data] [--wipe-stage]
 
 Set OCTO_POD_TARGET once and the address becomes optional:
 

@@ -124,17 +124,56 @@ run that uses it. A release built outside a release workflow names no repository
 `upgrade` refuses until you set `OCTO_POD_CERT_IDENTITY`. The release it then installs
 records its repository, so the next upgrade needs no override.
 
-## Rebuild an existing pod
+## Remove or rebuild a pod
 
-Only for an approved rebuild of an existing pod. A new box uses the [README quickstart](../README.md#deploy-a-pod); an existing
-Podman pod normally uses [Upgrading](#upgrading). Before a rebuild, preserve its identity,
-keys, retained data and audit records, prove recovery separately, and establish a working
-alternate path if feeds must remain available. This command is not an upgrade.
+Run removal from your workstation, using the release kit or a source checkout:
 
 ```bash
+octo-pod remote deprovision <user>@<pod-ip>
+# The same helper from a checkout:
 tools/deprovision-pod.sh <user>@<pod-ip>
 ```
 
-Type the address when it asks. Keeps the carried image bundle for reinstallation.
-Add `--wipe-stage` to delete that bundle too. Removes the pod’s mesh peer if you hold a NetBird admin
-token; `--keep-peer` skips that.
+Removal stops the pod's workloads and removes its package, Quadlet definitions,
+background timers, self-heal cron entry, and pod firewall rules and boot services.
+It interrupts feeds. Arrange an alternate path first if they must remain available.
+It preserves identity, private keys, CA, retained data, audit records, and the running
+NetBird agent and peer. Reinstall the software to reuse the retained configuration.
+This is a change from earlier releases, whose default deprovision command erased data.
+
+For an approved rebuild or permanent retirement, preserve required records and prove
+recovery before explicitly requesting permanent deletion:
+
+```bash
+tools/deprovision-pod.sh <user>@<lan-ip> --purge-data
+```
+
+`--purge-data` also removes pod identity, CA and leaf keys, retained pod/registry/egress
+data, and NetBird's package and local state. Publishers need new certificates after a
+rebuild. The workstation attempts mesh peer retirement using `goat` and its operator
+credentials. Missing credentials, an unknown peer address, or retirement failure return
+an error even when local cleanup succeeded. Resolve retirement and retry; if verified
+manually, use `--keep-peer` to skip the automatic step. Successful automatic retirement
+is recorded for retries. `--keep-netbird` preserves the agent, its state and peer even
+with `--purge-data`; it does not merely preserve the package.
+
+Use an independent LAN connection when removing NetBird. The helper refuses a detected
+mesh SSH route before making changes, including with `--yes`. Maintain console access:
+a route check cannot guarantee connectivity through every custom network arrangement.
+The firewall removal deletes only the pod's `inet octo_pod` and `inet net_isolation`
+tables. Other firewall tables are preserved; the pod's traffic restrictions no longer apply.
+
+The carried bundle at `/opt/octo-stage` stays unless `--wipe-stage` is specified.
+Podman, shared container images, OS users, SSH, network configuration, host tuning,
+chrony/journald configuration and system logs stay. There is no `apt autoremove` or
+shared image pruning. `--keep-images` and `--keep-docker` remain accepted as no-ops.
+This is application removal, not a factory reset or secure disk erasure.
+
+The helper supports the standard installation paths. Inventory overrides for storage,
+TLS, firewall or registry paths require a separate operator cleanup plan; do not assume
+custom paths have been erased. A root-only removal receipt and the mesh selector remain
+under `/var/lib/octo-uninstall` so interrupted cleanup can resume after identity deletion.
+Remove that directory manually only after local cleanup and peer retirement are verified.
+Errors stop cleanup with a nonzero exit; rerun the same command after resolving them.
+`--yes` skips only the confirmation. Reboot and verify that no pod workloads or firewall
+units return before treating a host as retired.

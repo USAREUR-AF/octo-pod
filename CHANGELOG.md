@@ -15,6 +15,11 @@ Notable changes to octo-pod. The format follows
 
 ### Fixed
 
+- Deprovisioning now preserves identity and retained data by default; irreversible
+  deletion requires `--purge-data`. Cleanup removes pod firewall and background-task
+  leftovers, preserves shared images and packages, and reports failures for retry.
+
+
 - A pod with no route to the internet could not verify an upgrade, because cosign
   downloads sigstore's keys from `tuf-repo-cdn.sigstore.dev` before it checks a signature.
   `octo-pod upgrade` and `tools/install-to-pod.sh` now check the standard Sigstore bundle,
