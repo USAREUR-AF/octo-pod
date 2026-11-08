@@ -98,6 +98,24 @@ class ReleaseEvidenceTests(unittest.TestCase):
                                 "--changelog", str(changelog), "--output", str(output)],
                                 capture_output=True).returncode, 0)
 
+    def test_notes_workflow_treats_context_as_data(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+        script = next(s["run"] for s in workflow["jobs"]["build"]["steps"]
+                      if s.get("name") == "human-written release notes")
+        self.assertNotIn("${{", script)
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "unexpected"
+            repository = "example/$(touch " + str(marker) + ")"
+            env = dict(os.environ, RUNNER_TEMP=tmp, RELEASE_VERSION="0.6.0",
+                       GITHUB_REPOSITORY=repository, GITHUB_REF_NAME="octo-pod-v0.6.0")
+            subprocess.run(["bash", "-c", script], cwd=ROOT, env=env, check=True)
+            text = (Path(tmp) / "release-notes.md").read_text()
+            self.assertIn(repository, text)
+            self.assertIn("octo-pod-v0.6.0", text)
+            self.assertNotIn("@VERSION@", text)
+            self.assertFalse(marker.exists())
+
     def test_workflow_enforces_evidence_before_publication(self):
         import yaml
         workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
