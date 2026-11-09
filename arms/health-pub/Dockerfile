@@ -19,7 +19,7 @@
 # a thing whose only job is to report. The privileged half stays on the host.
 
 # upstream tag at the time this digest was pinned: latest-dev
-FROM cgr.dev/chainguard/rust@sha256:5cf99a94c5e94cb6741988f77aeb0976ad9d4eb379db80e0ee980cc95c5e5fe6 AS chef
+FROM cgr.dev/chainguard/rust@sha256:fa05e1dee8bfe7efbd1a0e2a47bb450c7b1bcf23bf82212a68da3a1d3d1cf6e0 AS chef
 USER root
 # DEPENDENCIES COMPILE IN THEIR OWN LAYER. cargo-chef reduces the workspace to its
 # manifests and Cargo.lock (recipe.json), and `cook` compiles every dependency from that
@@ -42,7 +42,7 @@ COPY . .
 RUN cargo build --release --locked -p octo-health-pub
 
 # upstream tag at the time this digest was pinned: latest
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:671a621016fb33812136dea6182b1db957996d3c8c618187aaf86abd9b14af53
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:aab5cd0b4cc5edd9c87b6e7aa9ddaa3fb6ffcec559b9e5473c55bbc937b65399
 WORKDIR /
 COPY --from=rust-builder /build/target/release/octo-health-pub /usr/local/bin/octo-health-pub
 COPY --from=rust-builder /build/LICENSE /build/NOTICE /build/THIRD_PARTY_LICENSES.md /usr/share/doc/octo-pod/
