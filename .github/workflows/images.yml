@@ -172,7 +172,7 @@ jobs:
             egress)      var=egress_image ;;
             sapient)     var=sapient_image ;;
             uplink-bridge) var=uplink_bridge_image ;;
-            pen-zenoh)   var=zenoh_image ;;
+            pen-zenoh)   var=pen_zenoh_image ;;
             *) echo "::error::no group_vars pin name known for ${{ matrix.arm }}"; exit 1 ;;
           esac
           # TO STDOUT AS WELL AS THE SUMMARY. The manifest-list digest is the one value

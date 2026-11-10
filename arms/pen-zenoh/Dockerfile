@@ -15,7 +15,14 @@
 # newer zenoh, this image and the arms' zenoh crate pin move together.
 #
 # upstream tag at the time this digest was pinned: 1.9.0
+FROM eclipse/zenoh@sha256:157965d71e0bfd0a044d76a985ff0e5c306ad3968929168fb9678cd2a7fec23f AS notices
+COPY LICENSE NOTICE THIRD_PARTY_LICENSES.md /build/
+
 FROM eclipse/zenoh@sha256:157965d71e0bfd0a044d76a985ff0e5c306ad3968929168fb9678cd2a7fec23f
+
+# The same notices every image from this repository carries, at the standard path.
+# The upstream base keeps its own licenses for zenohd and the plugins.
+COPY --from=notices /build/LICENSE /build/NOTICE /build/THIRD_PARTY_LICENSES.md /usr/share/doc/octo-pod/
 
 # Alpine package updates only. /zenohd, the plugins and /entrypoint.sh come from the
 # pinned base layers and are not rebuilt or replaced here.
