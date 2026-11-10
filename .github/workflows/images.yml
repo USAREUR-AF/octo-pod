@@ -46,7 +46,7 @@ jobs:
         # sensor's data — but it is built, pushed and pinned by exactly the same rules,
         # so it rides the same matrix rather than growing a second pipeline that would
         # drift from this one.
-        arm: [udp-ingest, tcp-ingest, tcp-connect, health-pub, egress, sapient, uplink-bridge]
+        arm: [udp-ingest, tcp-ingest, tcp-connect, health-pub, egress, sapient, uplink-bridge, pen-zenoh]
         platform: [linux/amd64, linux/arm64]
         include:
           - { platform: linux/amd64, runner: ubuntu-24.04 }
@@ -124,7 +124,7 @@ jobs:
         # created. `:latest` then resolves to whichever architecture pushed last, and an
         # arm64 pod pulling it gets "exec format error" — found on a Jetson, months later.
         # The coverage job below now fails when the two drift.
-        arm: [udp-ingest, tcp-ingest, tcp-connect, health-pub, egress, sapient, uplink-bridge]
+        arm: [udp-ingest, tcp-ingest, tcp-connect, health-pub, egress, sapient, uplink-bridge, pen-zenoh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -172,6 +172,7 @@ jobs:
             egress)      var=egress_image ;;
             sapient)     var=sapient_image ;;
             uplink-bridge) var=uplink_bridge_image ;;
+            pen-zenoh)   var=zenoh_image ;;
             *) echo "::error::no group_vars pin name known for ${{ matrix.arm }}"; exit 1 ;;
           esac
           # TO STDOUT AS WELL AS THE SUMMARY. The manifest-list digest is the one value
