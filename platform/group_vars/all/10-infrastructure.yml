@@ -51,7 +51,7 @@ zenoh_image_upstream: "eclipse/zenoh@sha256:157965d71e0bfd0a044d76a985ff0e5c306a
 # The zenoh Python client verify-octo-pod.yml tests the pen's ACL with. Keep it at the
 # pen's version above (and the arms' crate, arms/Cargo.toml); test_templates.py checks.
 verify_zenoh_version: "1.9.0"
-audit_image_upstream: "ghcr.io/usareur-af/goat-audit-subscriber@sha256:6aacd50c4f6a8937e1750374a4e0b9a1150ddffe66a81d37fdb77c9e1ff49ae5"   # sha-b6ae695
+audit_image_upstream: "ghcr.io/usareur-af/goat-audit-subscriber@sha256:f02a39cd1e9f37b19c6fc763d5b287b0afe807b085847903857d8dd4b5850f7d"   # sha-6c4b219
 # TLS material is chowned to this gid so the sinks can read the pod key. Wrong value =
 # `Permission denied (os error 13)` = silent audit gap with every health signal green.
 # Confirm with: podman image inspect {{ audit_image }} --format '{{ "{{" }}.Config.User{{ "}}" }}'
