@@ -33,17 +33,18 @@ jobs:
       # Semgrep flags every checkout under pull_request_target. This one checks out
       # the BASE branch (what is already merged), never the pull request's code.
       - name: this repository's sensitive paths, from the base branch # nosemgrep: yaml.github-actions.security.pull-request-target-code-checkout.pull-request-target-code-checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           sparse-checkout: .github/contributor-trust
           persist-credentials: false
 
       - name: the check, from goatcore main
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: USAREUR-AF/goatcore
-          ref: main
+          # goatcore pinned by commit, bumped deliberately like the actions group
+          ref: 284921600e53e420be9fda36134e87a142eb2b14
           path: .goatcore-trust
           sparse-checkout: .github/contributor-trust
           persist-credentials: false
