@@ -35,6 +35,12 @@ jobs:
       MIN_LINES: '93'
       MIN_REGIONS: '93'
       MIN_BRANCHES: '80'
+      # The stable compiler that measures lines and regions. Pinned for the same reason as
+      # the nightly below: the figures move with the compiler (rustc 1.100.0 reports
+      # lines 92.4% and regions 90.4% for the tree that 1.99.1 reports as 93.5% and
+      # 93.8%), so a floor is reproducible only against a named compiler. Move this pin
+      # and the floors in one commit.
+      STABLE_TOOLCHAIN: '1.99.1'
       # The nightly that measures branches. Pinned, so a compiler change cannot move the
       # number without a commit that says so.
       BRANCH_TOOLCHAIN: nightly-2026-11-05
@@ -47,6 +53,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: ${{ env.STABLE_TOOLCHAIN }}
           components: llvm-tools-preview
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -56,14 +63,14 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.9.1
 
-      - name: lines and regions (stable)
+      - name: lines and regions (pinned stable)
         env:
           CARGO_LLVM_COV_TARGET_DIR: ${{ github.workspace }}/arms/target/cov-stable
         run: |
           set -euo pipefail
-          cargo +stable llvm-cov --workspace --locked --no-report
-          cargo +stable llvm-cov report --lcov --output-path lcov.info
-          cargo +stable llvm-cov report --json --summary-only --output-path stable.json
+          cargo "+$STABLE_TOOLCHAIN" llvm-cov --workspace --locked --no-report
+          cargo "+$STABLE_TOOLCHAIN" llvm-cov report --lcov --output-path lcov.info
+          cargo "+$STABLE_TOOLCHAIN" llvm-cov report --json --summary-only --output-path stable.json
 
       - name: branches (pinned nightly)
         env:
