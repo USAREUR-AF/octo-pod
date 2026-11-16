@@ -1,0 +1,85 @@
+{#
+SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+SPDX-License-Identifier: Apache-2.0
+-#}
+# /etc/containers/systemd/octo-translate-{{ t.id }}.container  MANAGED BY ANSIBLE
+{#
+   One unit per translation gateway declared in 50-translate.yml (docs/adr/0004). It is
+   not an arm: it opens no socket toward a sensor or a receiver, and its image is built
+   from gateway/translate/, not from arms/.
+
+   It reads the declared source keys on the pen and writes raw/<id>/** there, both under
+   its own pod-CA certificate. The pen ACL grants exactly those two things to that CN;
+   the binary refuses a declaration that would let it read its own output.
+
+   Caller supplies `t`, the gateway's entry.
+#}
+
+[Unit]
+Description=octo-pod translation gateway {{ t.id }} ({{ t.description | default(t['from'] ~ ' to ' ~ (t.to | join(', '))) }})
+After=octo-pen-zenoh-router.service network-online.target
+Wants=octo-pen-zenoh-router.service network-online.target
+
+[Container]
+Image={{ translate_image }}
+ContainerName=octo-translate-{{ t.id }}
+# Host networking, to dial the pen on this host as the arms do. It listens on nothing.
+Network=host
+# The binary closes its session and writes its audit `stop` line on SIGINT; podman's
+# default SIGTERM would end it without either.
+PodmanArgs=--stop-signal=SIGINT
+Environment=TRANSLATE_ID={{ t.id }}
+Environment=TRANSLATE_SOURCES={{ t.sources | join(',') }}
+Environment=TRANSLATE_FROM={{ t['from'] }}
+Environment=TRANSLATE_TO={{ t.to | join(',') }}
+Environment=TRANSLATE_NAMESPACE={{ t.namespace | regex_replace('/\*\*$', '') }}
+{% if t.publish_key is defined %}
+Environment=TRANSLATE_PUBLISH_KEY={{ t.publish_key }}
+{% endif %}
+{% if t.context | default({}) %}
+# Model keys the source format does not carry. Never replaces a value the source has.
+Environment="TRANSLATE_CONTEXT={% for k, v in (t.context | dictsort) %}{{ k }}={{ v }}{{ ';' if not loop.last }}{% endfor %}"
+{% endif %}
+{% if t.only_when | default({}) %}
+# Convert a sample only when each decoded model key has this value; skip any other.
+Environment=TRANSLATE_ONLY_WHEN={% for k, v in (t.only_when | dictsort) %}{{ k }}={{ v }}{{ ';' if not loop.last }}{% endfor %}
+
+{% endif %}
+{% if t.carry | default({}) %}
+# target=source model keys: a result takes `target` from the sample's `source` when the
+# sample carries no `target`.
+Environment=TRANSLATE_CARRY={% for k, v in (t.carry | dictsort) %}{{ k }}={{ v }}{{ ';' if not loop.last }}{% endfor %}
+
+{% endif %}
+{% if t.stale_after_s is defined %}
+Environment=TRANSLATE_STALE_AFTER_S={{ t.stale_after_s }}
+{% endif %}
+{% if t.stamp_time is defined %}
+Environment=TRANSLATE_STAMP_TIME={{ t.stamp_time | lower }}
+{% endif %}
+# `public` unless declared otherwise: the engine then refuses any pack or model module
+# marked `distribution controlled`, whatever the bundle holds.
+Environment=TRANSLATE_MAX_DISTRIBUTION={{ t.max_distribution | default('public') }}
+{% if t.packs_dir is defined %}
+# A pack bundle from this pod's disk instead of the one in the image. It must carry its
+# own MANIFEST.json; the binary checks every file against it before loading any.
+Environment=TRANSLATE_PACKS_DIR=/etc/octo-translate/packs
+Volume={{ t.packs_dir }}:/etc/octo-translate/packs:ro
+{% endif %}
+Environment=TRANSLATE_ENDPOINT=tls/{{ mesh_ip }}:{{ pen_listen_port }}
+Environment=TRANSLATE_CERT=/etc/octo/tls/translate-cert.pem
+Environment=TRANSLATE_KEY=/etc/octo/tls/translate-key.pem
+Environment=TRANSLATE_ROOT_CA=/etc/octo/tls/ca-root.pem
+Environment=TRANSLATE_AUDIT_DIR=/var/lib/octo-translate
+Environment=RUST_LOG={{ t.log_level | default('info') }}
+# One gateway's key is not readable by another gateway or by an arm.
+Volume=/etc/octo-translate-{{ t.id }}/tls:/etc/octo/tls:ro
+Volume={{ translate_audit_dir }}/{{ t.id }}:/var/lib/octo-translate
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

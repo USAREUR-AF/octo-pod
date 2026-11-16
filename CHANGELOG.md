@@ -8,6 +8,14 @@ Notable changes to octo-pod. The format follows
 
 ### Added
 
+- A translation gateway, proposed in ADR 0004 and off by default. `octo-pod translate
+  add` declares one: it reads captured samples on the pen under its own certificate,
+  converts each one with goat-transformers and its pinned packs (SAPIENT, Cursor on
+  Target XML, GeoJSON), and publishes the result on `raw/<id>/`. Captured samples are
+  unchanged. A declaration can restrict conversion to samples with a given decoded
+  value (`only_when`) and take a result value from another key of the sample (`carry`). It is built from `gateway/translate/`, apart from the arms; no image is
+  published yet. See `docs/guide-translation-gateway.md`.
+
 - Every release carries sigstore's public keys in `platform/sigstore/trusted_root.json`.
   `tools/sigstore-trusted-root.py` writes the current keys. The release workflow refuses
   to ship keys that are not sigstore's current ones, and proves that the keys it ships

@@ -864,6 +864,75 @@
           fabric data upstream under this pod's slot.
       tags: [always]
 
+    # TRANSLATION GATEWAYS (50-translate.yml, docs/adr/0004), checked like every other
+    # declaration, and absent on a pod that declares none. `octo-pod translate` refuses
+    # the same things before writing, and the gateway refuses them again at start (exit
+    # 2); this is the gate between the two that cannot be skipped.
+    #
+    # A gateway READS other publishers' keys, so its sources are held tighter than a
+    # publisher's namespace: each begins with a literal chunk, never in ops, attest,
+    # system, downlink or @ (data that came down is not converted and sent back up), and
+    # never reaches a gateway's namespace, where it would convert converted output. It
+    # writes raw/<id>/** and nothing else.
+    - name: translate — validate declarations
+      vars:
+        _xl: "{{ translators | default([], true) }}"
+        _xl_sources: "{{ _xl | selectattr('sources', 'defined') | map(attribute='sources') | flatten }}"
+        _xl_targets: "{{ _xl | selectattr('to', 'defined') | map(attribute='to') | flatten }}"
+        _xl_context: "{{ _xl | selectattr('context', 'defined') | map(attribute='context') | map('dict2items') | flatten }}"
+        _xl_only_when: "{{ _xl | selectattr('only_when', 'defined') | map(attribute='only_when') | map('dict2items') | flatten }}"
+        _xl_carry: "{{ _xl | selectattr('carry', 'defined') | map(attribute='carry') | map('dict2items') | flatten }}"
+        _ids: >-
+          {{ ((peers | default([], true)) + (arms | default([], true))
+              + (egress | default([], true)) + (translators | default([], true)))
+             | map(attribute='id') | list }}
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _ids | unique | length == _ids | length
+          - _xl | selectattr('enabled', 'defined') | list | length == _xl | length
+          - _xl | rejectattr('id', 'match', '^[a-z0-9][a-z0-9-]*$') | list | length == 0
+          - _xl | rejectattr('cert_cn', 'defined') | list | length == 0
+          - _xl | rejectattr('namespace', 'defined') | list | length == 0
+          - _xl | map(attribute='namespace') | list
+            == _xl | map(attribute='id') | map('regex_replace', '^', 'raw/') | map('regex_replace', '$', '/**') | list
+          - _xl | rejectattr('sources', 'defined') | list | length == 0
+          - _xl | selectattr('sources', 'string') | list | length == 0
+          - _xl | rejectattr('sources') | list | length == 0
+          - _xl_sources | reject('match', '^(?!(ops|attest|system|downlink)(/|$))(?!@)[^/*$]+/[^ ,]+$') | list | length == 0
+          - _xl_sources | select('match', '^raw/[^/]*[*$]') | list | length == 0
+          - _xl | map(attribute='id') | map('regex_replace', '^', 'raw/') | list
+            | intersect(_xl_sources | map('regex_search', '^raw/[^/]+') | select | list) | length == 0
+          - _xl | rejectattr('from', 'defined') | list | length == 0
+          - _xl | rejectattr('from', 'match', '^[a-z0-9][a-z0-9-]*$') | list | length == 0
+          - _xl | rejectattr('to', 'defined') | list | length == 0
+          - _xl | selectattr('to', 'string') | list | length == 0
+          - _xl | rejectattr('to') | list | length == 0
+          - _xl_targets | reject('match', '^[a-z0-9][a-z0-9-]*$') | list | length == 0
+          - _xl | selectattr('max_distribution', 'defined') | rejectattr('max_distribution', 'in', ['public', 'controlled']) | list | length == 0
+          - _xl | selectattr('publish_key', 'defined') | rejectattr('publish_key', 'match', '^\{namespace\}/[A-Za-z0-9_./{}-]+$') | list | length == 0
+          - _xl_context | rejectattr('key', 'match', '^[a-z0-9_.]+$') | list | length == 0
+          - _xl_context | map(attribute='value') | map('string') | reject('match', '^[A-Za-z0-9 ._:+-]*$') | list | length == 0
+          - _xl_only_when | rejectattr('key', 'match', '^[a-z0-9_.]+$') | list | length == 0
+          - _xl_only_when | map(attribute='value') | map('string') | reject('match', '^[A-Za-z0-9._:+-]+$') | list | length == 0
+          - _xl_carry | rejectattr('key', 'match', '^[a-z0-9_.]+$') | list | length == 0
+          - _xl_carry | map(attribute='value') | map('string') | reject('match', '^[a-z0-9_.]+$') | list | length == 0
+          - _xl | selectattr('stale_after_s', 'defined') | rejectattr('stale_after_s', 'integer') | list | length == 0
+          - _xl | selectattr('packs_dir', 'defined') | rejectattr('packs_dir', 'match', '^/[A-Za-z0-9_./-]+$') | list | length == 0
+        fail_msg: >-
+          Bad translation gateway declaration in 50-translate.yml. Every gateway needs an
+          explicit `enabled`, an id matching [a-z0-9-] that no peer, arm or destination
+          uses, a cert_cn, namespace raw/<id>/**, `from` (one pack name), `to` (a list of
+          pack names) and `sources` (a list of pen key expressions). Each source begins
+          with a literal chunk and has at least two; never in ops, attest, system,
+          downlink or @; no wildcard directly under raw/; and never under a gateway's
+          namespace. max_distribution is public or controlled. publish_key begins with
+          {namespace}/. Context keys match [a-z0-9_.] and values [A-Za-z0-9 ._:+-].
+          only_when keys and both sides of carry are model keys, [a-z0-9_.]; an only_when
+          value matches [A-Za-z0-9._:+-].
+          stale_after_s is a whole number; packs_dir is an absolute path.
+      tags: [always]
+
     # A declared peer mints its own cert. Nothing here is ever minted by hand:
     # the ACL template is generated from the same `peers` data, so a hand-minted
     # cert would have no policy and a hand-written policy would have no cert.
@@ -926,6 +995,22 @@
       loop_control: { loop_var: dest, label: "{{ dest.id }} ({{ dest.cert_cn }})" }
       tags: [pen, egress, onboard]
 
+    # A translation gateway's certificate, minted like an arm's. Named <id>-translate so it
+    # cannot collide with an arm, a peer or a destination of the same id. clientAuth only:
+    # it dials the pen and never serves.
+    - name: pen — derive leaf-cert specs for translation gateways
+      ansible.builtin.set_fact:
+        translate_leaf_certs: >-
+          {{ translate_leaf_certs | default([]) + [ {
+               'name': xl.id ~ '-translate',
+               'cn':   xl.cert_cn,
+               'eku':  'clientAuth',
+               'san':  'DNS:' ~ xl.cert_cn
+             } ] }}
+      loop: "{{ active_translators }}"
+      loop_control: { loop_var: xl, label: "{{ xl.id }} ({{ xl.cert_cn }})" }
+      tags: [pen, translate, onboard]
+
     # The downlink bridge's pen identity. Its FABRIC identity is the slot, never this.
     - name: pen — derive the leaf-cert spec for the downlink bridge
       ansible.builtin.set_fact:
@@ -976,7 +1061,8 @@
       loop: >-
         {{ pen_leaf_certs + (peer_leaf_certs | default([]))
            + (arm_leaf_certs | default([])) + (health_leaf_certs | default([]))
-           + (egress_leaf_certs | default([])) + (downlink_leaf_certs | default([])) }}
+           + (egress_leaf_certs | default([])) + (downlink_leaf_certs | default([]))
+           + (translate_leaf_certs | default([])) }}
       loop_control: { label: "{{ item.name }} (CN={{ item.cn }})" }
       tags: [pen, onboard]
 
@@ -1143,7 +1229,7 @@
         sink_suffix: "-{{ item.id }}"
         sink_key: "{{ item.namespace }}"
         sink_sub_id: "{{ pen_id }}-{{ item.id }}"
-      loop: "{{ active_peers + active_arms }}"
+      loop: "{{ active_peers + active_arms + active_translators }}"
       loop_control: { label: "{{ item.id }}" }
       notify: reload systemd
       tags: [pen, onboard]
@@ -1183,7 +1269,7 @@
       vars:
         _declared_sink_files: >-
           {{ ['/etc/containers/systemd/octo-pen-audit-sink.container']
-             + ((active_peers + active_arms)
+             + ((active_peers + active_arms + active_translators)
                 | map(attribute='id')
                 | map('regex_replace', '^(.*)$', '/etc/containers/systemd/octo-pen-audit-sink-\1.container')
                 | list)
@@ -1254,7 +1340,7 @@
         state: started
       loop: >-
         {{ ['octo-pen-zenoh-router.service', 'octo-pen-audit-sink.service']
-           + ((active_peers + active_arms)
+           + ((active_peers + active_arms + active_translators)
               | map(attribute='id')
               | map('regex_replace', '^(.*)$', 'octo-pen-audit-sink-\1.service')
               | list) }}
@@ -1965,6 +2051,187 @@
       loop_control: { label: "{{ item.dest.id }}" }
       tags: [egress, onboard]
 
+    # ================================================================ translate
+    # TRANSLATION GATEWAYS (docs/adr/0004). Every task here loops over active_translators,
+    # which is empty unless 50-translate.yml declares one, so a pod without one changes
+    # nothing here. One gateway per entry: its own pen certificate (minted with the
+    # others), its own TLS and audit directories, and a unit. It is not an arm: nothing
+    # here opens a socket toward a sensor or a receiver.
+    # Every per-gateway path uses `xl`, not `item`, so the publisher removal check in
+    # tests/test_templates.py cannot mistake a gateway key for an arm key;
+    # `octo-pod translate remove` deletes both copies of the key, and
+    # tests/test_translate.py checks that against these tasks.
+    - name: translate — tls dir
+      ansible.builtin.file:
+        path: "/etc/octo-translate-{{ xl.id }}/tls"
+        state: directory
+        mode: "0755"
+      loop: "{{ active_translators }}"
+      loop_control: { loop_var: xl, label: "{{ xl.id }}" }
+      tags: [translate, onboard]
+
+    - name: translate — place cert (public)
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ xl.id }}-translate-cert.pem"
+        dest: "/etc/octo-translate-{{ xl.id }}/tls/translate-cert.pem"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ active_translators }}"
+      loop_control: { loop_var: xl, label: "{{ xl.id }}" }
+      # As for arms and destinations: the mint is a shell task that check mode skips.
+      when: >-
+        not ansible_check_mode
+        or (pen_state_dir ~ '/zenoh/tls/' ~ xl.id ~ '-translate-cert.pem')
+           in (_pen_tls.files | default([]) | map(attribute='path') | list)
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: [translate, onboard]
+
+    - name: translate — place private key (readable ONLY by the gateway's runtime uid)
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/{{ xl.id }}-translate-key.pem"
+        dest: "/etc/octo-translate-{{ xl.id }}/tls/translate-key.pem"
+        remote_src: true
+        owner: root
+        group: "{{ audit_runtime_uid }}"
+        mode: "0640"
+      loop: "{{ active_translators }}"
+      loop_control: { loop_var: xl, label: "{{ xl.id }}" }
+      when: >-
+        not ansible_check_mode
+        or (pen_state_dir ~ '/zenoh/tls/' ~ xl.id ~ '-translate-key.pem')
+           in (_pen_tls.files | default([]) | map(attribute='path') | list)
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: [translate, onboard]
+
+    - name: translate — place CA root
+      ansible.builtin.copy:
+        src: "{{ pen_state_dir }}/zenoh/tls/ca-roots.pem"
+        dest: "/etc/octo-translate-{{ xl.id }}/tls/ca-root.pem"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ active_translators }}"
+      loop_control: { loop_var: xl, label: "{{ xl.id }}" }
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: [translate, onboard]
+
+    # The audit record says which captured sample became which published one, so it
+    # outlives the gateway: `octo-pod translate remove` keeps it, and only this
+    # gateway's uid may write it.
+    - name: translate — audit dir, writable only by the gateway's runtime uid
+      ansible.builtin.file:
+        path: "{{ translate_audit_dir }}/{{ xl.id }}"
+        state: directory
+        owner: "{{ audit_runtime_uid }}"
+        group: "{{ audit_runtime_uid }}"
+        mode: "0750"
+      loop: "{{ active_translators }}"
+      loop_control: { loop_var: xl, label: "{{ xl.id }}" }
+      tags: [translate, onboard]
+
+    # The image: a pinned reference when one is given, otherwise built here from
+    # gateway/translate, which only a clone has. A pod with neither and a gateway
+    # declared refuses, naming both ways forward. The build context is the repository
+    # root: the gateway takes the pen session code from arms/common by path.
+    - name: translate — does this pod run a gateway?
+      ansible.builtin.set_fact:
+        _translate_needed: "{{ active_translators | length > 0 }}"
+        _translate_from_src: "{{ (translate_image | default('', true)) | length == 0 }}"
+      tags: [translate, onboard]
+
+    - name: translate — is the gateway source here?
+      ansible.builtin.stat: { path: "{{ playbook_dir }}/../gateway/translate/Dockerfile" }
+      register: _translate_src
+      when: _translate_needed and _translate_from_src
+      tags: [translate, onboard]
+
+    - name: translate — an image it cannot build or pull cannot be started
+      ansible.builtin.assert:
+        that: _translate_src.stat.exists | default(false)
+        fail_msg: >-
+          This pod declares a translation gateway but has no image for it. Set
+          translate_image to a digest-pinned reference this pod carries or can pull, or
+          run from a clone of octo-pod, which builds localhost/octo-translate:dev from
+          gateway/translate.
+        quiet: true
+      when: _translate_needed and _translate_from_src
+      tags: [translate, onboard]
+
+    - name: translate — build the gateway image from source (clones only)
+      ansible.builtin.command: >-
+        podman build -f {{ playbook_dir }}/../gateway/translate/Dockerfile
+        -t localhost/octo-translate:dev {{ playbook_dir }}/..
+      register: _translate_build
+      changed_when: "'COMMIT' in _translate_build.stdout"
+      when: _translate_needed and _translate_from_src
+      tags: [translate, onboard]
+
+    - name: translate — the source build is the image for this run
+      ansible.builtin.set_fact:
+        translate_image: localhost/octo-translate:dev
+      when: _translate_needed and _translate_from_src
+      tags: [translate, onboard]
+
+    - name: translate — pull the pinned image before starting anything
+      ansible.builtin.command: "podman pull {{ translate_image }}"
+      register: _translate_pull
+      changed_when: "'Writing manifest' in _translate_pull.stdout"
+      when: _translate_needed and not _translate_from_src
+      tags: [translate, onboard]
+
+    - name: translate — quadlet per gateway
+      ansible.builtin.template:
+        src: translate/octo-translate.container.j2
+        dest: "/etc/containers/systemd/octo-translate-{{ xl.id }}.container"
+        mode: "0644"
+      vars: { t: "{{ xl }}" }
+      register: _translate_units
+      loop: "{{ active_translators }}"
+      loop_control: { loop_var: xl, label: "{{ xl.id }}: {{ xl['from'] }} -> {{ xl.to | join(', ') }}" }
+      tags: [translate, onboard]
+
+    # Removal converges for gateways as for arms and destinations: a unit file no
+    # declaration names is stopped and deleted, so a forgotten unit cannot resurrect its
+    # gateway at boot.
+    - name: translate — find gateway units on disk
+      ansible.builtin.find:
+        paths: /etc/containers/systemd
+        patterns: "octo-translate-*.container"
+      register: _translate_on_disk
+      tags: [translate, onboard]
+
+    - name: translate — reap gateway units no declaration names
+      ansible.builtin.shell: |
+        systemctl stop "{{ item | basename | regex_replace('\\.container$', '') }}.service" 2>/dev/null || true
+        rm -f "{{ item }}"
+      loop: >-
+        {{ _translate_on_disk.files | map(attribute='path')
+           | reject('in', active_translators | map(attribute='id')
+                    | map('regex_replace', '^(.*)$', '/etc/containers/systemd/octo-translate-\1.container')
+                    | list) | list }}
+      changed_when: true
+      tags: [translate, onboard]
+
+    - name: translate — generate the units just rendered
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: _translate_needed or (_translate_on_disk.files | length > 0)
+      tags: [translate, onboard]
+
+    # A changed unit means changed sources, formats, context or image: restart that
+    # gateway so it runs what was declared. An unchanged one is only made sure to be
+    # running.
+    - name: translate — up
+      ansible.builtin.systemd:
+        name: "octo-translate-{{ item.xl.id }}.service"
+        state: "{{ 'restarted' if item.changed else 'started' }}"
+      loop: "{{ _translate_units.results | default([]) }}"
+      loop_control: { label: "{{ item.xl.id }}" }
+      tags: [translate, onboard]
+
     # ================================================================== firewall
     # DENY BY DEFAULT, IN EVERY DIRECTION, once pod_firewall_enabled is true. Rendered after
     # the arms and destinations so it opens exactly what was just declared, and applied by
@@ -2201,6 +2468,10 @@
                 | map('regex_replace', '^', 'octo-pen-audit-sink-') | list)
              + (active_egress | default([]) | map(attribute='id')
                 | map('regex_replace', '^', 'octo-egress-') | list)
+             + (active_translators | default([]) | map(attribute='id')
+                | map('regex_replace', '^', 'octo-translate-') | list)
+             + (active_translators | default([]) | map(attribute='id')
+                | map('regex_replace', '^', 'octo-pen-audit-sink-') | list)
              + (['octo-tcp-ingest', 'octo-udp-ingest'] if arm_enabled | default(false) | bool else []) }}
       tags: [arm, onboard, orphans]
 

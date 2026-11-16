@@ -1,0 +1,51 @@
+{
+  "repository": "https://github.com/usareur-af/goat-transformers",
+  "commit": "0be9fc9cf926139d7c188465e56f0320f348657a",
+  "formats": [
+    "cot-xml",
+    "geojson",
+    "sapient"
+  ],
+  "files": [
+    {
+      "path": "model/core.def",
+      "sha256": "275729696e9bb7a91e3b46bc0f8a3f5ebf0fad66b9af9f458923eaf36cefe859"
+    },
+    {
+      "path": "model/sapient.def",
+      "sha256": "9c8d3de16e1a391a6290f46237ed72fea3d00a6172d220645aaa763a7a4f108d"
+    },
+    {
+      "path": "model/track.def",
+      "sha256": "a64c182427b56bfbaf3cbd329e63ba3ae7fd42232c84aaf3987e8eaa418e7187"
+    },
+    {
+      "path": "packs/cot-xml/pack.def",
+      "sha256": "6c5d24b3f1c392bc47f802d3f1f6ba38a1b28a9737cb695939a6b174be3932b5"
+    },
+    {
+      "path": "packs/cot-xml/pack.md",
+      "sha256": "d56a2108b3874f11b76e02ba6fa079db35fd2eeb0e288319b3b3001677152ebf"
+    },
+    {
+      "path": "packs/geojson/pack.def",
+      "sha256": "33b649aa3241e5ff6b54e8bd9aa8712cab2359be095c9b23c2a4e566ff31b96e"
+    },
+    {
+      "path": "packs/geojson/pack.md",
+      "sha256": "5e6c3a1113d2ca2b8e201c3712d5161f325778efbb5c9f790d9cabe641752c85"
+    },
+    {
+      "path": "packs/sapient/PROVENANCE.md",
+      "sha256": "76fba1901f9a9751d363282cd18adda05900d298ed040aae8ed113fb432a4294"
+    },
+    {
+      "path": "packs/sapient/pack.def",
+      "sha256": "30830bb4a8fa497923a3f3a6b063821a9500d08f51ad56ba6434189156b68c20"
+    },
+    {
+      "path": "packs/sapient/pack.md",
+      "sha256": "606ca4243993271023da8e75502a2d70bed37b755943e80aff57e3719d759d1a"
+    }
+  ]
+}
