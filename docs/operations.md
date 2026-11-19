@@ -242,6 +242,25 @@ sudo octo-pod egress add c2-sapient1 --dest sapient://10.1.2.30:48000 --node-typ
   --key '<sensor-anchor>/sensors/radar1/sapient/**'
 ```
 
+A receiver may need a format no sensor publishes: CoT for a TAK server, ASTERIX CAT062 or
+SAPIENT for a C2 system. The pod converts no format, so the key it delivers must already carry
+the receiver's format, written once upstream: by the producer (open-billie encodes CoT, CAT062
+and SAPIENT at the node), or by [goat-transformers](https://github.com/USAREUR-AF/goat-transformers)
+converting tracks on the fabric (`goat-xf-pipe-zenoh`). Give the pod that key:
+
+```bash
+sudo octo-pod egress add tak-tracks --dest udp://10.1.2.40:6969 \
+  --key '<publisher key carrying CoT>'
+sudo octo-pod egress add c2-tracks --dest sapient://10.1.2.30:48000 --node-type OTHER \
+  --key '<publisher key carrying SAPIENT>'
+```
+
+Each sample is one CoT event, one ASTERIX data block, or one `SapientMessage` without a length
+prefix. Measured: payloads encoded upstream reach a `udp://` receiver byte for byte, and a
+`sapient://` controller unchanged under the arm's node id, through `downlink-bridge` and
+`egress-arm` (octo-pod `fe48297`, one host).
+goatcore [ADR 1255](https://github.com/USAREUR-AF/goatcore/blob/main/docs/adr/1255-vendor-systems-connect-through-one-vendor-bridges-repository-and-open-standards-go-through-goat-transformers.md) (accepted) sets this route.
+
 Open both downward gates for the first destination. The first release on a pod also takes
 the bundle GOAT issued for the pod, because the downlink bridge reads the fabric as the
 pod's slot, and the fingerprint that proves the bundle is genuine (see
