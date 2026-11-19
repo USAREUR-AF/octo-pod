@@ -242,6 +242,24 @@ sudo octo-pod egress add c2-sapient1 --dest sapient://10.1.2.30:48000 --node-typ
   --key '<sensor-anchor>/sensors/radar1/sapient/**'
 ```
 
+A receiver may need a format no sensor publishes: CoT for a TAK server, ASTERIX CAT062 or
+SAPIENT for a C2 system, from tracks or decoded records on the fabric. The pod converts no
+format. [open-entity-gateway](https://github.com/USAREUR-AF/open-entity-gateway) does: its
+`fabric` destination encodes each track and publishes one payload per sample on one key, in
+the form these destinations relay (one CoT event, one ASTERIX data block, or one
+`SapientMessage` without a length prefix). Give the pod that key:
+
+```bash
+sudo octo-pod egress add tak-tracks --dest udp://10.1.2.40:6969 \
+  --key 'release/<lane>/tracks/cot'
+sudo octo-pod egress add c2-tracks --dest sapient://10.1.2.30:48000 --node-type OTHER \
+  --key 'release/<lane>/tracks/sapient'
+```
+
+The gateway's side is in its
+[fabric destination](https://github.com/USAREUR-AF/open-entity-gateway/blob/main/docs/adapters/fabric.md).
+Built on both sides; not yet run end to end through a pod.
+
 Open both downward gates for the first destination. The first release on a pod also takes
 the bundle GOAT issued for the pod, because the downlink bridge reads the fabric as the
 pod's slot, and the fingerprint that proves the bundle is genuine (see
