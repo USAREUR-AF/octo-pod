@@ -259,6 +259,7 @@ Each sample is one CoT event, one ASTERIX data block, or one `SapientMessage` wi
 prefix. Measured: payloads encoded upstream reach a `udp://` receiver byte for byte, and a
 `sapient://` controller unchanged under the arm's node id, through `downlink-bridge` and
 `egress-arm` (octo-pod `fe48297`, one host).
+goatcore [ADR 1255](https://github.com/USAREUR-AF/goatcore/blob/main/docs/adr/1255-vendor-systems-connect-through-one-vendor-bridges-repository-and-open-standards-go-through-goat-transformers.md) (accepted) sets this route.
 
 Open both downward gates for the first destination. The first release on a pod also takes
 the bundle GOAT issued for the pod, because the downlink bridge reads the fabric as the
