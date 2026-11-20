@@ -1,0 +1,29 @@
+$ sudo octo-pod add-arm sensor1 --udp 48021 --from 192.0.2.30 --bind 192.0.2.10
+declared sensor1 in /etc/octo-pod/host_vars/pod-x/30-arms.yml
+
+Nothing on the pod has changed yet. Next:
+  octo-pod check     # read the diff
+  octo-pod apply
+
+$ sudo octo-pod get arms
+NAME      DIRECTION   STATE         IN/s   OUT/s   DROP   LAST
+sensor1   ingress     NOT RUNNING   -      -       -      -
+
+$ cat /etc/octo-pod/host_vars/pod-x/30-arms.yml
+arms:
+  - id: sensor1
+    kind: udp-ingest
+    description: "sensor1 — udp publisher"
+    cert_cn: octo-arm-sensor1
+    namespace: "raw/sensor1/**"
+    enabled: true
+    feed: feed1
+    transport: udp
+    port: 48021
+    allow_sources: "192.0.2.30"
+    bind_host: "192.0.2.10"
+    trust_tier: T1
+    onboarded: "2026-11-20"
+    release:
+      to_fabric: false   # shut until you have seen their data. Opening it also needs
+                       # raw/sensor1/** added to bridge_allow in 10-pod.yml.

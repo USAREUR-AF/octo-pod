@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# copied in by capture-packets.sh from arms/Cargo.lock
+captures/packets/Cargo.lock
+captures/packets/target/
