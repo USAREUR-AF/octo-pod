@@ -489,6 +489,7 @@ requires  lat lon
 field  sapient.detection_report_report_id                                      7.1         pstring
 field  sapient.detection_report_object_id                                      7.2         pstring
 field  sapient.detection_report_task_id                                        7.3         pstring
+field  track.status_text                                                       7.4         pstring
 field  sapient.detection_report_state                                          7.4         pstring
 field  sapient.range_bearing_elevation                                         7.5.1       pdouble
 field  sapient.range_bearing_azimuth                                           7.5.2       pdouble
@@ -544,6 +545,7 @@ field  sapient.enu_velocity_up_rate_error                                      7
 field  sapient.detection_report_colour                                         7.22        pstring
 field  sapient.detection_report_id                                             7.23        pstring
 field  track.class                                                             7.11.1      pstring  via sapient-class
+field  track.confidence                                                        7.11.2      pfloat  with track.class
 const  7.6.7       1
 const  7.6.8       1
 group  sapient.detection_report_track_info  7.8

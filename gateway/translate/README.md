@@ -55,7 +55,7 @@ The attachment is one JSON object:
 ```json
 {"source_key": "raw/radar1/sapient/192-0-2-50", "source_ts": "2026-11-16T10:00:00.000Z",
  "source_hash": "sha256:…", "from": "sapient", "to": "cot-xml", "gateway": "xl1",
- "packs_commit": "0be9fc9cf926139d7c188465e56f0320f348657a"}
+ "packs_commit": "240d06df1ffd0f2b62d795a101c6996be2344b1f"}
 ```
 
 `source_ts` is the Zenoh timestamp of the captured sample, or `null` when the pen did not
@@ -165,6 +165,7 @@ commit. These are the points that matter for the three shipped formats.
 | `time`, `start` | `stamp_time: true` (the time the pod received the sample) | the event has neither |
 | `stale` | `stale_after_s` | the event has none |
 | `how` | `context: {how: ...}` | the event has none |
+| `state` (free text) | the packs: `detail/remarks` | |
 
 The SAPIENT pack reads `Location.x` as longitude and `Location.y` as latitude for every
 coordinate system. Declare `only_when: {sapient.location_coordinate_system: 1}`
@@ -174,15 +175,20 @@ detection is converted with its metres or radians written as degrees. Every BSI 
 reference detection with an x-y-z location declares UTM; `tests/reference_vectors.rs`
 holds that they are skipped under this rule.
 
-A detection located by range and bearing only, and every message that is not a
-detection, has no value the targets hold and is skipped (`no-shared-value`).
+Every message that is not a detection has no value the targets hold and is skipped
+(`no-shared-value`). A detection located by range and bearing only is skipped for
+GeoJSON. For CoT it is converted when it carries a `state`, which CoT writes as
+`detail/remarks`: the event then has no position. A declaration that needs a position
+on every event declares `only_when: {sapient.location_coordinate_system: 1}`, which such
+a detection does not meet.
 
 **CoT to SAPIENT**
 
 The result is a `DetectionReport` with the position. `context: {sapient.node_id: ...}`
 gives it a node id, and `carry: {sapient.detection_report_object_id: uid}` an object id
-(a ULID only when the CoT `uid` is one). It has no `report_id` and no message timestamp,
-so a SAPIENT controller that validates detections refuses it.
+(a ULID only when the CoT `uid` is one). The message timestamp is the event time, split
+into seconds and nanoseconds by the pack. It has no `report_id`, so a SAPIENT controller
+that validates detections refuses it.
 
 Each remaining point is a limit of the packs or the model at the pinned commit, and is
 changed in goat-transformers.

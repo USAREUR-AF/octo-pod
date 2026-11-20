@@ -87,7 +87,7 @@ fn invalid(stage: &str, e: &goat_transformers::Error) -> Failure {
 /// Whether a wire type passes through the engine as hexadecimal text.
 #[must_use]
 pub fn is_binary(wire: Wire) -> bool {
-    matches!(wire, Wire::Protobuf | Wire::Bits)
+    matches!(wire, Wire::Protobuf | Wire::Bits | Wire::Tlv)
 }
 
 /// A declared conversion the gateway refuses to run.
@@ -526,8 +526,9 @@ mod tests {
     fn cot_xml_becomes_sapient_bytes_that_convert_back_to_the_same_position() {
         let t = translator("cot-xml", &["sapient"], &[]);
         let out = t.translate("sapient", COT.as_bytes(), &[]).unwrap();
-        // Protobuf, not hex text.
-        assert_eq!(out[0], 0x3a, "field 7 (detection_report), length-delimited");
+        // Protobuf, not hex text: field 1 (the timestamp, which the library derives from
+        // the event time), length-delimited.
+        assert_eq!(out[0], 0x0a, "field 1 (timestamp), length-delimited");
         let back = translator("sapient", &["geojson"], &[]);
         let json: serde_json::Value =
             serde_json::from_slice(&back.translate("geojson", &out, &[]).unwrap()).unwrap();
@@ -558,9 +559,11 @@ mod tests {
         let t = translator("cot-xml", &["geojson"], &[]);
         let why = t.translate("geojson", b"<event", &[]).unwrap_err();
         assert_eq!(why.outcome, Outcome::Invalid);
-        assert_eq!(why.detail, "decode: unexpected end in tag");
-        // The engine gives this error no name.
-        assert_eq!(why.name, "unnamed");
+        assert_eq!(
+            why.detail,
+            "decode: malformed-wire: xml: unexpected end in tag <event>"
+        );
+        assert_eq!(why.name, "malformed-wire");
 
         let why = t.translate("geojson", &[0xff, 0xfe], &[]).unwrap_err();
         assert_eq!(why.name, "not-text");
@@ -586,17 +589,16 @@ mod tests {
         assert_eq!(why.name, "no-shared-value");
     }
 
-    /// goat-transformers at the pinned commit indexes past the end of an XML document
-    /// that stops after an attribute's `=` (engines/rust/src/lib.rs, the attribute
-    /// parser). The sample is counted as one failure and the next one still converts.
-    /// When the library returns an error instead, this test fails on the name: change
-    /// it to the engine's error then.
+    /// An XML document that stops after an attribute's `=`. The library once indexed
+    /// past its end and panicked; since goat-transformers#12 it returns
+    /// `malformed-wire`. Either way the sample is one failure and the next one still
+    /// converts.
     #[test]
-    fn a_sample_the_engine_panics_on_is_one_failure_and_the_next_still_converts() {
+    fn a_truncated_sample_is_one_failure_and_the_next_still_converts() {
         let t = translator("cot-xml", &["geojson"], &[]);
         let why = t.translate("geojson", b"<event uid=", &[]).unwrap_err();
         assert_eq!(why.outcome, Outcome::Invalid);
-        assert_eq!(why.name, "engine-panic");
+        assert_eq!(why.name, "malformed-wire");
         assert!(t.translate("geojson", COT.as_bytes(), &[]).is_ok());
     }
 
@@ -630,9 +632,10 @@ mod tests {
     }
 
     /// What a declaration can give a SAPIENT result made from a `CoT` event: the node id
-    /// as declared context and the object id carried from the event's uid. The report
-    /// id and the message timestamp stay absent: nothing in the packs or the model
-    /// produces them.
+    /// as declared context and the object id carried from the event's uid. The message
+    /// timestamp is the event time, split into seconds and nanoseconds by the library
+    /// (sapient 0.2.0, goat-transformers#146). The report id stays absent: nothing in
+    /// the packs or the model produces it.
     #[test]
     fn a_cot_event_becomes_a_sapient_detection_with_the_declared_node_and_the_carried_object() {
         use prost::Message;
@@ -648,7 +651,12 @@ mod tests {
         let bytes = t.translate("sapient", COT.as_bytes(), &[]).unwrap();
         let message = SapientMessage::decode(bytes.as_slice()).unwrap();
         assert_eq!(message.node_id.as_deref(), Some(node));
-        assert!(message.timestamp.is_none());
+        // 2021-02-27T20:00:00.000Z
+        let timestamp = message
+            .timestamp
+            .expect("the timestamp derived from the event time");
+        assert_eq!(timestamp.seconds, 1_614_456_000);
+        assert_eq!(timestamp.nanos, 0);
         let Some(Content::DetectionReport(report)) = message.content else {
             panic!("not a DetectionReport: {message:?}");
         };

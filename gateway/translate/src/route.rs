@@ -197,7 +197,10 @@ pub fn encoding(format: &str, wire: Wire) -> Encoding {
         Wire::GeoJson => Encoding::from("application/geo+json"),
         Wire::Json => Encoding::APPLICATION_JSON,
         Wire::Protobuf => Encoding::APPLICATION_PROTOBUF.with_schema(format),
-        Wire::Bits => Encoding::APPLICATION_OCTET_STREAM.with_schema(format),
+        // Tag-length-value records (goat-transformers spec 0.13) are binary, as `bits` is.
+        Wire::Bits | Wire::Tlv => Encoding::APPLICATION_OCTET_STREAM.with_schema(format),
+        // One record of ASCII text (goat-transformers spec 0.10).
+        Wire::Text => Encoding::TEXT_PLAIN.with_schema(format),
     }
 }
 
@@ -313,5 +316,15 @@ mod tests {
             "application/octet-stream;adsb"
         );
         assert_eq!(encoding("x", Wire::Json), Encoding::APPLICATION_JSON);
+        assert_eq!(
+            encoding("misb0601", Wire::Tlv).to_string(),
+            Encoding::APPLICATION_OCTET_STREAM
+                .with_schema("misb0601")
+                .to_string()
+        );
+        assert_eq!(
+            encoding("nmea0183", Wire::Text).to_string(),
+            Encoding::TEXT_PLAIN.with_schema("nmea0183").to_string()
+        );
     }
 }

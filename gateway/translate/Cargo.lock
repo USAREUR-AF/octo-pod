@@ -890,8 +890,8 @@ dependencies = [
 
 [[package]]
 name = "goat-transformers"
-version = "0.1.0"
-source = "git+https://github.com/usareur-af/goat-transformers?rev=0be9fc9cf926139d7c188465e56f0320f348657a#0be9fc9cf926139d7c188465e56f0320f348657a"
+version = "0.8.0"
+source = "git+https://github.com/usareur-af/goat-transformers?rev=240d06df1ffd0f2b62d795a101c6996be2344b1f#240d06df1ffd0f2b62d795a101c6996be2344b1f"
 
 [[package]]
 name = "hashbrown"

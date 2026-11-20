@@ -340,16 +340,16 @@ async fn a_sample_that_does_not_convert_is_counted_and_recorded_and_never_publis
         .is_some()
     {}
 
-    // Cut inside the root tag, which the engine reports; cut after an attribute's `=`,
-    // on which the pinned engine panics; bytes that are not text; and a sample over
-    // max_bytes.
+    // Cut inside the root tag; cut after an attribute's `=` (an engine before
+    // goat-transformers#12 panicked on it; it now reports malformed-wire); bytes that
+    // are not text; and a sample over max_bytes.
     let truncated = &COT.as_bytes()[..6];
-    let panics = &COT.as_bytes()[..40];
-    assert!(panics.ends_with(b"type="));
+    let cut_after_equals = &COT.as_bytes()[..40];
+    assert!(cut_after_equals.ends_with(b"type="));
     let oversize = vec![b' '; 5000];
     for bad in [
         truncated,
-        panics,
+        cut_after_equals,
         &[0xff, 0xfe, 0xfd][..],
         oversize.as_slice(),
     ] {
@@ -382,9 +382,12 @@ async fn a_sample_that_does_not_convert_is_counted_and_recorded_and_never_publis
             .starts_with("decode: "),
         "{failed:?}"
     );
-    assert_eq!(failed[0]["detail"], "decode: unexpected end in tag");
-    assert_eq!(failed[1]["error"], "engine-panic");
-    assert_eq!(failed[1]["source_hash"], payload_hash(panics));
+    assert_eq!(
+        failed[0]["detail"],
+        "decode: malformed-wire: xml: unexpected end in tag <event>"
+    );
+    assert_eq!(failed[1]["error"], "malformed-wire");
+    assert_eq!(failed[1]["source_hash"], payload_hash(cut_after_equals));
     assert_eq!(failed[2]["error"], "not-text");
     let stop_line = lines
         .iter()

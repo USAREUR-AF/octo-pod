@@ -88,14 +88,17 @@ fn every_accepted_reference_vector_converts_is_skipped_or_fails_by_name() {
     }
     assert_eq!(vectors, 38);
     // Only a detection holds a position, and neither target has a field for anything
-    // else. One reference detection gives its position as range and bearing, which the
-    // SAPIENT pack does not map, so it is skipped too.
+    // else of the other messages. One reference detection gives its position as range
+    // and bearing, which the SAPIENT pack does not map. GeoJSON has no field for the
+    // rest of it, so it is skipped there. CoT does: its free-text `state` is
+    // `track.status_text`, which cot-xml writes as `detail/remarks` (goat-transformers
+    // spec 0.18, #166), so it converts to an event that has no position.
     for ((message, target), (converted, skipped, failed)) in &seen {
         assert!(failed.is_empty(), "{message} to {target}: {failed:?}");
-        let expected = if *message == "detection_report" {
-            (2, 1)
-        } else {
-            (0, *skipped)
+        let expected = match (*message, *target) {
+            ("detection_report", "cot-xml") => (3, 0),
+            ("detection_report", _) => (2, 1),
+            _ => (0, *skipped),
         };
         assert_eq!((*converted, *skipped), expected, "{message} to {target}");
     }

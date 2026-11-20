@@ -20,14 +20,14 @@ of version 0.6 where the generator was given them, and a `group` block of versio
 | messages reachable from `SapientMessage` (through repeated fields too) | 63 |
 | message types on the walked paths | 52 |
 | kinds | 9 |
-| `field` lines | 433 |
+| `field` lines | 435 |
 | of those, inside a `group` | 256 |
 | `group` blocks | 51 |
 | of those, inside another group | 23 |
 | of those, a repeated scalar (one `.` field) | 7 |
 | keys in module `sapient` | 291 |
 | lists in module `sapient` | 49 |
-| `field` lines bound to `core` or `track` keys | 9 |
+| `field` lines bound to `core` or `track` keys | 11 |
 | `const` lines | 2 |
 | value tables (`map` lines) | 1 (9) |
 | vectors (existing and generated) | 17 |
@@ -77,6 +77,7 @@ inside a block start at the item.
 
 | Key | Path | Schema field | Schema comment |
 |---|---|---|---|
+| `track.status_text` | `7.4` | `DetectionReport.state` (string) | Whether a special case is in effect (e.g. object lost) |
 | `lon` | `7.6.1` | `Location.x` (double) | X-coordinate (normally longitude) |
 | `lat` | `7.6.2` | `Location.y` (double) | Y-coordinate (normally latitude) |
 | `hae` | `7.6.3` | `Location.z` (double) | Z-coordinate (normally altitude) |
@@ -99,6 +100,7 @@ is carried, the last on decode):
 | Key | Path | Transform | Table |
 |---|---|---|---|
 | `track.class` | `7.11.1` | `pstring` | `sapient-class` |
+| `track.confidence` | `7.11.2` | `pfloat` | none |
 
 Constants, written on every encode of the kind over any field (engine-spec 0.6):
 
@@ -118,7 +120,7 @@ require only common keys, so they are reached only by an entity that lacks
 
 | From | Encodes as | Keys carried | Keys the pack has no place for | Vector |
 |---|---|---|---|---|
-| `cot-xml` | `detection_report` | `hae` `lat` `lon` | `uid` `type` `time_ms` `how` `ce` `le` `callsign` | `packs/cot-xml/vectors/gen-cot-xml-to-sapient.json` |
+| `cot-xml` | `detection_report` | `hae` `lat` `lon` | `track.scoped_id` `uid` `type` `time_ms` `how` `ce` `le` `callsign` `time_text` | `packs/cot-xml/vectors/gen-cot-xml-to-sapient.json` |
 | `geojson` | `detection_report` | `hae` `lat` `lon` | none | `packs/geojson/vectors/gen-geojson-to-sapient.json` |
 
 ## Position assumption
@@ -127,7 +129,7 @@ require only common keys, so they are reached only by an entity that lacks
 
 ## Bound to `track` keys
 
-- `Location.z_error` (7.6.6) is `track.sigma_up_m`: with coordinate system 1 the z error is in metres. `x_error` and `y_error` (7.6.4, 7.6.5) are in degrees there and stay raw.
+- `Location.z_error` (7.6.6) is `track.sigma_up_m`: with coordinate system 1 the z error is in metres. `x_error` and `y_error` (7.6.4, 7.6.5) are in degrees there: they stay raw keys, and `model/sapient.def` derives them from `track.sigma_east_m` and `track.sigma_north_m` at the report's `lat` (`deg_lon_of`, `deg_lat_of`, engine-spec 0.16) when the entity does not hold them, as the open-billie translator writes them.
 - `DetectionReport.detection_confidence` (7.7) is `track.confidence`: the schema comment gives the range 0-1.
 - `ENUVelocity.east_rate`, `north_rate`, `up_rate` (7.19.1 to 7.19.3) are `track.vel_east_ms`, `track.vel_north_ms`, `track.vel_up_ms`. The message carries no unit: the unit (metres per second or kilometres per hour) is declared in the node's Registration. The binding holds for a node that registered metres per second.
 - `DetectionReportClassification.type` (7.11.1) is `track.class` through the table `sapient-class`. `classification` is a repeated field: one occurrence is carried, the last on decode. The wire names are those the open-billie translator writes (`runtime/rust/translator/src/sapient.rs`, `sapient_class`): `UNKNOWN`, `AIRCRAFT_FIXEDWING`, `AIRCRAFT_ROTARYWING`, `UAV`, `BALLOON`, `BIRD`, `VEHICLE`, `CLUTTER`. `unknown` and `other` both encode as `UNKNOWN`, and `UNKNOWN` decodes as `unknown`. The schema leaves the type a free string, so a name the table does not hold passes through unchanged in both directions.
@@ -135,7 +137,7 @@ require only common keys, so they are reached only by an entity that lacks
 ## Left raw on purpose
 
 - `DetectionReport.object_id` (7.2): a ULID in the schema (`is_ulid`), allocated by the reporting node for the object. It is not `uid`: an identifier from another format is not a ULID, so nothing is bound to the path and it stays the raw key `sapient.detection_report_object_id`. The same holds for `report_id` (7.1).
-- `google.protobuf.Timestamp` (message timestamp 1, predicted time 7.9.3, task start and end 8.4 and 8.5): two integers, seconds and nanos. No transform joins two wire fields into `time_ms`.
+- `google.protobuf.Timestamp` (message timestamp 1, predicted time 7.9.3, task start and end 8.4 and 8.5): two integers, seconds and nanos, raw keys. On encode the message timestamp is derived from `time_ms` (`sec_of`, `nsec_of`, engine-spec 0.16) when the entity does not hold it; a caller that stamps its own sending time passes `sapient.timestamp_seconds` and `sapient.timestamp_nanos` as context. Decode does not join them into `time_ms`.
 - `DetectionReport.range_bearing` (7.5): position relative to the sensor; the shared model has no key for it.
 
 ## Generated vectors
