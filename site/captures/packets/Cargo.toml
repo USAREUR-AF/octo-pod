@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# Records the packets the landing page replays: real datagrams through the real
+# udp-ingest arm into a real Zenoh router on loopback. See ../README.md.
+
+[package]
+name = "landing-packets"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+# Its own workspace: not a member of arms/, and never part of a pod.
+[workspace]
+
+[dependencies]
+octo-arm-common = { path = "../../../arms/common", features = ["test-support"] }
+zenoh = { version = "=1.9.0", features = ["unstable"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "process", "io-util"] }
+serde_json = "1"

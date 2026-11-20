@@ -1,0 +1,441 @@
+{
+  "arms": [
+    {
+      "allow_sources": "127.0.0.1",
+      "name": "sensor1"
+    },
+    {
+      "allow_sources": "192.0.2.30",
+      "name": "sensor2"
+    }
+  ],
+  "events": [
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0001 t=000000ms",
+      "t": 3435,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0001 t=000000ms",
+      "t": 3437
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0002 t=000253ms",
+      "t": 3688,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0002 t=000253ms",
+      "t": 3689
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0003 t=000505ms",
+      "t": 3941,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0003 t=000505ms",
+      "t": 3941
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0004 t=000757ms",
+      "t": 4192,
+      "to": "sensor2"
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0005 t=001008ms",
+      "t": 4443,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0005 t=001008ms",
+      "t": 4444
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0006 t=001261ms",
+      "t": 4696,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0006 t=001261ms",
+      "t": 4696
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0007 t=001512ms",
+      "t": 4948,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0007 t=001512ms",
+      "t": 4948
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0008 t=001764ms",
+      "t": 5199,
+      "to": "sensor2"
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0009 t=002016ms",
+      "t": 5451,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0009 t=002016ms",
+      "t": 5452
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0010 t=002268ms",
+      "t": 5703,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0010 t=002268ms",
+      "t": 5704
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0011 t=002520ms",
+      "t": 5955,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0011 t=002520ms",
+      "t": 5956
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0012 t=002772ms",
+      "t": 6207,
+      "to": "sensor2"
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0013 t=003025ms",
+      "t": 6460,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0013 t=003025ms",
+      "t": 6460
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0014 t=003275ms",
+      "t": 6710,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0014 t=003275ms",
+      "t": 6711
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0015 t=003528ms",
+      "t": 6963,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0015 t=003528ms",
+      "t": 6963
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0016 t=003781ms",
+      "t": 7216,
+      "to": "sensor2"
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0017 t=004033ms",
+      "t": 7468,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0017 t=004033ms",
+      "t": 7469
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0018 t=004285ms",
+      "t": 7720,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0018 t=004285ms",
+      "t": 7721
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0019 t=004537ms",
+      "t": 7972,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0019 t=004537ms",
+      "t": 7973
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0020 t=004789ms",
+      "t": 8225,
+      "to": "sensor2"
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0021 t=005041ms",
+      "t": 8476,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0021 t=005041ms",
+      "t": 8477
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0022 t=005293ms",
+      "t": 8728,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0022 t=005293ms",
+      "t": 8729
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0023 t=005544ms",
+      "t": 8979,
+      "to": "sensor1"
+    },
+    {
+      "bytes": 29,
+      "key": "raw/sensor1/feed1/127-0-0-1",
+      "kind": "published",
+      "payload": "synthetic seq=0023 t=005544ms",
+      "t": 8980
+    },
+    {
+      "bytes": 29,
+      "kind": "sent",
+      "payload": "synthetic seq=0024 t=005796ms",
+      "t": 9232,
+      "to": "sensor2"
+    }
+  ],
+  "logs": [
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:19.701616Z  INFO udp_ingest: udp-ingest starting feeds=[Feed { label: \"feed1\", port: 53733 }] bind_host=127.0.0.1 key_prefix=raw/sensor1 endpoint=tcp/127.0.0.1:63303 allow_sources=127.0.0.1",
+      "t": 3415
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:19.702641Z  INFO udp_ingest: udp-ingest starting feeds=[Feed { label: \"feed1\", port: 63926 }] bind_host=127.0.0.1 key_prefix=raw/sensor2 endpoint=tcp/127.0.0.1:63303 allow_sources=192.0.2.30",
+      "t": 3416
+    },
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:19.704588Z  INFO zenoh::net::runtime: Using ZID: 40c7558a4e2d29affe6ba6d26517549d",
+      "t": 3417
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:19.705933Z  INFO zenoh::net::runtime: Using ZID: cfa79dcc1e4a8ceb8283e6fdf18d803b",
+      "t": 3419
+    },
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:19.712351Z  INFO zenoh::net::runtime::orchestrator: Listening scout messages on 224.0.0.224:7446",
+      "t": 3425
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:19.712351Z  INFO zenoh::net::runtime::orchestrator: Listening scout messages on 224.0.0.224:7446",
+      "t": 3425
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:19.722511Z  INFO udp_ingest: zenoh session opened",
+      "t": 3435
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:19.722668Z  INFO udp_ingest: udp listener bound feed=feed1 bind=127.0.0.1:63926",
+      "t": 3435
+    },
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:19.722754Z  INFO udp_ingest: zenoh session opened",
+      "t": 3435
+    },
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:19.722813Z  INFO udp_ingest: udp listener bound feed=feed1 bind=127.0.0.1:53733",
+      "t": 3435
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:20.479565Z  WARN octo_arm_common::ingest: dropped: source not allowed feed=\"feed1\" source=127.0.0.1",
+      "t": 4192
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:21.486556Z  WARN octo_arm_common::ingest: dropped: source not allowed feed=\"feed1\" source=127.0.0.1",
+      "t": 5199
+    },
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:21.724343Z  INFO octo_arm_common::stats: stats received=6 forwarded=6 forward_errors=0 sent=0 send_errors=0 dropped_source=0 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 5437
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:21.724343Z  INFO octo_arm_common::stats: stats received=2 forwarded=0 forward_errors=0 sent=0 send_errors=0 dropped_source=2 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 5437
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:22.494603Z  WARN octo_arm_common::ingest: dropped: source not allowed feed=\"feed1\" source=127.0.0.1",
+      "t": 6207
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:23.503418Z  WARN octo_arm_common::ingest: dropped: source not allowed feed=\"feed1\" source=127.0.0.1",
+      "t": 7216
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:23.726577Z  INFO octo_arm_common::stats: stats received=4 forwarded=0 forward_errors=0 sent=0 send_errors=0 dropped_source=4 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 7439
+    },
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:23.726577Z  INFO octo_arm_common::stats: stats received=12 forwarded=12 forward_errors=0 sent=0 send_errors=0 dropped_source=0 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 7439
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:24.512179Z  WARN octo_arm_common::ingest: dropped: source not allowed feed=\"feed1\" source=127.0.0.1",
+      "t": 8225
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:25.519220Z  WARN octo_arm_common::ingest: dropped: source not allowed feed=\"feed1\" source=127.0.0.1",
+      "t": 9232
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:25.728489Z  INFO octo_arm_common::stats: stats received=6 forwarded=0 forward_errors=0 sent=0 send_errors=0 dropped_source=6 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 9441
+    },
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:25.728400Z  INFO octo_arm_common::stats: stats received=18 forwarded=18 forward_errors=0 sent=0 send_errors=0 dropped_source=0 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 9441
+    },
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:27.730201Z  INFO octo_arm_common::stats: stats received=18 forwarded=18 forward_errors=0 sent=0 send_errors=0 dropped_source=0 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 11444
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:27.730207Z  INFO octo_arm_common::stats: stats received=6 forwarded=0 forward_errors=0 sent=0 send_errors=0 dropped_source=6 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 11444
+    },
+    {
+      "arm": "sensor1",
+      "line": "2026-11-20T07:19:29.732551Z  INFO octo_arm_common::stats: stats received=18 forwarded=18 forward_errors=0 sent=0 send_errors=0 dropped_source=0 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 13446
+    },
+    {
+      "arm": "sensor2",
+      "line": "2026-11-20T07:19:29.732450Z  INFO octo_arm_common::stats: stats received=6 forwarded=0 forward_errors=0 sent=0 send_errors=0 dropped_source=6 dropped_overflow=0 dropped_stale=0 dropped_egress=0 dropped_invalid=0 skipped=0 pen_outages=0 pending=0 outbox_capacity=512",
+      "t": 13446
+    }
+  ],
+  "router": "loopback test pen (octo_arm_common::testing::TestPen)"
+}
