@@ -44,7 +44,7 @@ path = "src/main.rs"
 # The mapping engine. Standard library only, no dependencies of its own. The rev is the
 # commit packs/MANIFEST.json records; move both together (tools/refresh-packs.py refuses
 # anything else).
-goat-transformers = { git = "https://github.com/usareur-af/goat-transformers", rev = "7597d8199bc37445fe572dde4286bdaf6571e72d" }
+goat-transformers = { git = "https://github.com/usareur-af/goat-transformers", rev = "9e951e9df8a212077cf7dcbc532aeadcdcbf88e5" }
 octo-arm-common = { path = "../../arms/common" }
 zenoh = { version = "=1.9.0", features = ["unstable"] }
 # sync: the bounded queue between the subscriber callback and the converter.

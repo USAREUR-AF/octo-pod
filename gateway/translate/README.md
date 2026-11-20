@@ -55,7 +55,7 @@ The attachment is one JSON object:
 ```json
 {"source_key": "raw/radar1/sapient/192-0-2-50", "source_ts": "2026-11-16T10:00:00.000Z",
  "source_hash": "sha256:…", "from": "sapient", "to": "cot-xml", "gateway": "xl1",
- "packs_commit": "7597d8199bc37445fe572dde4286bdaf6571e72d"}
+ "packs_commit": "9e951e9df8a212077cf7dcbc532aeadcdcbf88e5"}
 ```
 
 `source_ts` is the Zenoh timestamp of the captured sample, or `null` when the pen did not
