@@ -39,6 +39,43 @@ jobs:
         run: cargo test --workspace --locked
         working-directory: arms
 
+  # The translation gateway (docs/adr/0004) is its own workspace, so the arms' steps
+  # above do not see it. Same checks, same toolchain, its own lock file and policy.
+  gateway:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: gateway/translate
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+          fallback: none
+      - name: fmt
+        run: cargo fmt --all --check
+        working-directory: gateway/translate
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: gateway/translate
+      - name: test
+        run: cargo test --locked
+        working-directory: gateway/translate
+      - name: cargo-deny (licenses, bans, sources)
+        run: cargo deny check licenses bans sources
+        working-directory: gateway/translate
+      - name: cargo-audit
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0041
+        working-directory: gateway/translate
+      - name: the pack bundle matches its manifest and the pinned commit
+        run: python3 gateway/translate/tools/refresh-packs.py --check
+      - name: the image definition parses
+        run: docker buildx build --check -f gateway/translate/Dockerfile .
+
   # uuid 1.28 requires Rust 1.89; keep the declared minimum buildable.
   msrv:
     runs-on: ubuntu-24.04
@@ -88,6 +125,12 @@ jobs:
       # source on a pod" are checked on every push, not at tag time when it is too late.
       - name: release payload
         run: python3 tests/test_release.py
+        working-directory: platform
+
+      # A translation gateway reads other publishers' keys: its grants, its declaration
+      # gate and its CLI are checked on every push, with the ACL.
+      - name: translation gateway (grants, declaration gate, CLI, separation from the arms)
+        run: python3 tests/test_translate.py
         working-directory: platform
 
       - name: join proves the requested management connection

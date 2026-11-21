@@ -82,6 +82,7 @@ SECRET_PARTS = ("secret", "token", "passw", "passphrase", "private", "credential
 # bridge's copy, and the slot certificate with the fabric's root, which nothing on the
 # pod renews. A test reads the playbook and fails if it writes certificates elsewhere.
 DEFAULT_COPIES = ("/etc/octo-arm/tls:/etc/octo-arm-*/tls:/etc/octo-egress-*/tls:"
+                  "/etc/octo-translate-*/tls:"
                   "/etc/octo-pen-uplink:/etc/octo-downlink/tls:/etc/fabric-uplink")
 COPIES = os.environ.get("OCTO_POD_CERT_COPIES", DEFAULT_COPIES)
 TIMERS = ("pen-cert-renew.timer", "pen-cert-expiry.timer")
@@ -248,7 +249,8 @@ def owner_of(path, anchor):
         return "slot"   # both bridges present it to the fabric
     if f in CA_FILES:
         return "ca"
-    for pre, kind in (("octo-egress-", "egress"), ("octo-arm-", "arm")):
+    for pre, kind in (("octo-egress-", "egress"), ("octo-translate-", "translate"),
+                      ("octo-arm-", "arm")):
         if parent.startswith(pre):
             return f"{kind}/{parent[len(pre):]}"
     fixed = {"pod-cert.pem": "pen-router", "health-cert.pem": "health-publisher",
@@ -256,7 +258,7 @@ def owner_of(path, anchor):
              "downlink-bridge-cert.pem": "bridge/downlink", "arm-cert.pem": "first-party-arm"}
     if f in fixed:
         return fixed[f]
-    m = re.match(r"(.+)-(arm|egress)-cert\.pem$", f)
+    m = re.match(r"(.+)-(arm|egress|translate)-cert\.pem$", f)
     if m:
         return f"{m.group(2)}/{m.group(1)}"
     m = re.match(r"(.+)-cert\.pem$", f)
@@ -272,7 +274,7 @@ def short(path):
         return f"pen/{f}"
     base = os.path.basename(os.path.dirname(d) if os.path.basename(d) == "tls" else d)
     base = base.removeprefix("octo-")
-    for pre in ("egress-", "arm-"):
+    for pre in ("egress-", "translate-", "arm-"):
         if base.startswith(pre):
             base = f"{pre[:-1]}/{base[len(pre):]}"
     return f"{'slot' if base == 'fabric-uplink' else base}/{f}"
@@ -313,7 +315,7 @@ def certificates(days, now=None):
             # Removing an arm, peer or destination keeps its certificate for the audit
             # trail and deletes its key. Nothing presents or renews it again, so it is
             # listed but never fails --check.
-            retired = (d == pen and owner.split("/")[0] in ("arm", "egress", "peer")
+            retired = (d == pen and owner.split("/")[0] in ("arm", "egress", "peer", "translate")
                        and owner not in decl and not os.path.exists(path[:-8] + "key.pem"))
             for n, block in enumerate(blocks, 1):
                 cn, end = x509(block) if block else (None, None)

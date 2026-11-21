@@ -37,6 +37,13 @@ omit =
 bin =
     bin/
     */bin/
+# The translation gateway's own tools. platform/tests/test_translate.py copies the
+# gateway into a scratch tree (<tmp>/translate/) and runs its refresh-packs.py there.
+# Listed before `tools`, so those copies map here and not to the top-level tools/,
+# which has no such file.
+gateway_tools =
+    gateway/translate/tools/
+    */translate/tools/
 tools =
     tools/
     */tools/

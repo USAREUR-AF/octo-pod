@@ -170,6 +170,7 @@ fi
 if [ "$purge" = 1 ]; then
   rm -rf /etc/octo-pod /var/lib/octo-pen /var/lib/octo-registry /var/lib/octo-pod \
          /var/lib/octo-egress /etc/octo-arm /etc/octo-arm-* /etc/octo-egress-* \
+         /var/lib/octo-translate /etc/octo-translate-* \
          /etc/octo-downlink /etc/fabric-uplink /etc/octo-pen-uplink
 fi
 if [ "$wipe_stage" = 1 ]; then rm -rf /opt/octo-stage; fi

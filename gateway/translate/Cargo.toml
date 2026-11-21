@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# octo-translate: a translation gateway for one pod's pen.
+#
+# ADR 0001 keeps field translation out of octo-pod's arms and assigns it to a translation
+# gateway. This crate is that gateway (ADR 0004, Proposed). It is NOT a member of the
+# arms workspace: it has its own lock file, dependency policy, image and version, so a
+# translation change and a capture or session change are released separately, and the
+# directory can move to a repository of its own without changing the arms.
+#
+# It maps nothing itself. The mapping engine is goat-transformers, pinned by commit, and
+# the mappings are that library's packs, copied into packs/ at the same commit
+# (tools/refresh-packs.py, packs/MANIFEST.json).
+#
+# What it shares with the arms is the pen idiom only: the mTLS client session and the
+# counters of ../../arms/common, by path, so the two cannot drift.
+#
+# The zenoh pin is the arms' pin (=1.9.0, never float); platform/tests/test_translate.py
+# fails if the two differ.
+
+[package]
+name = "octo-translate"
+version = "0.1.0"
+# Never goes to crates.io: this is a binary baked into a container image, and it uses a
+# path dependency, which crates.io forbids.
+publish = false
+description = "octo-pod translation gateway: subscribes to captured pen keys, converts each sample with goat-transformers, republishes it under its own identity"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/usareur-af/octo-pod"
+
+[workspace]
+members = ["."]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "octo-translate"
+path = "src/main.rs"
+
+[dependencies]
+# The mapping engine. Standard library only, no dependencies of its own. The rev is the
+# commit packs/MANIFEST.json records; move both together (tools/refresh-packs.py refuses
+# anything else).
+goat-transformers = { git = "https://github.com/usareur-af/goat-transformers", rev = "9e951e9df8a212077cf7dcbc532aeadcdcbf88e5" }
+octo-arm-common = { path = "../../arms/common" }
+zenoh = { version = "=1.9.0", features = ["unstable"] }
+# sync: the bounded queue between the subscriber callback and the converter.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+tracing = "0.1"
+# All four are already in the zenoh dependency tree at these majors, and the egress arms
+# use the same four for the same jobs: the audit record, its payload hash and timestamp.
+serde_json = "1"
+ring = "0.17"
+hex = "0.4"
+humantime = "2"
+
+[dev-dependencies]
+octo-arm-common = { path = "../../arms/common", features = ["test-support"] }
+# The 231 BSI Flex 335 reference vectors and the decoder the arms test against, so the
+# gateway is tested on the SAPIENT bytes a pod captures.
+sapient-receiver = { path = "../../arms/sapient-receiver" }
+sapient-proto = { path = "../../arms/sapient-proto" }
+prost = "0.14"
+
+# The egress crate's lints, for the same reason: this crate writes data into the pen that
+# the pod did not capture.
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
