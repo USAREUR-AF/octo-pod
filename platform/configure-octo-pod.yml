@@ -2159,6 +2159,19 @@
       when: _translate_needed and _translate_from_src
       tags: [translate, onboard]
 
+    # The image id before the build or pull, so a run that produced a new image restarts
+    # the gateways even when their unit files did not change (a source build retags the
+    # same localhost/octo-translate:dev).
+    - name: translate — the image this pod runs now
+      ansible.builtin.command: >-
+        podman image inspect --format '{{ '{{' }}.Id{{ '}}' }}'
+        {{ translate_image | default('localhost/octo-translate:dev', true) }}
+      register: _translate_image_before
+      changed_when: false
+      failed_when: false
+      when: _translate_needed
+      tags: [translate, onboard]
+
     - name: translate — build the gateway image from source (clones only)
       ansible.builtin.command: >-
         podman build -f {{ playbook_dir }}/../gateway/translate/Dockerfile
@@ -2179,6 +2192,21 @@
       register: _translate_pull
       changed_when: "'Writing manifest' in _translate_pull.stdout"
       when: _translate_needed and not _translate_from_src
+      tags: [translate, onboard]
+
+    - name: translate — the image this run produced
+      ansible.builtin.command: >-
+        podman image inspect --format '{{ '{{' }}.Id{{ '}}' }}' {{ translate_image }}
+      register: _translate_image_after
+      changed_when: false
+      when: _translate_needed
+      tags: [translate, onboard]
+
+    - name: translate — did this run produce a new image?
+      ansible.builtin.set_fact:
+        _translate_image_changed: >-
+          {{ (_translate_image_before.stdout | default('')) != (_translate_image_after.stdout | default('')) }}
+      when: _translate_needed
       tags: [translate, onboard]
 
     - name: translate — quadlet per gateway
@@ -2220,13 +2248,14 @@
       when: _translate_needed or (_translate_on_disk.files | length > 0)
       tags: [translate, onboard]
 
-    # A changed unit means changed sources, formats, context or image: restart that
-    # gateway so it runs what was declared. An unchanged one is only made sure to be
-    # running.
+    # A changed unit means changed sources, formats, context or image reference; a new
+    # image id under the same reference means a rebuilt or re-pulled binary. Either
+    # restarts that gateway so it runs what was declared. Otherwise it is only made sure
+    # to be running.
     - name: translate — up
       ansible.builtin.systemd:
         name: "octo-translate-{{ item.xl.id }}.service"
-        state: "{{ 'restarted' if item.changed else 'started' }}"
+        state: "{{ 'restarted' if (item.changed or (_translate_image_changed | default(false) | bool)) else 'started' }}"
       loop: "{{ _translate_units.results | default([]) }}"
       loop_control: { label: "{{ item.xl.id }}" }
       tags: [translate, onboard]

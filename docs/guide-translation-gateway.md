@@ -152,6 +152,12 @@ The command, the playbook and the gateway binary each check these rules.
 
 - A published, signed image and its digest pin. A pod installed from a package needs
   `translate_image` set to a digest-pinned reference it carries.
+- A build on an air-gapped pod. Without `translate_image`, a clone of octo-pod builds
+  `localhost/octo-translate:dev` on the pod, and that build fetches crates from
+  crates.io, the goat-transformers crate from GitHub and its base images from cgr.dev.
+  An air-gapped clone sets `translate_image` to an image it carries instead. When a
+  build or pull produces a new image, the playbook restarts every gateway, even if no
+  unit file changed.
 - The gateway in `octo-pod status`, `top`, `get`, `describe`, `logs`, `verify` and
   shell completion. `octo-pod certs` lists its certificate.
 - `octo-pod release` for a gateway's namespace.

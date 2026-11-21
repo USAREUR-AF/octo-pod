@@ -22,10 +22,11 @@ updates:
       cargo:
         patterns: ["*"]
 
-  # Base images are pinned by digest in each arm's Dockerfile. One group moves every arm
-  # to the same base digests in one PR, so the arms never run on different bases.
+  # Base images are pinned by digest in each arm's Dockerfile and in the translation
+  # gateway's, which uses the same bases. One group moves them all to the same base
+  # digests in one PR, so the arms and the gateway never run on different bases.
   - package-ecosystem: docker
-    directories: ["/arms/*"]
+    directories: ["/arms/*", "/gateway/translate"]
     schedule:
       interval: weekly
       day: monday
