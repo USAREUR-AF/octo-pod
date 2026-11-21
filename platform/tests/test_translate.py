@@ -424,17 +424,6 @@ class Separation(unittest.TestCase):
                     for p in tomllib.loads(lock.read_text())["package"]}
         arms, own = packages(REPO / "arms" / "Cargo.lock"), packages(GATEWAY / "Cargo.lock")
         extra = {k: v for k, v in own.items() if v and k not in arms}
-        # Ahead of the arms' lock for a security advisory, by a patch release of a crate
-        # the arms also hold, so the license text the image ships still covers it. Remove
-        # an entry when the arms' lock reaches the same version.
-        ahead = {("quinn-proto", "0.11.19"): "RUSTSEC-2026-0523, RUSTSEC-2026-0524",
-                 ("quinn-udp", "0.5.16"): "RUSTSEC-2026-0538"}
-        for name, version in ahead:
-            held = [v for n, v in arms if n == name]
-            self.assertTrue(held, f"the arms do not hold {name}")
-            self.assertNotIn(version, held, f"the arms reached {name} {version}: drop the exception")
-            self.assertEqual(extra.pop((name, version), None),
-                             "registry+https://github.com/rust-lang/crates.io-index")
         self.assertEqual(list(extra), [next(k for k in own if k[0] == "goat-transformers")])
         (source,) = extra.values()
         rev = tomllib.loads((GATEWAY / "Cargo.toml").read_text())["dependencies"]["goat-transformers"]["rev"]
