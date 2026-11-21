@@ -146,11 +146,9 @@ class Unit(unittest.TestCase):
         unit = self.render(context={"how": "m-g", "callsign": "POD 1"}, stale_after_s=30,
                            stamp_time=True, publish_key="{namespace}/{to}/{tail}",
                            packs_dir="/etc/octo-pod/packs", max_distribution="controlled",
-                           only_when={"sapient.location_coordinate_system": 1},
-                           carry={"uid": "sapient.detection_report_object_id"})
+                           only_when={"sapient.location_coordinate_system": 1})
         for line in ('Environment="TRANSLATE_CONTEXT=callsign=POD 1;how=m-g"',
                      "Environment=TRANSLATE_ONLY_WHEN=sapient.location_coordinate_system=1",
-                     "Environment=TRANSLATE_CARRY=uid=sapient.detection_report_object_id",
                      "Environment=TRANSLATE_STALE_AFTER_S=30",
                      "Environment=TRANSLATE_STAMP_TIME=true",
                      "Environment=TRANSLATE_PUBLISH_KEY={namespace}/{to}/{tail}",
@@ -207,7 +205,6 @@ class Gate(unittest.TestCase):
         self.assertTrue(self.gate([gateway(sources=["raw/radar1/**", "cot/tak/*"],
                                            context={"how": "m-g"}, stale_after_s=30,
                                            only_when={"sapient.location_coordinate_system": 1},
-                                           carry={"uid": "sapient.detection_report_object_id"},
                                            publish_key="{namespace}/{to}/{tail}")]))
         self.assertTrue(self.gate([gateway(enabled=False)]))
 
@@ -242,8 +239,8 @@ class Gate(unittest.TestCase):
             "a relative packs_dir": ([gateway(packs_dir="packs")], []),
             "an only_when value the unit cannot carry": ([gateway(only_when={"a.b": "1;x=2"})], []),
             "an only_when key that is not a model key": ([gateway(only_when={"A B": "1"})], []),
-            "a carry source that is not a model key": ([gateway(carry={"uid": "a;b=c"})], []),
-            "a carry target that is not a model key": ([gateway(carry={"u=d": "a.b"})], []),
+            "a carry rule (a field mapping belongs in the packs)": (
+                [gateway(carry={"uid": "sapient.detection_report_object_id"})], []),
             "stale_after_s as text": ([gateway(stale_after_s="soon")], []),
         }
         for label, (translators, arms) in cases.items():
@@ -282,8 +279,7 @@ class Cli(unittest.TestCase):
         self.assertIn("no translation gateway is declared", out)
 
         rc, out = self.add("xl1", "--set", "how=m-g", "--stale-after", "30", "--stamp-time",
-                           "--only-when", "sapient.location_coordinate_system=1",
-                           "--carry", "uid=sapient.detection_report_object_id")
+                           "--only-when", "sapient.location_coordinate_system=1")
         self.assertEqual(rc, 0, out)
         self.assertIn("Nothing on the pod has changed yet", out)
         self.assertIn("until raw/xl1/** is in bridge_allow", out)
@@ -294,7 +290,7 @@ class Cli(unittest.TestCase):
         self.assertEqual((entry["from"], entry["to"]), ("sapient", ["cot-xml", "geojson"]))
         self.assertEqual(entry["context"], {"how": "m-g"})
         self.assertEqual(entry["only_when"], {"sapient.location_coordinate_system": "1"})
-        self.assertEqual(entry["carry"], {"uid": "sapient.detection_report_object_id"})
+        self.assertNotIn("carry", entry)
         self.assertEqual((entry["stale_after_s"], entry["stamp_time"], entry["max_distribution"]),
                          (30, True, "public"))
         self.assertIs(entry["enabled"], True)
@@ -337,8 +333,6 @@ class Cli(unittest.TestCase):
             ("must be <model key>=<value>", ["add", "xl3", "--source", "raw/radar1/**", *base, "--set", "how"]),
             ("the value may hold only", ["add", "xl3", "--source", "raw/radar1/**", *base, "--set", "how=%h"]),
             ("--only-when 'x' must be", ["add", "xl3", "--source", "raw/radar1/**", *base, "--only-when", "x"]),
-            ("--carry 'uid=a b' must be", ["add", "xl3", "--source", "raw/radar1/**", *base, "--carry", "uid=a b"]),
-            ("--carry 'uid=uid' carries nothing", ["add", "xl3", "--source", "raw/radar1/**", *base, "--carry", "uid=uid"]),
             ("needs --packs-dir", ["add", "xl3", "--source", "raw/radar1/**", *base,
                                    "--max-distribution", "controlled"]),
             ("must be an absolute path", ["add", "xl3", "--source", "raw/radar1/**", *base,

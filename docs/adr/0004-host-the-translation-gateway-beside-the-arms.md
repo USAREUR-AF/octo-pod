@@ -74,14 +74,21 @@ certificate. No deployment has run it.
    edit in this repository. By default the engine loads only packs marked
    `distribution public`.
 
-   A declaration may hold two rules that name model keys: `only_when` (convert a sample
-   only when a decoded key has a given value) and `carry` (take a result value from
-   another key of the same sample when the sample lacks it). They are an operator's
-   configuration of one gateway, applied by key name on the decoded model. The crate
-   and the platform layer name no key of any format. A `carry` is the nearest thing in
-   this repository to a mapping, and the maintainers may prefer it removed in favor of a
-   pack change; it is here because the pinned packs give a converted detection no
-   identifier.
+   A declaration may hold one rule that names model keys: `only_when` (convert a sample
+   only when a decoded key has a given value), an operator's configuration of one
+   gateway, applied by key name on the decoded model. A declaration holds no field
+   mapping (ADR 0001): an earlier draft had `carry`, which took a result value from
+   another key of the same sample, and it was removed in review. A value one format
+   holds under a key another does not read is a pack change in goat-transformers.
+
+   The crate names a key of a format in one place: a position guard, on by default,
+   that skips a sample whose position the pinned packs would misread. The pinned
+   SAPIENT pack reads `Location.x` and `Location.y` as longitude and latitude for every
+   coordinate system, so a detection in radians, UTM metres or no stated system is
+   skipped (`coordinate-system-not-expressed`) rather than published with those
+   numbers as degrees. It is not left to a declared rule, because a wrong position on a
+   track feed is worse than none, and it goes when goat-transformers maps that position
+   by coordinate system.
 
 3. **The gateway is a pen client with one certificate and two grants.** It is declared
    in `50-translate.yml`, and one declaration generates its certificate, its grants, its

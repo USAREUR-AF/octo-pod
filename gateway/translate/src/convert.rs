@@ -10,15 +10,15 @@
 //! target's defaults and the declared context, which says nothing the source said. That
 //! sample is skipped, not published.
 //!
-//! Two declared rules are applied at the same point, on the decoded model, by model key
-//! name. Neither is a mapping: this crate still holds no field name of any format.
+//! Two checks are applied at the same point, on the decoded model, by model key name:
 //!
-//! - `only_when key=value`: a sample whose decoded `key` is absent or has another value
-//!   is skipped (`condition-not-met`). It is how a declaration says "convert only the
-//!   samples these packs read correctly", for example one coordinate system.
-//! - `carry target=source`: when the sample carries no `target` and does carry `source`,
-//!   `target` takes the value of `source`. It is how a declaration gives a result an
-//!   identifier the source message has under a key the target format does not read.
+//! - The position guard ([`POSITION_GUARDS`]), always on: a sample whose decoded
+//!   position comes from a coordinate system the pinned packs do not express is skipped
+//!   (`coordinate-system-not-expressed`). It is the one place this crate names a key of
+//!   a format, and it stays until goat-transformers maps that position by coordinate
+//!   system. A wrong position on a track feed is worse than none.
+//! - The declared `only_when key=value`: a sample whose decoded `key` is absent or has
+//!   another value is skipped (`condition-not-met`).
 //!
 //! Binary wire types (`protobuf`, `bits`) pass through the engine as hexadecimal text;
 //! the pen carries the bytes. The conversion to and from hex is here and nowhere else.
@@ -28,6 +28,28 @@ use std::fmt;
 use goat_transformers::{Engine, Grade, Value, Wire};
 
 use crate::bundle::Bundle;
+
+/// A position the pinned packs read without regard to its coordinate system: for a
+/// sample of `format`, a decoded `lat` or `lon` is kept only when `key` holds one of
+/// `expressed`. An absent `key` is not expressed (proto3 leaves out 0, unspecified).
+#[derive(Debug, Clone, Copy)]
+pub struct PositionGuard {
+    /// The source format.
+    pub format: &'static str,
+    /// The model key that names the coordinate system of the position.
+    pub key: &'static str,
+    /// The values whose position the packs write as latitude and longitude in degrees.
+    pub expressed: &'static [i64],
+}
+
+/// The pinned SAPIENT pack reads `Location.x` as longitude and `Location.y` as latitude
+/// whatever `Location.coordinate_system` says: 1 is latitude and longitude in degrees;
+/// 2 (radians) and 5 (UTM metres) would be published as degrees.
+pub const POSITION_GUARDS: &[PositionGuard] = &[PositionGuard {
+    format: "sapient",
+    key: "sapient.location_coordinate_system",
+    expressed: &[1],
+}];
 
 /// Why a sample produced no output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,8 +134,8 @@ pub struct Translator {
     context: Vec<(String, Value)>,
     /// (key, required value): see the module text.
     only_when: Vec<(String, Value)>,
-    /// (target key, source key): see the module text.
-    carry: Vec<(String, String)>,
+    /// The position guards of the source format whose key its pack decodes.
+    guards: Vec<PositionGuard>,
 }
 
 impl fmt::Debug for Translator {
@@ -178,6 +200,14 @@ impl Translator {
             .engine
             .context_from_text(context)
             .map_err(|e| PlanError(format!("declared context refused: {e}")))?;
+        // A guard whose key the pack no longer decodes (the pack maps the position by
+        // coordinate system itself) has nothing to check.
+        let source_keys = bundle.engine.model_keys(from);
+        let guards = POSITION_GUARDS
+            .iter()
+            .filter(|g| g.format == from && source_keys.iter().any(|k| k == g.key))
+            .copied()
+            .collect();
         Ok(Self {
             bundle,
             from: from.to_string(),
@@ -185,23 +215,17 @@ impl Translator {
             targets,
             context,
             only_when: Vec::new(),
-            carry: Vec::new(),
+            guards,
         })
     }
 
-    /// Add the declared `only_when` and `carry` rules, checked against the bundle.
+    /// Add the declared `only_when` rules, checked against the bundle.
     ///
     /// # Errors
     ///
-    /// Fails when a key is empty or named twice; an `only_when` key or a `carry` source
-    /// is not a key the source format decodes; an `only_when` value is not of its key's
-    /// type; a `carry` target is its own source, or is not a key any declared target
-    /// encodes.
-    pub fn with_rules(
-        mut self,
-        only_when: &[(String, String)],
-        carry: &[(String, String)],
-    ) -> Result<Self, PlanError> {
+    /// Fails when a key is named twice, is not a key the source format decodes, or its
+    /// value is not of the key's type.
+    pub fn with_rules(mut self, only_when: &[(String, String)]) -> Result<Self, PlanError> {
         let source_keys = self.engine().model_keys(&self.from);
         for (key, text) in only_when {
             if !source_keys.contains(key) {
@@ -220,32 +244,6 @@ impl Translator {
             if let Some(pair) = typed.pop() {
                 self.only_when.push(pair);
             }
-        }
-        for (target, source) in carry {
-            if target == source {
-                return Err(PlanError(format!(
-                    "carry {target}={source} carries nothing"
-                )));
-            }
-            if !source_keys.contains(source) {
-                return Err(PlanError(format!(
-                    "carry source {source:?} is not a model key the {} pack decodes",
-                    self.from
-                )));
-            }
-            if !self
-                .targets
-                .iter()
-                .any(|(t, _)| self.engine().model_keys(t).contains(target))
-            {
-                return Err(PlanError(format!(
-                    "carry target {target:?} is not a model key any declared target encodes"
-                )));
-            }
-            if self.carry.iter().any(|(t, _)| t == target) {
-                return Err(PlanError(format!("carry names target {target} twice")));
-            }
-            self.carry.push((target.clone(), source.clone()));
         }
         Ok(self)
     }
@@ -383,6 +381,25 @@ impl Translator {
             });
         }
 
+        for guard in &self.guards {
+            let positioned =
+                entity.fields.contains_key("lat") || entity.fields.contains_key("lon");
+            let system = entity.fields.get(guard.key);
+            let expressed = matches!(system, Some(Value::I64(v)) if guard.expressed.contains(v));
+            if positioned && !expressed {
+                return Err(Failure {
+                    outcome: Outcome::Skipped,
+                    name: "coordinate-system-not-expressed".into(),
+                    detail: format!(
+                        "{} is {}: the {} pack would write that position as degrees",
+                        guard.key,
+                        system.map_or_else(|| "absent".to_string(), Value::as_display),
+                        self.from
+                    ),
+                });
+            }
+        }
+
         for (key, wanted) in &self.only_when {
             if entity.fields.get(key) != Some(wanted) {
                 return Err(Failure {
@@ -399,23 +416,6 @@ impl Translator {
                 });
             }
         }
-        // Before the context, so a value the source message carries wins over a
-        // declared one. The value is read again as the target key's type: a carry
-        // between keys of different types fails by the engine's own name.
-        for (target_key, source_key) in &self.carry {
-            if entity.fields.contains_key(target_key) {
-                continue;
-            }
-            if let Some(value) = entity.fields.get(source_key) {
-                let typed = engine
-                    .context_from_text(&[(target_key.clone(), value.as_display())])
-                    .map_err(|e| invalid("carry", &e))?;
-                engine
-                    .fill(&mut entity, &typed)
-                    .map_err(|e| invalid("carry", &e))?;
-            }
-        }
-
         engine
             .fill(&mut entity, &self.context)
             .and_then(|()| engine.fill(&mut entity, extra))
@@ -605,49 +605,35 @@ mod tests {
     #[test]
     fn a_rule_the_bundle_cannot_apply_is_refused() {
         let rule = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
-        let why = |only_when: &[(String, String)], carry: &[(String, String)]| {
+        let why = |only_when: &[(String, String)]| {
             translator("sapient", &["cot-xml"], &[])
-                .with_rules(only_when, carry)
+                .with_rules(only_when)
                 .unwrap_err()
                 .0
         };
+        assert!(why(&rule("callsign", "x")).contains("not a model key the sapient pack decodes"));
         assert!(
-            why(&rule("callsign", "x"), &[]).contains("not a model key the sapient pack decodes")
+            why(&rule("sapient.location_coordinate_system", "utm")).contains("key-type-mismatch")
         );
-        assert!(why(&rule("sapient.location_coordinate_system", "utm"), &[])
-            .contains("key-type-mismatch"));
-        assert!(why(&[], &rule("uid", "callsign")).contains("carry source"));
-        assert!(why(
-            &[],
-            &rule("sapient.node_id", "sapient.detection_report_object_id")
-        )
-        .contains("not a model key any declared target encodes"));
-        assert!(why(&[], &rule("lat", "lat")).contains("carries nothing"));
         let twice = [
-            rule("uid", "sapient.node_id"),
-            rule("uid", "sapient.destination_id"),
+            rule("sapient.location_coordinate_system", "1"),
+            rule("sapient.location_coordinate_system", "5"),
         ]
         .concat();
-        assert!(why(&[], &twice).contains("twice"));
+        assert!(why(&twice).contains("twice"));
     }
 
     /// What a declaration can give a SAPIENT result made from a `CoT` event: the node id
-    /// as declared context and the object id carried from the event's uid. The message
-    /// timestamp is the event time, split into seconds and nanoseconds by the library
-    /// (sapient 0.2.0, goat-transformers#146). The report id stays absent: nothing in
-    /// the packs or the model produces it.
+    /// as declared context. The message timestamp is the event time, split into seconds
+    /// and nanoseconds by the library (sapient 0.2.0, goat-transformers#146). The object
+    /// id and the report id stay absent: the SAPIENT pack leaves `object_id` raw, because
+    /// a `CoT` uid is not the ULID the schema requires there.
     #[test]
-    fn a_cot_event_becomes_a_sapient_detection_with_the_declared_node_and_the_carried_object() {
+    fn a_cot_event_becomes_a_sapient_detection_with_the_declared_node() {
         use prost::Message;
         use sapient_proto::v2::{sapient_message::Content, SapientMessage};
         let node = "0f6a0b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b";
-        let rule = vec![(
-            "sapient.detection_report_object_id".to_string(),
-            "uid".to_string(),
-        )];
-        let t = translator("cot-xml", &["sapient"], &[("sapient.node_id", node)])
-            .with_rules(&[], &rule)
-            .unwrap();
+        let t = translator("cot-xml", &["sapient"], &[("sapient.node_id", node)]);
         let bytes = t.translate("sapient", COT.as_bytes(), &[]).unwrap();
         let message = SapientMessage::decode(bytes.as_slice()).unwrap();
         assert_eq!(message.node_id.as_deref(), Some(node));
@@ -660,24 +646,18 @@ mod tests {
         let Some(Content::DetectionReport(report)) = message.content else {
             panic!("not a DetectionReport: {message:?}");
         };
-        assert_eq!(report.object_id.as_deref(), Some("J-01334"));
+        assert!(report.object_id.is_none());
         assert!(report.report_id.is_none());
     }
 
-    /// A carried value never replaces one the source message has, and a sample
-    /// without the source key is converted without it.
+    /// The position guard applies to the format it names, and only while that format's
+    /// pack decodes the key it reads.
     #[test]
-    fn a_carry_fills_only_an_absent_target() {
-        let rule = vec![("callsign".to_string(), "uid".to_string())];
-        let t = translator("cot-xml", &["geojson"], &[])
-            .with_rules(&[], &rule)
-            .unwrap();
-        let json = |xml: &str| -> serde_json::Value {
-            serde_json::from_slice(&t.translate("geojson", xml.as_bytes(), &[]).unwrap()).unwrap()
-        };
-        assert_eq!(json(COT)["properties"]["callsign"], "GATOR");
-        let bare = COT.replace(r#"<contact callsign="GATOR"/>"#, "");
-        assert_eq!(json(&bare)["properties"]["callsign"], "J-01334");
+    fn the_position_guard_applies_to_sapient_only() {
+        let sapient = translator("sapient", &["cot-xml"], &[]);
+        assert_eq!(sapient.guards.len(), 1);
+        let cot = translator("cot-xml", &["geojson"], &[]);
+        assert!(cot.guards.is_empty());
     }
 
     #[test]

@@ -21,10 +21,6 @@ use sapient_proto::v2::sapient_message::Content;
 /// Converted, skipped, and failed by engine error name.
 type Tally = (u32, u32, BTreeMap<String, u32>);
 
-fn rule(key: &str, value: &str) -> Vec<(String, String)> {
-    vec![(key.to_string(), value.to_string())]
-}
-
 fn translator() -> Translator {
     let bundle = Bundle::load(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("packs"),
@@ -88,16 +84,18 @@ fn every_accepted_reference_vector_converts_is_skipped_or_fails_by_name() {
     }
     assert_eq!(vectors, 38);
     // Only a detection holds a position, and neither target has a field for anything
-    // else of the other messages. One reference detection gives its position as range
-    // and bearing, which the SAPIENT pack does not map. GeoJSON has no field for the
-    // rest of it, so it is skipped there. CoT does: its free-text `state` is
+    // else of the other messages. Two reference detections give an x-y-z location in
+    // UTM metres: the position guard skips them for both targets, since the SAPIENT pack
+    // would write those metres as degrees. The third gives its position as range and
+    // bearing, which the SAPIENT pack does not map. GeoJSON has no field for the rest of
+    // it, so it is skipped there. CoT does: its free-text `state` is
     // `track.status_text`, which cot-xml writes as `detail/remarks` (goat-transformers
     // spec 0.18, #166), so it converts to an event that has no position.
     for ((message, target), (converted, skipped, failed)) in &seen {
         assert!(failed.is_empty(), "{message} to {target}: {failed:?}");
         let expected = match (*message, *target) {
-            ("detection_report", "cot-xml") => (3, 0),
-            ("detection_report", _) => (2, 1),
+            ("detection_report", "cot-xml") => (1, 2),
+            ("detection_report", _) => (0, 3),
             _ => (0, *skipped),
         };
         assert_eq!((*converted, *skipped), expected, "{message} to {target}");
@@ -106,52 +104,44 @@ fn every_accepted_reference_vector_converts_is_skipped_or_fails_by_name() {
 }
 
 /// The pinned SAPIENT pack reads `Location.x` and `Location.y` as longitude and latitude
-/// whatever coordinate system the message declares. Every reference detection with an
-/// x-y-z location declares UTM metres. A gateway declared with `only_when` on the
-/// coordinate system skips them, and converts the same detection once it declares
-/// latitude and longitude; `carry` then gives the result the detection's object id.
+/// whatever coordinate system the message declares. The gateway's position guard is on
+/// by default: a detection whose location is in radians (2), UTM metres (5) or declares
+/// none is skipped, and the same detection in latitude and longitude in degrees (1) is
+/// converted with its numbers as degrees.
 #[test]
-fn a_gateway_declared_for_latitude_and_longitude_skips_the_utm_reference_detections() {
-    let t = translator()
-        .with_rules(
-            &rule("sapient.location_coordinate_system", "1"),
-            &rule("uid", "sapient.detection_report_object_id"),
-        )
-        .unwrap();
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../arms/sapient-receiver/tests/vectors/true");
-    for name in [
-        "DetectionReport.FullMessage.json",
-        "DetectionReport.ThreeClassProbabilities.FullMessage.json",
-    ] {
-        let mut message =
-            sapient_receiver::json::decode(&std::fs::read_to_string(dir.join(name)).unwrap())
-                .unwrap();
-        let why = t
-            .translate("cot-xml", &message.encode_to_vec(), &[])
-            .unwrap_err();
-        assert_eq!(why.outcome, Outcome::Skipped, "{name}: {why}");
-        assert_eq!(why.name, "condition-not-met", "{name}: {why}");
-        assert!(why.detail.ends_with("the message has 5"), "{name}: {why}");
-
+fn a_detection_is_converted_only_in_degrees_and_skipped_in_radians_utm_or_unspecified() {
+    let t = translator();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../arms/sapient-receiver/tests/vectors/true/DetectionReport.FullMessage.json");
+    let reference =
+        sapient_receiver::json::decode(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let with_system = |system: Option<i32>| {
+        let mut message = reference.clone();
         let Some(Content::DetectionReport(report)) = &mut message.content else {
-            panic!("{name} is not a DetectionReport");
+            panic!("not a DetectionReport");
         };
         let Some(sapient_proto::v2::detection_report::LocationOneof::Location(location)) =
             &mut report.location_oneof
         else {
-            panic!("{name} has no x-y-z location");
+            panic!("no x-y-z location");
         };
-        location.coordinate_system = Some(1);
-        let object_id = report.object_id.clone().unwrap();
-        let xml = String::from_utf8(
-            t.translate("cot-xml", &message.encode_to_vec(), &[])
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(
-            xml.contains(&format!(r#" uid="{object_id}""#)),
-            "{name}: {xml}"
-        );
+        location.coordinate_system = system;
+        message.encode_to_vec()
+    };
+    for (system, shown) in [(Some(2), "2"), (Some(5), "5"), (None, "absent")] {
+        for target in ["cot-xml", "geojson"] {
+            let why = t.translate(target, &with_system(system), &[]).unwrap_err();
+            assert_eq!(why.outcome, Outcome::Skipped, "{shown} to {target}: {why}");
+            assert_eq!(why.name, "coordinate-system-not-expressed", "{shown}: {why}");
+            assert!(
+                why.detail
+                    .starts_with(&format!("sapient.location_coordinate_system is {shown}:")),
+                "{why}"
+            );
+        }
+    }
+    for target in ["cot-xml", "geojson"] {
+        let out = t.translate(target, &with_system(Some(1)), &[]).unwrap();
+        assert!(!out.is_empty(), "degrees to {target}");
     }
 }

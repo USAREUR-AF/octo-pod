@@ -45,12 +45,6 @@ Environment="TRANSLATE_CONTEXT={% for k, v in (t.context | dictsort) %}{{ k }}={
 Environment=TRANSLATE_ONLY_WHEN={% for k, v in (t.only_when | dictsort) %}{{ k }}={{ v }}{{ ';' if not loop.last }}{% endfor %}
 
 {% endif %}
-{% if t.carry | default({}) %}
-# target=source model keys: a result takes `target` from the sample's `source` when the
-# sample carries no `target`.
-Environment=TRANSLATE_CARRY={% for k, v in (t.carry | dictsort) %}{{ k }}={{ v }}{{ ';' if not loop.last }}{% endfor %}
-
-{% endif %}
 {% if t.stale_after_s is defined %}
 Environment=TRANSLATE_STALE_AFTER_S={{ t.stale_after_s }}
 {% endif %}

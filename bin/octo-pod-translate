@@ -5,7 +5,7 @@
 
   octo-pod translate add <id> --source <pen key> --from <format> --to <format>[,<format>]
                               [--set <key>=<value>]... [--stale-after <seconds>]
-                              [--only-when <key>=<value>]... [--carry <key>=<key>]...
+                              [--only-when <key>=<value>]...
                               [--stamp-time] [--publish-key <template>]
                               [--packs-dir <dir> --max-distribution controlled]
   octo-pod translate list
@@ -28,9 +28,6 @@ unchanged on the key the arm published it on.
   --only-when  convert a sample only when this decoded model key has this value, and
              skip any other, for example sapient.location_coordinate_system=1 (a
              detection that reports latitude and longitude in degrees).
-  --carry    <target key>=<source key>: the result takes the target from the sample's
-             source key when the sample has no target, for example
-             uid=sapient.detection_report_object_id.
 
 Nothing is on unless a gateway is declared: a pod with no 50-translate.yml renders no
 certificate, no pen grant and no unit.
@@ -183,15 +180,13 @@ def context_pairs(items):
 
 
 def rule_pairs(flag, items, value_re, what):
-    """[(key, value)] from a repeated --only-when or --carry, or die naming the bad one."""
+    """[(key, value)] from a repeated --only-when, or die naming the bad one."""
     out = []
     for item in items or []:
         key, sep, value = item.partition("=")
         key = key.strip()
         if not sep or not CONTEXT_KEY_RE.match(key) or not value_re.match(value):
             die(_critical('{v0} {v1!r} must be {v2}', v0=flag, v1=item, v2=what))
-        if flag == "--carry" and key == value:
-            die(_critical('--carry {v0!r} carries nothing', v0=item))
         if key in [k for k, _ in out]:
             die(_critical('{v0} names {v1} twice', v0=flag, v1=key))
         out.append((key, value))
@@ -254,9 +249,6 @@ def cmd_add(args, d):
     context = context_pairs(args.set)
     only_when = rule_pairs("--only-when", args.only_when, ONLY_WHEN_VALUE_RE,
                            "<model key>=<value>, for example sapient.location_coordinate_system=1")
-    carry = rule_pairs("--carry", args.carry, CONTEXT_KEY_RE,
-                       "<target model key>=<source model key>, for example "
-                       "uid=sapient.detection_report_object_id")
 
     lines = [f"  - id: {args.id}",
              "    kind: translate",
@@ -274,9 +266,6 @@ def cmd_add(args, d):
     if only_when:
         lines.append("    only_when:")
         lines += [f"      {k}: \"{v}\"" for k, v in only_when]
-    if carry:
-        lines.append("    carry:")
-        lines += [f"      {k}: {v}" for k, v in carry]
     if args.stale_after is not None:
         lines.append(f"    stale_after_s: {args.stale_after}")
     if args.stamp_time:
@@ -405,9 +394,6 @@ def main():
     ap.add_argument("--only-when", action="append",
                     help=_tr("add: convert a sample only when this model key has this value, "
                              "as key=value; repeat for more"))
-    ap.add_argument("--carry", action="append",
-                    help=_tr("add: take a target model key from a source model key the sample "
-                             "carries, as target=source; repeat for more"))
     ap.add_argument("--stale-after", type=int,
                     help=_tr("add: give each result a stale time this many seconds after the "
                              "sample was received, when the source carries none"))

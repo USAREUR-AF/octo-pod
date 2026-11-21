@@ -78,7 +78,6 @@ fn declaration(pen: &TestPen, dir: &str, source: &str, from: &str, to: &[&str]) 
         publish_key: DEFAULT_TEMPLATE.into(),
         context: vec![("how".into(), "m-g".into())],
         only_when: Vec::new(),
-        carry: Vec::new(),
         stale_after: Some(Duration::from_secs(30)),
         stamp_time: true,
         packs_dir: Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -192,8 +191,6 @@ async fn a_captured_sapient_detection_is_published_as_cot_xml_and_geojson_with_p
         "sapient",
         &["cot-xml", "geojson"],
     );
-    declared.only_when = vec![("sapient.location_coordinate_system".into(), "1".into())];
-    declared.carry = vec![("uid".into(), "sapient.detection_report_object_id".into())];
     let (stop, task) = start(declared);
 
     let (message, bytes) = reference_detection();
@@ -214,11 +211,8 @@ async fn a_captured_sapient_detection_is_published_as_cot_xml_and_geojson_with_p
         );
     }
     assert!(xml.contains(r#"how="m-g""#), "{xml}");
-    // The declared carry: the event's uid is the detection's object id.
-    assert!(
-        xml.contains(r#" uid="01GGYFBAXH4VYRQYEX7S3XGK3H""#),
-        "{xml}"
-    );
+    // No uid: the SAPIENT pack leaves the object id raw, and the gateway maps nothing.
+    assert!(!xml.contains(" uid="), "{xml}");
     // The values only the host knows: when the sample was received, and stale 30 s on.
     assert!(
         xml.contains(r#" time="20"#) && xml.contains(r#" stale="20"#),

@@ -29,8 +29,9 @@ To declare one on a pod, see [the guide](../../docs/guide-translation-gateway.md
 2. One task takes each sample from the queue. A sample that waited longer than
    `max_age` is dropped and counted.
 3. For each target format, the engine decodes the sample to the shared model. The
-   gateway applies the declared `only_when` and `carry` rules, the engine adds the
-   declared context for values the sample does not carry, and encodes the target format.
+   gateway applies its position guard and the declared `only_when` rules, the engine adds
+   the declared context for values the sample does not carry, and encodes the target
+   format.
 4. The result is published on `raw/<id>/<format>/<source key>` with the target format's
    content type and an attachment that names the source.
 5. One line is written to the local audit file.
@@ -74,6 +75,7 @@ error, and logged the first time each error occurs and every hundredth time afte
 | The bytes are not UTF-8 and the source format is text | `dropped_invalid` | `failed` | `not-text` |
 | The engine panics on the sample | `dropped_invalid` | `failed` | `engine-panic` |
 | The sample parses, and the target has no field for anything it carries (a SAPIENT status report on its way to CoT) | `skipped` | `skipped` | `no-shared-value` |
+| The sample parses, and its position is in a coordinate system the packs do not express (below) | `skipped` | `skipped` | `coordinate-system-not-expressed` |
 | The sample parses, and a declared `only_when` key is absent or has another value | `skipped` | `skipped` | `condition-not-met` |
 | The sample is larger than `max_bytes` | `dropped_oversize` | none | |
 | The queue is full | `dropped_overflow` | none | |
@@ -87,9 +89,8 @@ each error name. The audit file gets the same summary.
 
 The gateway does not start (exit code 2, one `refused` audit line) when: a format is not
 in the pack bundle; a target is the source format; the two formats share no model key;
-a context key is not declared by a loaded model module; an `only_when` key or a `carry`
-source is not a key the source pack decodes; a `carry` target is not a key a declared
-target encodes; a source key reaches the
+a context key is not declared by a loaded model module; an `only_when` key is not a key
+the source pack decodes; a source key reaches the
 gateway's own namespace or a reserved root; or the pack bundle does not match its
 manifest.
 
@@ -109,7 +110,6 @@ declaration.
 | `TRANSLATE_PUBLISH_KEY` | `{namespace}/{to}/{source}` | Placeholders: `{namespace}` `{from}` `{to}` `{source}` `{tail}` |
 | `TRANSLATE_CONTEXT` | none | Model keys the source does not carry, `key=value;key=value` |
 | `TRANSLATE_ONLY_WHEN` | none | Convert a sample only when each decoded model key has this value, `key=value;key=value`; skip any other |
-| `TRANSLATE_CARRY` | none | `target=source;target=source` model keys: a result takes `target` from the sample's `source` when the sample has no `target` |
 | `TRANSLATE_STALE_AFTER_S` | `0` (none) | Adds a stale time this many seconds after receipt, when the source has none |
 | `TRANSLATE_STAMP_TIME` | `false` | Adds the receive time, when the source has no time |
 | `TRANSLATE_PACKS_DIR` | `/usr/share/octo-translate/packs` | The pack bundle |
@@ -121,9 +121,11 @@ declaration.
 | `TRANSLATE_MAX_AGE_MS` | `1500` | Longest wait in the queue |
 | `TRANSLATE_STATS_SECS` | `60` | Seconds between stats lines |
 
-A context value or a carried value never replaces a value the source message carries.
-`only_when` and `carry` name model keys; the keys of a format are in its model module
-under `packs/model/` and its pack under `packs/packs/`.
+A context value never replaces a value the source message carries. `only_when` names
+model keys; the keys of a format are in its model module under `packs/model/` and its
+pack under `packs/packs/`. A declaration maps no field of any format (ADR 0001): a value
+one format holds under a key another format does not read is a change to the packs, in
+goat-transformers.
 
 ## The pack bundle
 
@@ -161,32 +163,36 @@ commit. These are the points that matter for the three shipped formats.
 | Value | Carried by | Without it |
 |---|---|---|
 | Position and its vertical error | the packs | |
-| `uid` | `carry: {uid: sapient.detection_report_object_id}` | the event has no `uid`, and a CoT consumer that requires one refuses it |
+| `uid` | nothing yet: the SAPIENT pack leaves `object_id` raw | the event has no `uid`, and a CoT consumer that requires one refuses it |
 | `time`, `start` | `stamp_time: true` (the time the pod received the sample) | the event has neither |
 | `stale` | `stale_after_s` | the event has none |
 | `how` | `context: {how: ...}` | the event has none |
 | `state` (free text) | the packs: `detail/remarks` | |
 
 The SAPIENT pack reads `Location.x` as longitude and `Location.y` as latitude for every
-coordinate system. Declare `only_when: {sapient.location_coordinate_system: 1}`
-(latitude and longitude in degrees): the gateway then skips a detection that reports UTM
-metres or radians and counts it as `condition-not-met`. Without the rule, such a
-detection is converted with its metres or radians written as degrees. Every BSI Flex 335
-reference detection with an x-y-z location declares UTM; `tests/reference_vectors.rs`
-holds that they are skipped under this rule.
+coordinate system. The gateway therefore skips, by default and with no rule declared, a
+detection whose location is in radians, in UTM metres or in no stated coordinate system,
+and counts it as `coordinate-system-not-expressed`: a wrong position on a track feed is
+worse than none. Only latitude and longitude in degrees (`Location.coordinate_system`
+1) is converted. This position guard (`POSITION_GUARDS` in `src/convert.rs`) is the one
+place the crate names a key of a format, and it stays until goat-transformers maps the
+SAPIENT location by coordinate system. Every BSI Flex 335 reference detection with an
+x-y-z location declares UTM; `tests/reference_vectors.rs` holds that they are skipped,
+and that the same detection in radians or with no coordinate system is skipped too.
 
 Every message that is not a detection has no value the targets hold and is skipped
 (`no-shared-value`). A detection located by range and bearing only is skipped for
 GeoJSON. For CoT it is converted when it carries a `state`, which CoT writes as
 `detail/remarks`: the event then has no position. A declaration that needs a position
 on every event declares `only_when: {sapient.location_coordinate_system: 1}`, which such
-a detection does not meet.
+a detection does not meet: the position guard leaves it through, because it carries no
+position to misread.
 
 **CoT to SAPIENT**
 
 The result is a `DetectionReport` with the position. `context: {sapient.node_id: ...}`
-gives it a node id, and `carry: {sapient.detection_report_object_id: uid}` an object id
-(a ULID only when the CoT `uid` is one). The message timestamp is the event time, split
+gives it a node id. It has no object id: the SAPIENT schema requires a ULID there, and a
+CoT `uid` is not one. The message timestamp is the event time, split
 into seconds and nanoseconds by the pack. It has no `report_id`, so a SAPIENT controller
 that validates detections refuses it.
 

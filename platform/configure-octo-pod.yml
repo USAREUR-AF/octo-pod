@@ -881,7 +881,6 @@
         _xl_targets: "{{ _xl | selectattr('to', 'defined') | map(attribute='to') | flatten }}"
         _xl_context: "{{ _xl | selectattr('context', 'defined') | map(attribute='context') | map('dict2items') | flatten }}"
         _xl_only_when: "{{ _xl | selectattr('only_when', 'defined') | map(attribute='only_when') | map('dict2items') | flatten }}"
-        _xl_carry: "{{ _xl | selectattr('carry', 'defined') | map(attribute='carry') | map('dict2items') | flatten }}"
         _ids: >-
           {{ ((peers | default([], true)) + (arms | default([], true))
               + (egress | default([], true)) + (translators | default([], true)))
@@ -915,8 +914,7 @@
           - _xl_context | map(attribute='value') | map('string') | reject('match', '^[A-Za-z0-9 ._:+-]*$') | list | length == 0
           - _xl_only_when | rejectattr('key', 'match', '^[a-z0-9_.]+$') | list | length == 0
           - _xl_only_when | map(attribute='value') | map('string') | reject('match', '^[A-Za-z0-9._:+-]+$') | list | length == 0
-          - _xl_carry | rejectattr('key', 'match', '^[a-z0-9_.]+$') | list | length == 0
-          - _xl_carry | map(attribute='value') | map('string') | reject('match', '^[a-z0-9_.]+$') | list | length == 0
+          - _xl | selectattr('carry', 'defined') | list | length == 0
           - _xl | selectattr('stale_after_s', 'defined') | rejectattr('stale_after_s', 'integer') | list | length == 0
           - _xl | selectattr('packs_dir', 'defined') | rejectattr('packs_dir', 'match', '^/[A-Za-z0-9_./-]+$') | list | length == 0
         fail_msg: >-
@@ -928,8 +926,9 @@
           downlink or @; no wildcard directly under raw/; and never under a gateway's
           namespace. max_distribution is public or controlled. publish_key begins with
           {namespace}/. Context keys match [a-z0-9_.] and values [A-Za-z0-9 ._:+-].
-          only_when keys and both sides of carry are model keys, [a-z0-9_.]; an only_when
-          value matches [A-Za-z0-9._:+-].
+          only_when keys are model keys, [a-z0-9_.]; an only_when value matches
+          [A-Za-z0-9._:+-]. `carry` is no longer accepted: a field mapping belongs in the
+          packs (ADR 0001), so remove it from the declaration.
           stale_after_s is a whole number; packs_dir is an absolute path.
       tags: [always]
 

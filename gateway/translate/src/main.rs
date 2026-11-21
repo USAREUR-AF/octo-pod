@@ -51,10 +51,6 @@ struct Args {
     /// `key=value`, semicolon-separated. Any other sample is skipped and counted.
     #[arg(long = "only-when", env = "TRANSLATE_ONLY_WHEN", value_delimiter = ';')]
     only_when: Vec<String>,
-    /// `target=source` model keys, semicolon-separated: a result takes `target` from the
-    /// sample's `source` when the sample carries no `target`.
-    #[arg(long, env = "TRANSLATE_CARRY", value_delimiter = ';')]
-    carry: Vec<String>,
     /// Give each result a stale time this many seconds after the sample was received,
     /// when the source carries none. 0 adds none.
     #[arg(long, env = "TRANSLATE_STALE_AFTER_S", default_value_t = 0)]
@@ -135,7 +131,6 @@ fn declaration(args: Args) -> Declaration {
         publish_key: args.publish_key,
         context: pairs(&args.context),
         only_when: pairs(&args.only_when),
-        carry: pairs(&args.carry),
         stale_after: (args.stale_after_s > 0).then(|| Duration::from_secs(args.stale_after_s)),
         stamp_time: args.stamp_time,
         packs_dir: args.packs_dir,
@@ -197,7 +192,7 @@ mod tests {
         assert_eq!((d.queue, d.max_bytes), (DEFAULT_QUEUE, DEFAULT_MAX_BYTES));
         assert_eq!(d.max_age, DEFAULT_MAX_AGE);
         assert!(d.context.is_empty() && d.stale_after.is_none() && !d.stamp_time);
-        assert!(d.only_when.is_empty() && d.carry.is_empty());
+        assert!(d.only_when.is_empty());
         assert_eq!(d.pen.endpoint, "tls/127.0.0.1:7447");
     }
 

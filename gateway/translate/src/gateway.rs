@@ -78,9 +78,6 @@ pub struct Declaration {
     /// Convert a sample only when each decoded model key has this value, as
     /// `key=value` text (see [`crate::convert`]).
     pub only_when: Vec<(String, String)>,
-    /// `target key = source key`: a result takes `target` from the sample's `source`
-    /// when the sample carries no `target`.
-    pub carry: Vec<(String, String)>,
     /// When set, each result is given `stale_ms` = receive time + this, if the source
     /// carries no stale time and the declared context sets none.
     pub stale_after: Option<Duration>,
@@ -167,7 +164,7 @@ fn plan(d: &Declaration) -> Result<Plan, String> {
     let bundle = Bundle::load(Path::new(&d.packs_dir), limit)
         .map_err(|e| format!("pack bundle {}: {e}", d.packs_dir))?;
     let translator = Translator::new(bundle, &d.from, &d.to, &d.context)
-        .and_then(|t| t.with_rules(&d.only_when, &d.carry))
+        .and_then(|t| t.with_rules(&d.only_when))
         .map_err(|e| e.to_string())?;
     // The two values the gateway can add per sample are model keys like any other: check
     // now that the loaded modules declare them, not on the first sample.
