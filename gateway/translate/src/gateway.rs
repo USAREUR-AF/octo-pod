@@ -235,9 +235,11 @@ fn record_failure(
         }
     };
     let count = counters.note(&why.name);
-    if audit
-        .not_translated(kind, source, target, &why.name, &why.detail)
-        .is_err()
+    // A skipped sample is counted, not written: the summary line holds the counts.
+    if kind == "failed"
+        && audit
+            .not_translated(kind, source, target, &why.name, &why.detail)
+            .is_err()
     {
         counters.audit_errors.fetch_add(1, Ordering::Relaxed);
     }

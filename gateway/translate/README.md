@@ -34,7 +34,8 @@ To declare one on a pod, see [the guide](../../docs/guide-translation-gateway.md
    format.
 4. The result is published on `raw/<id>/<format>/<source key>` with the target format's
    content type and an attachment that names the source.
-5. One line is written to the local audit file.
+5. One line is written to the local audit file for each published result and each
+   failure. A skipped sample is counted, not written (below).
 
 ## Keys, content types and provenance
 
@@ -66,8 +67,9 @@ from.
 
 ## When a sample does not convert
 
-Nothing is published for it. It is counted, written to the audit file with the engine's
-error, and logged the first time each error occurs and every hundredth time after.
+Nothing is published for it. It is counted and logged the first time each error occurs
+and every hundredth time after. A failure (`failed`) is also written to the audit file
+with the engine's error; a skip is only counted.
 
 | Case | Counter | Audit `kind` | `error` |
 |---|---|---|---|
@@ -85,7 +87,10 @@ error, and logged the first time each error occurs and every hundredth time afte
 The gateway logs the arms' `stats` line with the shared counters (`received`,
 `forwarded`, `forward_errors`, `dropped_invalid`, `skipped`, `dropped_overflow`,
 `dropped_stale`) and a `translate stats` line with its own counters and the count of
-each error name. The audit file gets the same summary.
+each error name. The audit file gets the same summary. It is the only record of skipped
+samples: most message kinds on a busy feed are skipped, so they are counted, not
+written one by one. The audit file is rotated past 64 MiB to `<id>-translate.ndjson.1`,
+keeping three older files, so it never holds more than about 256 MiB.
 
 The gateway does not start (exit code 2, one `refused` audit line) when: a format is not
 in the pack bundle; a target is the source format; the two formats share no model key;

@@ -132,7 +132,10 @@ fn a_detection_is_converted_only_in_degrees_and_skipped_in_radians_utm_or_unspec
         for target in ["cot-xml", "geojson"] {
             let why = t.translate(target, &with_system(system), &[]).unwrap_err();
             assert_eq!(why.outcome, Outcome::Skipped, "{shown} to {target}: {why}");
-            assert_eq!(why.name, "coordinate-system-not-expressed", "{shown}: {why}");
+            assert_eq!(
+                why.name, "coordinate-system-not-expressed",
+                "{shown}: {why}"
+            );
             assert!(
                 why.detail
                     .starts_with(&format!("sapient.location_coordinate_system is {shown}:")),

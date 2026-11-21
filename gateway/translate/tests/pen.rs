@@ -184,7 +184,7 @@ async fn a_captured_sapient_detection_is_published_as_cot_xml_and_geojson_with_p
     let results = pen.subscribe("raw/xl1/**").await;
     let captured = pen.subscribe("raw/radar1/**").await;
     let dir = scratch("sapient");
-    let mut declared = declaration(
+    let declared = declaration(
         &pen,
         &dir,
         "raw/radar1/sapient/*",

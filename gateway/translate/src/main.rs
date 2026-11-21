@@ -192,7 +192,7 @@ mod tests {
         assert_eq!((d.queue, d.max_bytes), (DEFAULT_QUEUE, DEFAULT_MAX_BYTES));
         assert_eq!(d.max_age, DEFAULT_MAX_AGE);
         assert!(d.context.is_empty() && d.stale_after.is_none() && !d.stamp_time);
-        assert!(d.only_when.is_empty());
+        assert_eq!(d.only_when, Vec::<(String, String)>::new());
         assert_eq!(d.pen.endpoint, "tls/127.0.0.1:7447");
     }
 

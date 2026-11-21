@@ -382,8 +382,7 @@ impl Translator {
         }
 
         for guard in &self.guards {
-            let positioned =
-                entity.fields.contains_key("lat") || entity.fields.contains_key("lon");
+            let positioned = entity.fields.contains_key("lat") || entity.fields.contains_key("lon");
             let system = entity.fields.get(guard.key);
             let expressed = matches!(system, Some(Value::I64(v)) if guard.expressed.contains(v));
             if positioned && !expressed {
