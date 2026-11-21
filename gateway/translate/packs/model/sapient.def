@@ -355,3 +355,4 @@ derive  sapient.timestamp_seconds  sec_of  time_ms
 derive  sapient.timestamp_nanos  nsec_of  time_ms
 derive  sapient.location_x_error  deg_lon_of  track.sigma_east_m  lat
 derive  sapient.location_y_error  deg_lat_of  track.sigma_north_m  lat
+derive  uid  copy  sapient.detection_report_object_id

@@ -81,14 +81,11 @@ certificate. No deployment has run it.
    another key of the same sample, and it was removed in review. A value one format
    holds under a key another does not read is a pack change in goat-transformers.
 
-   The crate names a key of a format in one place: a position guard, on by default,
-   that skips a sample whose position the pinned packs would misread. The pinned
-   SAPIENT pack reads `Location.x` and `Location.y` as longitude and latitude for every
-   coordinate system, so a detection in radians, UTM metres or no stated system is
-   skipped (`coordinate-system-not-expressed`) rather than published with those
-   numbers as degrees. It is not left to a declared rule, because a wrong position on a
-   track feed is worse than none, and it goes when goat-transformers maps that position
-   by coordinate system.
+   The crate names no key of any format. A draft held a position guard, on by
+   default, for the SAPIENT pack's reading of `Location.x` and `y` as degrees in every
+   coordinate system. It went when that pack began to read a position only in degrees
+   (goat-transformers#312): a detection in radians, UTM metres or no stated system now
+   has no position in the model, so nothing writes those numbers as degrees.
 
 3. **The gateway is a pen client with one certificate and two grants.** It is declared
    in `50-translate.yml`, and one declaration generates its certificate, its grants, its

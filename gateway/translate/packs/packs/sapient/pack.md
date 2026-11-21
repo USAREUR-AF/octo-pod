@@ -19,8 +19,8 @@ of version 0.6 where the generator was given them, and a `group` block of versio
 | enums defined | 31 |
 | messages reachable from `SapientMessage` (through repeated fields too) | 63 |
 | message types on the walked paths | 52 |
-| kinds | 9 |
-| `field` lines | 435 |
+| kinds | 10 |
+| `field` lines | 491 |
 | of those, inside a `group` | 256 |
 | `group` blocks | 51 |
 | of those, inside another group | 23 |
@@ -30,7 +30,7 @@ of version 0.6 where the generator was given them, and a `group` block of versio
 | `field` lines bound to `core` or `track` keys | 11 |
 | `const` lines | 2 |
 | value tables (`map` lines) | 1 (9) |
-| vectors (existing and generated) | 17 |
+| vectors (existing and generated) | 22 |
 
 ## Kinds
 
@@ -136,7 +136,7 @@ require only common keys, so they are reached only by an entity that lacks
 
 ## Left raw on purpose
 
-- `DetectionReport.object_id` (7.2): a ULID in the schema (`is_ulid`), allocated by the reporting node for the object. It is not `uid`: an identifier from another format is not a ULID, so nothing is bound to the path and it stays the raw key `sapient.detection_report_object_id`. The same holds for `report_id` (7.1).
+- `DetectionReport.object_id` (7.2): a ULID in the schema (`is_ulid`), allocated by the reporting node for the object. Nothing is bound to the path, so it is the raw key `sapient.detection_report_object_id`, and an identifier from another format is never written there (it is not a ULID). A decoded detection's object id is also its `uid`, by the derivation `derive uid copy sapient.detection_report_object_id` in `model/sapient.def`: it fills `uid` only when the entity has none, so a converted detection carries an identifier to CoT and GeoJSON, and nothing runs the other way. The same holds for `report_id` (7.1), which has no derivation: it is new for every message.
 - `google.protobuf.Timestamp` (message timestamp 1, predicted time 7.9.3, task start and end 8.4 and 8.5): two integers, seconds and nanos, raw keys. On encode the message timestamp is derived from `time_ms` (`sec_of`, `nsec_of`, engine-spec 0.16) when the entity does not hold it; a caller that stamps its own sending time passes `sapient.timestamp_seconds` and `sapient.timestamp_nanos` as context. Decode does not join them into `time_ms`.
 - `DetectionReport.range_bearing` (7.5): position relative to the sensor; the shared model has no key for it.
 

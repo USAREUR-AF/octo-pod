@@ -29,9 +29,8 @@ To declare one on a pod, see [the guide](../../docs/guide-translation-gateway.md
 2. One task takes each sample from the queue. A sample that waited longer than
    `max_age` is dropped and counted.
 3. For each target format, the engine decodes the sample to the shared model. The
-   gateway applies its position guard and the declared `only_when` rules, the engine adds
-   the declared context for values the sample does not carry, and encodes the target
-   format.
+   gateway applies the declared `only_when` rules, the engine adds the declared context
+   for values the sample does not carry, and encodes the target format.
 4. The result is published on `raw/<id>/<format>/<source key>` with the target format's
    content type and an attachment that names the source.
 5. One line is written to the local audit file for each published result and each
@@ -57,7 +56,7 @@ The attachment is one JSON object:
 ```json
 {"source_key": "raw/radar1/sapient/192-0-2-50", "source_ts": "2026-11-16T10:00:00.000Z",
  "source_hash": "sha256:…", "from": "sapient", "to": "cot-xml", "gateway": "xl1",
- "packs_commit": "9e951e9df8a212077cf7dcbc532aeadcdcbf88e5"}
+ "packs_commit": "1f24c0b3956a25409ba6e4f91ca6bd1a796d6c29"}
 ```
 
 `source_ts` is the Zenoh timestamp of the captured sample, or `null` when the pen did not
@@ -77,7 +76,6 @@ with the engine's error; a skip is only counted.
 | The bytes are not UTF-8 and the source format is text | `dropped_invalid` | `failed` | `not-text` |
 | The engine panics on the sample | `dropped_invalid` | `failed` | `engine-panic` |
 | The sample parses, and the target has no field for anything it carries (a SAPIENT status report on its way to CoT) | `skipped` | `skipped` | `no-shared-value` |
-| The sample parses, and its position is in a coordinate system the packs do not express (below) | `skipped` | `skipped` | `coordinate-system-not-expressed` |
 | The sample parses, and a declared `only_when` key is absent or has another value | `skipped` | `skipped` | `condition-not-met` |
 | The sample is larger than `max_bytes` | `dropped_oversize` | none | |
 | The queue is full | `dropped_overflow` | none | |
@@ -168,30 +166,27 @@ commit. These are the points that matter for the three shipped formats.
 | Value | Carried by | Without it |
 |---|---|---|
 | Position and its vertical error | the packs | |
-| `uid` | nothing yet: the SAPIENT pack leaves `object_id` raw | the event has no `uid`, and a CoT consumer that requires one refuses it |
+| `uid` | the packs: the detection's object id (goat-transformers#312) | |
 | `time`, `start` | `stamp_time: true` (the time the pod received the sample) | the event has neither |
 | `stale` | `stale_after_s` | the event has none |
 | `how` | `context: {how: ...}` | the event has none |
 | `state` (free text) | the packs: `detail/remarks` | |
 
-The SAPIENT pack reads `Location.x` as longitude and `Location.y` as latitude for every
-coordinate system. The gateway therefore skips, by default and with no rule declared, a
-detection whose location is in radians, in UTM metres or in no stated coordinate system,
-and counts it as `coordinate-system-not-expressed`: a wrong position on a track feed is
-worse than none. Only latitude and longitude in degrees (`Location.coordinate_system`
-1) is converted. This position guard (`POSITION_GUARDS` in `src/convert.rs`) is the one
-place the crate names a key of a format, and it stays until goat-transformers maps the
-SAPIENT location by coordinate system. Every BSI Flex 335 reference detection with an
-x-y-z location declares UTM; `tests/reference_vectors.rs` holds that they are skipped,
-and that the same detection in radians or with no coordinate system is skipped too.
+The SAPIENT pack reads `Location.x`, `y` and `z` as longitude, latitude and height only
+when `Location.coordinate_system` is 1, latitude and longitude in degrees
+(goat-transformers#312). A detection in radians, UTM metres or no stated system has no
+position in the model: its numbers stay in the raw location keys, and no result writes
+them as degrees. Every BSI Flex 335 reference detection with an x-y-z location declares
+UTM; `tests/reference_vectors.rs` holds that each, and the same detection in radians or
+with no system, has no position, and that in degrees it has its numbers as the position.
 
 Every message that is not a detection has no value the targets hold and is skipped
-(`no-shared-value`). A detection located by range and bearing only is skipped for
-GeoJSON. For CoT it is converted when it carries a `state`, which CoT writes as
-`detail/remarks`: the event then has no position. A declaration that needs a position
-on every event declares `only_when: {sapient.location_coordinate_system: 1}`, which such
-a detection does not meet: the position guard leaves it through, because it carries no
-position to misread.
+(`no-shared-value`). A detection with no position (range and bearing, or a location
+not in degrees) is skipped for GeoJSON: the uid the pack derives is not counted, since
+the gateway counts what the message itself carries. For CoT it is converted when it
+carries a `state`, which CoT writes as `detail/remarks`: the event then has the uid and
+no lat or lon. A declaration that needs a position on every event declares
+`only_when: {sapient.location_coordinate_system: 1}`.
 
 **CoT to SAPIENT**
 

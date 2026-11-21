@@ -38,12 +38,10 @@ Target XML and to GeoJSON.
    sudo octo-pod translate add xl1 --source 'raw/radar1/sapient/*' --from sapient --to cot-xml,geojson --set how=m-g --stamp-time --stale-after 30
    ```
 
-   - The gateway converts only a detection that reports latitude and longitude in
-     degrees. It skips and counts any other (radians, UTM metres, or no stated
-     coordinate system) without being told to, because the SAPIENT pack reads the two
-     numbers as degrees for every coordinate system.
-   - The results have no `uid`: the SAPIENT pack does not map the detection's object id
-     to one yet. A CoT consumer that requires a `uid` refuses them until it does.
+   - A detection has a position only when it reports latitude and longitude in degrees.
+     One in radians, UTM metres or no stated system converts with no position (CoT) or
+     is skipped (GeoJSON); the SAPIENT pack never reads those numbers as degrees.
+   - Each result's `uid` is the detection's object id, which the SAPIENT pack maps.
    - `--set` supplies a value that SAPIENT does not carry.
    - `--stamp-time` and `--stale-after` give each result the time the sample was
      received and a stale time 30 seconds later, because the SAPIENT pack maps neither.

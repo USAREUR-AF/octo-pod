@@ -201,6 +201,7 @@ pub fn encoding(format: &str, wire: Wire) -> Encoding {
         Wire::Bits | Wire::Tlv => Encoding::APPLICATION_OCTET_STREAM.with_schema(format),
         // One record of ASCII text (goat-transformers spec 0.10).
         Wire::Text => Encoding::TEXT_PLAIN.with_schema(format),
+        Wire::Cbor => Encoding::from("application/cbor").with_schema(format),
     }
 }
 

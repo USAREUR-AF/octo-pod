@@ -10,15 +10,11 @@
 //! target's defaults and the declared context, which says nothing the source said. That
 //! sample is skipped, not published.
 //!
-//! Two checks are applied at the same point, on the decoded model, by model key name:
-//!
-//! - The position guard ([`POSITION_GUARDS`]), always on: a sample whose decoded
-//!   position comes from a coordinate system the pinned packs do not express is skipped
-//!   (`coordinate-system-not-expressed`). It is the one place this crate names a key of
-//!   a format, and it stays until goat-transformers maps that position by coordinate
-//!   system. A wrong position on a track feed is worse than none.
-//! - The declared `only_when key=value`: a sample whose decoded `key` is absent or has
-//!   another value is skipped (`condition-not-met`).
+//! The declared `only_when key=value` rules are applied at the same point, on the
+//! decoded model, by model key name: a sample whose decoded `key` is absent or has
+//! another value is skipped (`condition-not-met`). This crate names no key of any
+//! format; what a format's fields mean is the packs' (goat-transformers#312 made the
+//! SAPIENT pack read a position only in degrees).
 //!
 //! Binary wire types (`protobuf`, `bits`) pass through the engine as hexadecimal text;
 //! the pen carries the bytes. The conversion to and from hex is here and nowhere else.
@@ -28,28 +24,6 @@ use std::fmt;
 use goat_transformers::{Engine, Grade, Value, Wire};
 
 use crate::bundle::Bundle;
-
-/// A position the pinned packs read without regard to its coordinate system: for a
-/// sample of `format`, a decoded `lat` or `lon` is kept only when `key` holds one of
-/// `expressed`. An absent `key` is not expressed (proto3 leaves out 0, unspecified).
-#[derive(Debug, Clone, Copy)]
-pub struct PositionGuard {
-    /// The source format.
-    pub format: &'static str,
-    /// The model key that names the coordinate system of the position.
-    pub key: &'static str,
-    /// The values whose position the packs write as latitude and longitude in degrees.
-    pub expressed: &'static [i64],
-}
-
-/// The pinned SAPIENT pack reads `Location.x` as longitude and `Location.y` as latitude
-/// whatever `Location.coordinate_system` says: 1 is latitude and longitude in degrees;
-/// 2 (radians) and 5 (UTM metres) would be published as degrees.
-pub const POSITION_GUARDS: &[PositionGuard] = &[PositionGuard {
-    format: "sapient",
-    key: "sapient.location_coordinate_system",
-    expressed: &[1],
-}];
 
 /// Why a sample produced no output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +83,7 @@ fn invalid(stage: &str, e: &goat_transformers::Error) -> Failure {
 /// Whether a wire type passes through the engine as hexadecimal text.
 #[must_use]
 pub fn is_binary(wire: Wire) -> bool {
-    matches!(wire, Wire::Protobuf | Wire::Bits | Wire::Tlv)
+    matches!(wire, Wire::Protobuf | Wire::Bits | Wire::Tlv | Wire::Cbor)
 }
 
 /// A declared conversion the gateway refuses to run.
@@ -134,8 +108,6 @@ pub struct Translator {
     context: Vec<(String, Value)>,
     /// (key, required value): see the module text.
     only_when: Vec<(String, Value)>,
-    /// The position guards of the source format whose key its pack decodes.
-    guards: Vec<PositionGuard>,
 }
 
 impl fmt::Debug for Translator {
@@ -200,14 +172,6 @@ impl Translator {
             .engine
             .context_from_text(context)
             .map_err(|e| PlanError(format!("declared context refused: {e}")))?;
-        // A guard whose key the pack no longer decodes (the pack maps the position by
-        // coordinate system itself) has nothing to check.
-        let source_keys = bundle.engine.model_keys(from);
-        let guards = POSITION_GUARDS
-            .iter()
-            .filter(|g| g.format == from && source_keys.iter().any(|k| k == g.key))
-            .copied()
-            .collect();
         Ok(Self {
             bundle,
             from: from.to_string(),
@@ -215,7 +179,6 @@ impl Translator {
             targets,
             context,
             only_when: Vec::new(),
-            guards,
         })
     }
 
@@ -379,24 +342,6 @@ impl Translator {
                     self.from
                 ),
             });
-        }
-
-        for guard in &self.guards {
-            let positioned = entity.fields.contains_key("lat") || entity.fields.contains_key("lon");
-            let system = entity.fields.get(guard.key);
-            let expressed = matches!(system, Some(Value::I64(v)) if guard.expressed.contains(v));
-            if positioned && !expressed {
-                return Err(Failure {
-                    outcome: Outcome::Skipped,
-                    name: "coordinate-system-not-expressed".into(),
-                    detail: format!(
-                        "{} is {}: the {} pack would write that position as degrees",
-                        guard.key,
-                        system.map_or_else(|| "absent".to_string(), Value::as_display),
-                        self.from
-                    ),
-                });
-            }
         }
 
         for (key, wanted) in &self.only_when {
@@ -647,16 +592,6 @@ mod tests {
         };
         assert!(report.object_id.is_none());
         assert!(report.report_id.is_none());
-    }
-
-    /// The position guard applies to the format it names, and only while that format's
-    /// pack decodes the key it reads.
-    #[test]
-    fn the_position_guard_applies_to_sapient_only() {
-        let sapient = translator("sapient", &["cot-xml"], &[]);
-        assert_eq!(sapient.guards.len(), 1);
-        let cot = translator("cot-xml", &["geojson"], &[]);
-        assert!(cot.guards.is_empty());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/usareur-af/goat-transformers",
-  "commit": "9e951e9df8a212077cf7dcbc532aeadcdcbf88e5",
+  "commit": "1f24c0b3956a25409ba6e4f91ca6bd1a796d6c29",
   "formats": [
     "cot-xml",
     "geojson",
@@ -13,7 +13,7 @@
     },
     {
       "path": "model/sapient.def",
-      "sha256": "351d4813741ebd6d258b3cd37bc0d430484cfbd0d0f1ecec8e6d5c8080ab931f"
+      "sha256": "32c3d4a17d60e58439453c84f3c7ffc5a85e62946bc2f84cf32c82f27073a0e2"
     },
     {
       "path": "model/track.def",
@@ -41,11 +41,11 @@
     },
     {
       "path": "packs/sapient/pack.def",
-      "sha256": "a3b424cc70f3d81a8eababc0a58e4733576edad762b2323d77c1b02d9aeaffdc"
+      "sha256": "5730dd385163619701b333a9ec0fcc28346686dd0a0d1be4888fa355a1fd5cd0"
     },
     {
       "path": "packs/sapient/pack.md",
-      "sha256": "05224255a2ae01fd6d6b72b3190f5362a533e0748b795c6e879e2d6b1033bfe3"
+      "sha256": "a7dcce0c9d26d8b89929f012e6c09c378ff225241f7cd9a1f5b86ccbf889e758"
     }
   ]
 }
