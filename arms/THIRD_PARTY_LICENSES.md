@@ -1992,7 +1992,7 @@ Used by: web-time 1.1.0
 
 ## Apache License 2.0
 
-Used by: quinn-proto 0.11.18, quinn-udp 0.5.15, quinn 0.11.11, rustls-platform-verifier 0.7.0, tls-listener 0.11.2
+Used by: quinn-proto 0.11.19, quinn-udp 0.5.16, quinn 0.11.11, rustls-platform-verifier 0.7.0, tls-listener 0.11.2
 
 ```text
                                  Apache License
