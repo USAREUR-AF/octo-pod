@@ -341,6 +341,17 @@ class Cli(unittest.TestCase):
                                               "--publish-key", "cot/{to}/{tail}"]),
             ("must contain {to}", ["add", "xl3", "--source", "raw/radar1/**", *base,
                                    "--publish-key", "{namespace}/{source}"]),
+            ("may use only", ["add", "xl3", "--source", "raw/radar1/**", *base,
+                              "--publish-key", "{namespace}/{to}/{other}"]),
+            ("must contain {source} or {tail}", ["add", "xl3", "--source", "raw/radar1/**", *base,
+                                                 "--publish-key", "{namespace}/{to}"]),
+            ("--from must be one pack name", ["add", "xl3", "--source", "raw/radar1/**",
+                                              "--from", "two names", "--to", "cot-xml"]),
+            ("--set names how twice", ["add", "xl3", "--source", "raw/radar1/**", *base,
+                                       "--set", "how=m-g", "--set", "how=h-e"]),
+            ("--only-when names sapient.node_id twice", [
+                "add", "xl3", "--source", "raw/radar1/**", *base,
+                "--only-when", "sapient.node_id=a", "--only-when", "sapient.node_id=b"]),
             ("at least 1 second", ["add", "xl3", "--source", "raw/radar1/**", *base, "--stale-after", "0"]),
             ("is not declared in 50-translate.yml. Known: xl1", ["remove", "ghost", "--yes"]),
         ]
@@ -350,6 +361,51 @@ class Cli(unittest.TestCase):
                 self.assertNotEqual(rc, 0, out)
                 self.assertIn(needle, out)
                 self.assertEqual(self.s.read("50-translate.yml"), before)
+
+    def test_add_writes_a_publish_key_and_a_bundle_from_the_pods_disk(self):
+        rc, out = self.add("xl1", "--publish-key", "{namespace}/{to}/{tail}",
+                           "--packs-dir", "/etc/octo-pod/packs", "--max-distribution", "controlled")
+        self.assertEqual(rc, 0, out)
+        (entry,) = self.declared()
+        self.assertEqual((entry["publish_key"], entry["packs_dir"], entry["max_distribution"]),
+                         ("{namespace}/{to}/{tail}", "/etc/octo-pod/packs", "controlled"))
+        if shutil.which("ansible-playbook"):
+            self.assertTrue(gate([entry]))
+
+    def test_an_emptied_list_takes_a_new_entry_and_a_file_without_one_is_left_alone(self):
+        self.s.write("50-translate.yml", "translators: []\n")
+        self.assertEqual(self.add()[0], 0)
+        self.assertEqual([e["id"] for e in self.declared()], ["xl1"])
+        for text, needle in (("other: 1\n", "has no `translators:` list; nothing was changed"),
+                             ("translators: [\n", "is not valid YAML, so nothing was changed")):
+            with self.subTest(text):
+                self.s.write("50-translate.yml", text)
+                rc, out = self.add()
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(needle, out)
+                self.assertEqual(self.s.read("50-translate.yml"), text)
+
+    def test_the_pod_must_be_one_pod(self):
+        other = self.s.pod.parent / "second-pod"
+        other.mkdir()
+        rc, out = self.run_cli("list")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("more than one pod under", out)
+        other.rmdir()
+        shutil.rmtree(self.s.pod)
+        rc, out = self.run_cli("list")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("no pod identity under", out)
+
+    def test_remove_keeps_the_other_gateways_and_names_a_grant_left_in_bridge_allow(self):
+        """No key, unit or directory was ever written for xl1: removal still forgets it."""
+        self.assertEqual(self.add("xl1")[0], 0)
+        self.assertEqual(self.add("xl2")[0], 0)
+        self.s.write("10-pod.yml", 'bridge_allow: "raw/xl1/**"\n')
+        rc, out = self.run_cli("remove", "xl1", "--yes")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([e["id"] for e in self.declared()], ["xl2"])
+        self.assertIn("still mentions raw/xl1/: check bridge_allow", out)
 
     def test_remove_asks_for_the_id_then_stops_deletes_and_forgets(self):
         self.assertEqual(self.add()[0], 0)
@@ -458,6 +514,118 @@ class Separation(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("packs/cot-xml/pack.def: differs from the manifest", r.stderr)
+
+
+class RefreshPacks(unittest.TestCase):
+    """gateway/translate/tools/refresh-packs.py, run on a copy of the gateway against a
+    synthetic library checkout: a git repository with the three packs and their modules."""
+
+    MODULES = {"core": [], "track": ["core"], "sapient": ["track"]}
+    # No pack names `track`: it is reached through the module `sapient`.
+    USES = {"cot-xml": [], "geojson": [], "sapient": ["sapient"]}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # <tmp>/translate: the path .coveragerc maps to gateway/translate.
+        self.copy = Path(tmp.name) / "translate"
+        (self.copy / "tools").mkdir(parents=True)
+        shutil.copy(GATEWAY / "tools" / "refresh-packs.py", self.copy / "tools")
+        stale = self.copy / "packs" / "packs" / "old" / "pack.def"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("format old\n")
+        self.stale = stale
+        self.lib = Path(tmp.name) / "library"
+        for name, uses in self.MODULES.items():
+            self.put(f"model/{name}.def", "distribution public\n" + "".join(f"uses {u}\n" for u in uses))
+        for name, uses in self.USES.items():
+            self.put(f"packs/{name}/pack.def", "distribution public\n" + "".join(f"uses {u}\n" for u in uses))
+            self.put(f"packs/{name}/pack.md", f"# {name}\n")
+            self.put(f"packs/{name}/vectors/01.json", "{}\n")
+        self.git("init", "-q")
+        self.commit()
+
+    def put(self, path, text):
+        target = self.lib / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.lib), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+             "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+            check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self):
+        """Commit the synthetic library and pin the gateway copy to that commit."""
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "synthetic")
+        self.pin(self.git("rev-parse", "HEAD"))
+
+    def pin(self, rev):
+        self.rev = rev
+        (self.copy / "Cargo.toml").write_text(
+            f'[dependencies]\ngoat-transformers = {{ git = "https://example.invalid/x", rev = "{rev}" }}\n')
+
+    def run_tool(self, *argv):
+        r = subprocess.run([sys.executable, str(self.copy / "tools" / "refresh-packs.py"), *argv],
+                           capture_output=True, text=True)
+        return r.returncode, r.stdout + r.stderr
+
+    def refuses(self, needle, *argv):
+        rc, out = self.run_tool(*(argv or (str(self.lib),)))
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn(needle, out)
+
+    def test_a_refresh_copies_the_packs_and_every_module_they_reach_and_checks_clean(self):
+        rc, out = self.run_tool(str(self.lib))
+        self.assertEqual(rc, 0, out)
+        manifest = json.loads((self.copy / "packs" / "MANIFEST.json").read_text())
+        self.assertEqual(manifest["commit"], self.rev)
+        self.assertEqual([f["path"] for f in manifest["files"]], [
+            "model/core.def", "model/sapient.def", "model/track.def",
+            "packs/cot-xml/pack.def", "packs/cot-xml/pack.md",
+            "packs/geojson/pack.def", "packs/geojson/pack.md",
+            "packs/sapient/pack.def", "packs/sapient/pack.md"])
+        self.assertFalse(self.stale.exists(), "a file the library no longer has stays in the bundle")
+        rc, out = self.run_tool("--check")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("9 files match the manifest", out)
+
+    def test_a_refused_refresh_leaves_the_bundle_as_it_was(self):
+        self.refuses("is not a goat-transformers checkout", str(self.copy))
+        self.refuses("usage:", "--force")
+        self.refuses("usage:", str(self.lib), "extra")
+        self.pin("0" * 40)
+        self.refuses("Cargo.toml pins " + "0" * 40)
+        (self.copy / "Cargo.toml").write_text('goat-transformers = { branch = "main" }\n')
+        self.refuses("does not pin goat-transformers by a 40-character rev")
+        self.put("model/core.def", "distribution public\n# edited\n")
+        self.refuses("uncommitted changes under model/ or packs/")
+        self.put("packs/sapient/pack.def", "distribution controlled\nuses sapient\n")
+        self.commit()
+        self.refuses("pack sapient is not `distribution public`")
+        self.put("packs/sapient/pack.def", "distribution public\nuses sapient\n")
+        self.put("model/track.def", "distribution controlled\n")
+        self.commit()
+        self.refuses("model module track is not `distribution public`")
+        (self.lib / "model" / "track.def").unlink()
+        self.commit()
+        self.refuses("model module track is not in the checkout")
+        self.assertTrue(self.stale.exists())
+        self.assertFalse((self.copy / "packs" / "MANIFEST.json").exists())
+
+    def test_the_check_names_every_way_a_bundle_differs(self):
+        self.refuses("MANIFEST.json is missing", "--check")
+        self.assertEqual(self.run_tool(str(self.lib))[0], 0)
+        (self.copy / "packs" / "model" / "extra.def").write_text("x\n")
+        (self.copy / "packs" / "model" / "track.def").unlink()
+        self.pin("1" * 40)
+        rc, out = self.run_tool("--check")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("model/extra.def: present, not in the manifest", out)
+        self.assertIn("model/track.def: in the manifest, missing", out)
+        self.assertIn("is not the rev Cargo.toml pins", out)
 
 
 if __name__ == "__main__":
