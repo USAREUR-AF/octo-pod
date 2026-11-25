@@ -261,6 +261,11 @@ prefix. Measured: payloads encoded upstream reach a `udp://` receiver byte for b
 `egress-arm` (octo-pod `fe48297`, one host).
 goatcore [ADR 1255](https://github.com/USAREUR-AF/goatcore/blob/main/docs/adr/1255-vendor-systems-connect-through-one-vendor-bridges-repository-and-open-standards-go-through-goat-transformers.md) (accepted) sets this route.
 
+The alternative is a translation gateway inside the pod, beside the arms, that converts formats
+for receivers on the pod's LAN. It is designed, not merged: ADR 0004 (Proposed) and its code on
+the branch `feat/translation-gateway`, pull request #31. It stays available if a receiver's
+format cannot be written upstream.
+
 Open both downward gates for the first destination. The first release on a pod also takes
 the bundle GOAT issued for the pod, because the downlink bridge reads the fabric as the
 pod's slot, and the fingerprint that proves the bundle is genuine (see
