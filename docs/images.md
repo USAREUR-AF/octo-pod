@@ -15,15 +15,15 @@ does not match them.
 
 | Image | Role on the pod | Source | Version | Digest |
 | --- | --- | --- | --- | --- |
-| `eclipse/zenoh` | The pen: the pod's local Zenoh router, which every arm connects to | Eclipse Zenoh upstream image | `1.9.0` | `sha256:157965d71e0bfd0a044d76a985ff0e5c306ad3968929168fb9678cd2a7fec23f` |
+| `docker.io/eclipse/zenoh` | The pen: the pod's local Zenoh router, which every arm connects to | Eclipse Zenoh upstream image | `1.9.0` | `sha256:157965d71e0bfd0a044d76a985ff0e5c306ad3968929168fb9678cd2a7fec23f` |
 | `ghcr.io/usareur-af/goat-audit-subscriber` | Audit subscriber: records what the pod allowed through | GOAT audit subscriber image | `sha-b6ae695` | `sha256:6aacd50c4f6a8937e1750374a4e0b9a1150ddffe66a81d37fdb77c9e1ff49ae5` |
-| `ghcr.io/usareur-af/octo-udp-ingest` | Listens for UDP sensor feeds and publishes them to the pen | `arms/udp-ingest` | `main@92ac8ee` | `sha256:91eaeee4be041c2b0a53d5a6c2f858e7483fa9a91530cebe420305556a6586b8` |
-| `ghcr.io/usareur-af/octo-tcp-ingest` | Listens for TCP sensor streams (newline, length-prefix or raw framing) and publishes them to the pen | `arms/tcp-ingest` | `main@92ac8ee` | `sha256:978106c316b4f4f3e0d528f3bf0acd7a642b473ad190dc145398c6f35cb6987a` |
-| `ghcr.io/usareur-af/octo-tcp-connect` | Dials sensors that serve their own TCP stream, reconnects, and publishes to the pen | `arms/tcp-connect` | `main@92ac8ee` | `sha256:81e079cf8eed9fe2f8aad5d226d3741a7494b912597ce2146bb873c967c318a7` |
-| `ghcr.io/usareur-af/octo-health-pub` | Publishes the pod's health to the pen; the uplink bridge carries it to the fabric only if released | `arms/health-pub` | `main@92ac8ee` | `sha256:d7c138963ea5fac9a4a6254a74595fa60664222626721eb0cf5727398a086d85` |
-| `ghcr.io/usareur-af/octo-uplink-bridge` | Republishes allowed pen keys to the fabric under the pod's slot, outbound only | `arms/uplink-bridge` | `main@92ac8ee` | `sha256:8ce3aee66f022a185af76c12c3e90adf40a3177014146a472df65e66f8c33662` |
-| `ghcr.io/usareur-af/octo-egress` | Sends released feeds to each declared destination, behind the downlink gate | `arms/egress` | `main@92ac8ee` | `sha256:b1c880fb892f24a08b3b69dc7a9928f71f863226eba93c7400ee557a00b15a3f` |
-| `ghcr.io/usareur-af/octo-sapient` | SAPIENT session arm: BSI Flex 335 v2.0 over TCP | `arms/sapient` | `main@92ac8ee` | `sha256:762da1f05963a794128212a1fd91b278375d2fbb85c084f5868d8ac7714d6b3b` |
+| `ghcr.io/usareur-af/octo-udp-ingest` | Listens for UDP sensor feeds and publishes them to the pen | `arms/udp-ingest` | `main@b444a6f` | `sha256:b5d74ace9738b7129c7eac68e4babd7d7625459e2863a971ea01689471178edc` |
+| `ghcr.io/usareur-af/octo-tcp-ingest` | Listens for TCP sensor streams (newline, length-prefix or raw framing) and publishes them to the pen | `arms/tcp-ingest` | `main@b444a6f` | `sha256:5c47cf832f808e7656ae8fedbfa3cfa5af2de88efa0e44cf9510300aec7cedc7` |
+| `ghcr.io/usareur-af/octo-tcp-connect` | Dials sensors that serve their own TCP stream, reconnects, and publishes to the pen | `arms/tcp-connect` | `main@b444a6f` | `sha256:5f6f67353654e0a5d262462cd8d81ff69bac74bc7d9ac005e4b05ca118ff00fa` |
+| `ghcr.io/usareur-af/octo-health-pub` | Publishes the pod's health to the pen; the uplink bridge carries it to the fabric only if released | `arms/health-pub` | `main@b444a6f` | `sha256:69c2ad188bee6905464d96aa45daf5489f6e50810663437d8b3a52fd60a83eba` |
+| `ghcr.io/usareur-af/octo-uplink-bridge` | Republishes allowed pen keys to the fabric under the pod's slot, outbound only | `arms/uplink-bridge` | `main@b444a6f` | `sha256:03aab264ef937af5db823cf3d52fe6c99e57913e73c4490c3ad01470be47e775` |
+| `ghcr.io/usareur-af/octo-egress` | Sends released feeds to each declared destination, behind the downlink gate | `arms/egress` | `main@b444a6f` | `sha256:de66360db83dd0c15ca454927bd8c8e89d28e01d876bcfdd97d459829772d849` |
+| `ghcr.io/usareur-af/octo-sapient` | SAPIENT session arm: BSI Flex 335 v2.0 over TCP | `arms/sapient` | `main@b444a6f` | `sha256:f5e55f489d12e3ee97118520ba7ce9ed7f549e286ea5a0e696e14bf65dc66142` |
 
 ## Check What a Pod Runs
 

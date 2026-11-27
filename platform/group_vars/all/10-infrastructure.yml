@@ -41,13 +41,17 @@ pen_ca_cn: "octo-pen-local-ca"
 # how the registry that serves the digests is itself bootstrapped from a tar.
 #
 # The rewrite strips a leading registry host — a first path segment containing a dot or
-# a colon — and prefixes the mirror. `eclipse/zenoh` has no host at all (implicit Docker
-# Hub) and is left alone, so the mirror must hold it under that same path. One rule for
-# all five, so a mirror never serves four images and silently miss the fifth.
+# a colon — and prefixes the mirror. One rule for all five, so a mirror never serves four
+# images and silently misses the fifth.
+#
+# EVERY PIN NAMES ITS REGISTRY. Podman on stock Ubuntu 24.04 has no search registries
+# configured, so it refuses a name with no host: `eclipse/zenoh@sha256:…` failed the pull
+# and the pen never started. `docker.io/eclipse/zenoh` strips to `eclipse/zenoh`, so a
+# mirror holds it at the path it always did.
 image_mirror: ""
 
 
-zenoh_image_upstream: "eclipse/zenoh@sha256:157965d71e0bfd0a044d76a985ff0e5c306ad3968929168fb9678cd2a7fec23f"   # 1.9.0
+zenoh_image_upstream: "docker.io/eclipse/zenoh@sha256:157965d71e0bfd0a044d76a985ff0e5c306ad3968929168fb9678cd2a7fec23f"   # 1.9.0
 # The zenoh Python client verify-octo-pod.yml tests the pen's ACL with. Keep it at the
 # pen's version above (and the arms' crate, arms/Cargo.toml); test_templates.py checks.
 verify_zenoh_version: "1.9.0"
@@ -127,10 +131,10 @@ arm_repo_dir: /var/lib/octo-pod
 # TAGS ARE NOT PINS. A tag is a mutable pointer, so an image swapped upstream reaches
 # every pod at the next apply. platform/tests/test_templates.py fails if either of these
 # lacks a digest, and CI runs it on every push.
-udp_ingest_image_upstream: "ghcr.io/usareur-af/octo-udp-ingest@sha256:91eaeee4be041c2b0a53d5a6c2f858e7483fa9a91530cebe420305556a6586b8"   # main@92ac8ee, signed by images.yml
-tcp_ingest_image_upstream: "ghcr.io/usareur-af/octo-tcp-ingest@sha256:978106c316b4f4f3e0d528f3bf0acd7a642b473ad190dc145398c6f35cb6987a"   # main@92ac8ee, signed by images.yml
-tcp_connect_image_upstream: "ghcr.io/usareur-af/octo-tcp-connect@sha256:81e079cf8eed9fe2f8aad5d226d3741a7494b912597ce2146bb873c967c318a7"   # main@92ac8ee, signed by images.yml
-health_pub_image_upstream: "ghcr.io/usareur-af/octo-health-pub@sha256:d7c138963ea5fac9a4a6254a74595fa60664222626721eb0cf5727398a086d85"   # main@92ac8ee, signed by images.yml
+udp_ingest_image_upstream: "ghcr.io/usareur-af/octo-udp-ingest@sha256:b5d74ace9738b7129c7eac68e4babd7d7625459e2863a971ea01689471178edc"   # main@b444a6f, signed by images.yml
+tcp_ingest_image_upstream: "ghcr.io/usareur-af/octo-tcp-ingest@sha256:5c47cf832f808e7656ae8fedbfa3cfa5af2de88efa0e44cf9510300aec7cedc7"   # main@b444a6f, signed by images.yml
+tcp_connect_image_upstream: "ghcr.io/usareur-af/octo-tcp-connect@sha256:5f6f67353654e0a5d262462cd8d81ff69bac74bc7d9ac005e4b05ca118ff00fa"   # main@b444a6f, signed by images.yml
+health_pub_image_upstream: "ghcr.io/usareur-af/octo-health-pub@sha256:69c2ad188bee6905464d96aa45daf5489f6e50810663437d8b3a52fd60a83eba"   # main@b444a6f, signed by images.yml
 # NOTE: tcp-ingest is a passive LISTENER — fire-and-forget feeds and raw sampling only.
 # A protocol that requires a session, or one where the sensor listens and expects us to
 # dial out, needs its own arm. No such arm exists yet.
@@ -143,7 +147,7 @@ fabric_uplink_dir: /etc/fabric-uplink
 sub_leaf_dir: /etc/octo-pen-uplink
 # The uplink bridge (arms/uplink-bridge) is published with the arm images by
 # .github/workflows/images.yml and pinned the same way. It runs as a Quadlet unit.
-uplink_bridge_image_upstream: "ghcr.io/usareur-af/octo-uplink-bridge@sha256:8ce3aee66f022a185af76c12c3e90adf40a3177014146a472df65e66f8c33662"   # main@92ac8ee, signed by images.yml
+uplink_bridge_image_upstream: "ghcr.io/usareur-af/octo-uplink-bridge@sha256:03aab264ef937af5db823cf3d52fe6c99e57913e73c4490c3ad01470be47e775"   # main@b444a6f, signed by images.yml
 
 # ---- pod firewall ------------------------------------------------------------
 # Deny by default inbound, outbound and routed, with openings rendered from the
@@ -177,10 +181,10 @@ mgmt_ssh_sources: []
 #
 # Published with the other arm images. Both the egress arm and downlink bridge
 # use this immutable multi-arch index; release bundles carry it for offline pods.
-egress_image_upstream: "ghcr.io/usareur-af/octo-egress@sha256:b1c880fb892f24a08b3b69dc7a9928f71f863226eba93c7400ee557a00b15a3f"   # main@92ac8ee, signed by images.yml
+egress_image_upstream: "ghcr.io/usareur-af/octo-egress@sha256:de66360db83dd0c15ca454927bd8c8e89d28e01d876bcfdd97d459829772d849"   # main@b444a6f, signed by images.yml
 # sapient:// destinations run the SAPIENT session arm from its own immutable
 # multi-arch image. A pod pulls the pinned reference or its carried registry mirror.
-sapient_image_upstream: "ghcr.io/usareur-af/octo-sapient@sha256:762da1f05963a794128212a1fd91b278375d2fbb85c084f5868d8ac7714d6b3b"   # main@92ac8ee, signed by images.yml
+sapient_image_upstream: "ghcr.io/usareur-af/octo-sapient@sha256:f5e55f489d12e3ee97118520ba7ce9ed7f549e286ea5a0e696e14bf65dc66142"   # main@b444a6f, signed by images.yml
 # Schemes whose arm holds a session with the destination: it registers and heartbeats
 # whether or not data flows. A declared but unreleased session destination is therefore
 # not started, so the far side never sees this pod before its data is released; udp://,
