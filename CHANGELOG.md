@@ -6,6 +6,12 @@ Notable changes to octo-pod. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `octo-pod apply` could not pull the Zenoh router image on stock Ubuntu 24.04, because
+  Podman there refuses an image name with no registry. The pin now names `docker.io`. The
+  digest is unchanged, and a mirror holds the image at the same path as before.
+
 ## [0.6.1] - 2026-11-27
 
 ### Security

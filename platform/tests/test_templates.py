@@ -604,6 +604,7 @@ def main():
     check_arm_release_slot()
     check_ca_roots_pin_in_playbook()
     check_image_carries_what_the_playbooks_install()
+    check_every_pinned_image_names_its_registry()
     check_bootstrap_downloads_are_pinned_and_updates_return()
     check_firewall(ctx)
     check_firewall_mesh_port_discovery()
@@ -2396,6 +2397,26 @@ def check_bootstrap_downloads_are_pinned_and_updates_return():
     rel = (root.parent / "tools" / "build-release.sh").read_text()
     check("the release ships that lock beside the playbook",
           "tools/requirements/verify-zenoh.txt" in rel.split("EXTRA_FILES=(")[1].split(")")[0], "EXTRA_FILES")
+
+
+def check_every_pinned_image_names_its_registry():
+    """A pinned image reference with no registry host does not resolve on stock Podman.
+
+    Ubuntu 24.04's Podman ships with no unqualified-search registries, so
+    `eclipse/zenoh@sha256:…` failed to pull and the pen never started. Every
+    `*_image_upstream` names its registry, and the mirror rewrite still maps the Zenoh
+    image to the path a mirror already holds.
+    """
+    print("\nimage pins — every reference names its registry")
+    gv = (HERE.parent / "group_vars" / "all" / "10-infrastructure.yml").read_text()
+    pins = re.findall(r'^([a-z0-9_]+_image_upstream):\s*"([^"]+)"', gv, re.M)
+    host = re.compile(r"^[a-z0-9-]+[.:][a-z0-9.:-]*/")
+    short = [k for k, ref in pins if not host.match(ref)]
+    check("every *_image_upstream starts with a registry host", len(pins) >= 9 and not short,
+          f"{len(pins)} pins; without a host: {short}")
+    zenoh = dict(pins).get("zenoh_image_upstream", "")
+    check("a mirror still holds the Zenoh image at eclipse/zenoh",
+          host.sub("", zenoh).startswith("eclipse/zenoh@sha256:"), zenoh)
 
 
 def check_image_carries_what_the_playbooks_install():
