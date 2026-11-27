@@ -15,7 +15,7 @@ does not match them.
 
 | Image | Role on the pod | Source | Version | Digest |
 | --- | --- | --- | --- | --- |
-| `eclipse/zenoh` | The pen: the pod's local Zenoh router, which every arm connects to | Eclipse Zenoh upstream image | `1.9.0` | `sha256:157965d71e0bfd0a044d76a985ff0e5c306ad3968929168fb9678cd2a7fec23f` |
+| `docker.io/eclipse/zenoh` | The pen: the pod's local Zenoh router, which every arm connects to | Eclipse Zenoh upstream image | `1.9.0` | `sha256:157965d71e0bfd0a044d76a985ff0e5c306ad3968929168fb9678cd2a7fec23f` |
 | `ghcr.io/usareur-af/goat-audit-subscriber` | Audit subscriber: records what the pod allowed through | GOAT audit subscriber image | `sha-b6ae695` | `sha256:6aacd50c4f6a8937e1750374a4e0b9a1150ddffe66a81d37fdb77c9e1ff49ae5` |
 | `ghcr.io/usareur-af/octo-udp-ingest` | Listens for UDP sensor feeds and publishes them to the pen | `arms/udp-ingest` | `main@b444a6f` | `sha256:b5d74ace9738b7129c7eac68e4babd7d7625459e2863a971ea01689471178edc` |
 | `ghcr.io/usareur-af/octo-tcp-ingest` | Listens for TCP sensor streams (newline, length-prefix or raw framing) and publishes them to the pen | `arms/tcp-ingest` | `main@b444a6f` | `sha256:5c47cf832f808e7656ae8fedbfa3cfa5af2de88efa0e44cf9510300aec7cedc7` |
