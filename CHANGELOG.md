@@ -6,6 +6,26 @@ Notable changes to octo-pod. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-27
+
+### Security
+
+- Bootstrap checks what it downloads as root before it trusts it. cosign is pinned by
+  version and by a sha256 for each architecture; a download that does not match is never
+  installed, and on a connected pod a cosign already present that does not match is
+  removed. NetBird's package-signing key is pinned by its full fingerprint, fetched to a
+  holding path and installed only when it is that key and no other. The image build
+  applies the same two pins.
+- `octo-pod verify` installs its Zenoh client from the hashed lock with
+  `--require-hashes`. The lock, `tools/requirements/verify-zenoh.txt`, ships in the release.
+- A pod installs security updates by itself again. Bootstrap used to mask
+  `unattended-upgrades` and the apt timers for good, to keep them off the dpkg lock. It now
+  stops them for the run only, with a mask that a reboot clears, and turns them back on
+  when it ends. `octo-pod apply` turns them back on for a pod that an earlier release
+  bootstrapped.
+- The arms' lock file moves `url` to 2.5.9 and `form_urlencoded` to 1.2.3, for
+  RUSTSEC-2026-0592.
+
 ### Added
 
 - Every release carries sigstore's public keys in `platform/sigstore/trusted_root.json`.

@@ -84,9 +84,10 @@ PAYLOAD=(bin platform example README.md LICENSE NOTICE VERSION)
 # without ever cloning the repo ("the operator never types git" applies to
 # the workstation too — install-to-pod living only in git was the chicken-egg:
 # the tool that installs from a release was not in the release).
+# tools/requirements/verify-zenoh.txt is the hashed lock verify-octo-pod.yml installs from.
 # Keep the README's operator guides available offline, without copying all of
 # docs/ (design files and local editor backups are not release payload).
-EXTRA_FILES=(tools/build-airgap-bundle.sh
+EXTRA_FILES=(tools/build-airgap-bundle.sh tools/requirements/verify-zenoh.txt
              tools/install-to-pod.sh tools/mint-key.sh tools/deprovision-pod.sh docs/images.md
              CHANGELOG.md docs/deployment.md docs/operations.md docs/upgrading.md docs/faq.md
              docs/release-status.md docs/guide-zenoh-partners.md docs/mac-airgap-images.md)

@@ -31,6 +31,14 @@
 
   vars:
     bootstrap_mode: connected            # connected | airgap
+    # The background updater and its timers: quiet while this play uses apt, back on at its end.
+    updater_units:
+      - unattended-upgrades.service
+      - apt-daily.timer
+      - apt-daily-upgrade.timer
+      - apt-daily.service
+      - apt-daily-upgrade.service
+    cosign_arch: "{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
     # stage_dir is defined in group_vars/all/10-infrastructure.yml so configure-octo-pod.yml
     # can name it too (it points a missing-bridge-source error at it).
     # The on-pod registry that serves the carried images at their published digests.
@@ -118,30 +126,32 @@
     # A box NOT built from our base image runs unattended-upgrades on first boot, and it
     # grabs /var/lib/dpkg/lock-frontend the moment the box has a network — exactly when the
     # apt steps below want it. Measured 2026-09-10 on a fresh Ubuntu 24.04 Pi: the docker-ce
-    # install died with "Could not get lock ... held by unattended-upgr". Mask the updater
-    # and its timers (an appliance takes package currency as a deliberate act — a new base
-    # image — not a background run that upgrades openssh/u-boot mid-session), then wait out
-    # any run already in flight before touching apt. The base image prebakes this away; a
-    # box built any other way needs it done here.
-    - name: base — mask the background updater so it cannot hold the dpkg lock
-      ansible.builtin.systemd:
-        name: "{{ item }}"
-        state: stopped
-        enabled: false
-        masked: true
-      loop:
-        - unattended-upgrades.service
-        - apt-daily.timer
-        - apt-daily-upgrade.timer
-        - apt-daily.service
-        - apt-daily-upgrade.service
-      failed_when: false      # a minimal image may ship none of these; nothing to stop is fine
+    # install died with "Could not get lock ... held by unattended-upgr".
+    #
+    # QUIET FOR THIS RUN ONLY. Releases through 0.6.0 masked the updater and its timers for
+    # good, which left every pod with automatic security updates off. Now they are stopped
+    # and masked with --runtime: the mask lives in /run, so a reboot removes it even when
+    # this play dies halfway, and the last task of the play puts them back.
+    - name: base — remove a permanent mask an earlier release left on the updater
+      ansible.builtin.command: systemctl unmask {{ updater_units | join(' ') }}
+      changed_when: false
+      failed_when: false      # a minimal image may ship none of these; nothing to unmask is fine
+      tags: [base]
+
+    - name: base — keep the background updater quiet while this play uses apt
+      ansible.builtin.shell: |
+        for u in {{ updater_units | join(' ') }}; do
+          systemctl stop "$u" 2>/dev/null
+          systemctl mask --runtime "$u" 2>/dev/null
+        done
+        exit 0
+      changed_when: false
       tags: [base]
 
     - name: base — wait for a dpkg run already in flight to release the lock
       # `stop` above ends future runs; one that was already downloading at boot still holds
       # the lock until it finishes. Wait for it rather than racing apt into a hard failure.
-      # Skips cleanly where `fuser` is absent — the mask above is the load-bearing half.
+      # Skips cleanly where `fuser` is absent — the stop above is the load-bearing half.
       ansible.builtin.shell: |
         command -v fuser >/dev/null 2>&1 || exit 0
         for _ in $(seq 1 60); do
@@ -233,14 +243,48 @@
     # and the documented way out becomes the thing an operator reaches for — which is
     # how a verification control turns into a formality. Installed here so the safe path
     # is also the default one.
+    #
+    # PINNED AND CHECKED. `octo-pod upgrade` runs this binary as root to decide what may be
+    # installed, so a cosign nobody checked would make every later check worthless. The
+    # download must match cosign_sha256 for this architecture. One that does not is never
+    # written. On a connected box a cosign already present that does not match is removed
+    # first, so a box that then has no route is left with no cosign, and upgrade refuses
+    # with "cosign is not installed" instead of trusting one nobody checked.
+    - name: verification — the cosign already on this box, if any
+      ansible.builtin.stat: { path: /usr/local/bin/cosign, checksum_algorithm: sha256 }
+      register: _cosign_have
+      tags: [verification]
+
+    - name: verification — remove a cosign that is not the pinned one
+      ansible.builtin.file: { path: /usr/local/bin/cosign, state: absent }
+      when:
+        - bootstrap_mode == 'connected'     # an airgapped box keeps the cosign it was built with
+        - _cosign_have.stat.exists
+        - _cosign_have.stat.checksum | default('') != cosign_sha256[cosign_arch]
+      tags: [verification]
+
     - name: verification — cosign (release signatures are checked on this box)
       ansible.builtin.get_url:
-        url: "https://github.com/sigstore/cosign/releases/download/v{{ cosign_version | default('2.4.1') }}/cosign-linux-{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
+        url: "https://github.com/sigstore/cosign/releases/download/v{{ cosign_version }}/cosign-linux-{{ cosign_arch }}"
         dest: /usr/local/bin/cosign
         mode: "0755"
-        checksum: "{{ cosign_checksum | default(omit) }}"
+        checksum: "sha256:{{ cosign_sha256[cosign_arch] }}"
       when: bootstrap_mode == 'connected'
+      register: _cosign_get
       failed_when: false          # airgap or no route: upgrade will say what is missing
+      tags: [verification]
+
+    # No route is tolerated above. A download that arrived and did not match is not.
+    - name: verification — a cosign that does not match its pinned checksum is refused
+      ansible.builtin.fail:
+        msg: >-
+          The cosign downloaded for {{ cosign_arch }} does not match the checksum pinned in
+          group_vars (cosign_sha256). Nothing was installed. Check cosign_version and
+          cosign_sha256 against the release's cosign_checksums.txt before running again.
+      when:
+        - bootstrap_mode == 'connected'
+        - _cosign_get is failed
+        - "'checksum' in (_cosign_get.msg | default('') | lower)"
       tags: [verification]
 
     - name: clock — packages (RTC-less boxes cold-boot at 1970)
@@ -434,11 +478,51 @@
         - not _debs_carried
       tags: [netbird]
       block:
-        - name: netbird — signing key
+        # FETCHED TO A HOLDING PATH, CHECKED, THEN INSTALLED. apt trusts every key in the
+        # file `signed-by` names, so the file must hold the pinned key and no other. A key
+        # that is not the pinned one is deleted and the play stops: a NetBird package signed
+        # by an unknown key never reaches this box.
+        - name: netbird — signing key, to a holding path
           ansible.builtin.get_url:
             url: https://pkgs.netbird.io/debian/public.key
-            dest: /etc/apt/keyrings/netbird.asc
+            dest: /etc/apt/keyrings/netbird.asc.unverified
             mode: "0644"
+
+        - name: netbird — the primary keys in that file
+          ansible.builtin.shell: |
+            set -o pipefail
+            gpg --batch --no-default-keyring --show-keys --with-colons --with-fingerprint \
+              /etc/apt/keyrings/netbird.asc.unverified \
+              | awk -F: '$1=="pub"{p=1; next} $1=="sub"{p=0} p && $1=="fpr"{print $10; p=0}'
+          args: { executable: /bin/bash }
+          register: _nb_key
+          changed_when: false
+          failed_when: false
+
+        - name: netbird — refuse a signing key that is not the pinned one
+          when: _nb_key.rc != 0 or _nb_key.stdout_lines != [netbird_apt_key_fingerprint]
+          block:
+            - name: netbird — delete the key that was refused
+              ansible.builtin.file: { path: /etc/apt/keyrings/netbird.asc.unverified, state: absent }
+
+            - name: netbird — the signing key did not match
+              ansible.builtin.fail:
+                msg: >-
+                  The key at pkgs.netbird.io/debian/public.key is not the one pinned in
+                  group_vars (netbird_apt_key_fingerprint): found
+                  {{ _nb_key.stdout_lines | default([]) | join(', ') or 'no key' }}. Nothing
+                  was installed. If NetBird has published a new key, confirm its fingerprint
+                  from a second source and change the pin.
+
+        - name: netbird — install the verified signing key
+          ansible.builtin.copy:
+            src: /etc/apt/keyrings/netbird.asc.unverified
+            dest: /etc/apt/keyrings/netbird.asc
+            remote_src: true
+            mode: "0644"
+
+        - name: netbird — the holding copy is no longer needed
+          ansible.builtin.file: { path: /etc/apt/keyrings/netbird.asc.unverified, state: absent }
 
         - name: netbird — apt source
           ansible.builtin.apt_repository:
@@ -1226,6 +1310,24 @@
         - bootstrap_mode == 'connected'
         - _unpulled | length > 0
       tags: [images]
+
+    # ====================================================== background updater, back on
+    # The updater was stopped for this run only (see the dpkg lock section). Put it back,
+    # so the box installs security updates by itself. tags: always, so a run limited to
+    # some tags restores it too. A run that fails before this point leaves only the
+    # --runtime mask, which the next reboot or the next run removes.
+    - name: base — automatic security updates are on again
+      ansible.builtin.shell: |
+        systemctl unmask --runtime {{ updater_units | join(' ') }} 2>/dev/null
+        systemctl unmask {{ updater_units | join(' ') }} 2>/dev/null
+        for u in apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+          systemctl cat "$u" >/dev/null 2>&1 || continue      # a minimal image may ship none
+          systemctl enable "$u" >/dev/null 2>&1
+          case "$u" in *.timer) systemctl start "$u" ;; esac
+        done
+        exit 0
+      changed_when: false
+      tags: [always]
 
     # ================================================================ handover
     # Assert ONLY what this play is responsible for. It previously demanded an enrolled

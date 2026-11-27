@@ -604,6 +604,7 @@ def main():
     check_arm_release_slot()
     check_ca_roots_pin_in_playbook()
     check_image_carries_what_the_playbooks_install()
+    check_bootstrap_downloads_are_pinned_and_updates_return()
     check_firewall(ctx)
     check_firewall_mesh_port_discovery()
     check_firewall_mesh_mgmt_addresses()
@@ -2278,6 +2279,123 @@ def check_egress_key_rule_parity():
         except (ValueError, KeyError, IndexError):
             got = {"<error>", (r.stdout + r.stderr)[-300:]}
     check("playbook: refuses exactly the bad keys", got == set(EGRESS_KEYS_REFUSED), f"refused {sorted(got)}")
+
+
+def check_bootstrap_downloads_are_pinned_and_updates_return():
+    """What bootstrap fetches as root is checked before it is trusted, and the box keeps
+    installing security updates.
+
+    Releases through 0.6.0 fetched cosign with an optional checksum nobody set, took
+    NetBird's package-signing key as served, installed verify's zenoh client from PyPI by
+    version alone, and masked unattended-upgrades and the apt timers for good. Each of the
+    four is a way for something nobody chose to run as root, or for a pod to stop taking
+    fixes. These checks fail on the 0.6.0 playbooks.
+    """
+    print("\nplaybooks — bootstrap's downloads are pinned, and security updates return")
+    root = HERE.parent
+    gv = yaml.safe_load((root / "group_vars" / "all" / "10-infrastructure.yml").read_text())
+    boot_text = (root / "bootstrap-octo-pod.yml").read_text()
+    boot = (yaml.safe_load(boot_text) or [{}])[0]
+    tasks = list(leaf_tasks(boot.get("tasks")))
+    by_name = {t.get("name", ""): t for t in tasks}
+
+    # --- cosign
+    sums = gv.get("cosign_sha256") or {}
+    check("cosign has a pinned version and a sha256 for amd64 and arm64",
+          re.fullmatch(r"\d+\.\d+\.\d+", str(gv.get("cosign_version", ""))) is not None
+          and all(re.fullmatch(r"[0-9a-f]{64}", str(sums.get(a, ""))) for a in ("amd64", "arm64")),
+          f"cosign_version={gv.get('cosign_version')!r} cosign_sha256={sums!r}")
+    get = by_name.get("verification — cosign (release signatures are checked on this box)", {})
+    g = get.get("ansible.builtin.get_url") or {}
+    check("the cosign download names the pinned checksum, with no way to omit it",
+          str(g.get("checksum", "")).startswith("sha256:{{ cosign_sha256[")
+          and "omit" not in str(g.get("checksum", "")) and "cosign_version" in str(g.get("url", "")),
+          str(g))
+    refuse = by_name.get("verification — a cosign that does not match its pinned checksum is refused", {})
+    check("a cosign that arrives and does not match stops the play",
+          "ansible.builtin.fail" in refuse and "checksum" in str(refuse.get("when", "")), str(refuse))
+    rm = by_name.get("verification — remove a cosign that is not the pinned one", {})
+    check("a cosign already on the box that is not the pinned one is removed",
+          (rm.get("ansible.builtin.file") or {}).get("state") == "absent"
+          and "cosign_sha256" in str(rm.get("when", "")), str(rm))
+    prov = (root.parent / "tools" / "vm-image-provision.sh").read_text()
+    img_ver = re.search(r'^readonly COSIGN_VERSION="([^"]+)"', prov, re.M)
+    check("the image build installs the same cosign version, against the same pinned checksum",
+          img_ver is not None and img_ver.group(1) == str(gv.get("cosign_version"))
+          and "cosign_sha256" in prov and "cosign_checksums.txt" not in prov,
+          f"image {img_ver.group(1) if img_ver else None}, group_vars {gv.get('cosign_version')}")
+
+    # --- NetBird's signing key
+    fpr = str(gv.get("netbird_apt_key_fingerprint", ""))
+    check("NetBird's package-signing key is pinned by its full fingerprint",
+          re.fullmatch(r"[0-9A-F]{40}", fpr) is not None, repr(fpr))
+    names = [t.get("name", "") for t in tasks]
+    def at(n):
+        return names.index(n) if n in names else -1
+    fetch, refuse_i, install = (at("netbird — signing key, to a holding path"),
+                                at("netbird — the signing key did not match"),
+                                at("netbird — install the verified signing key"))
+    fetched = (tasks[fetch].get("ansible.builtin.get_url") or {}) if fetch >= 0 else {}
+    check("the key is fetched to a holding path, checked, and only then installed",
+          0 <= fetch < refuse_i < install
+          and str(fetched.get("dest", "")).endswith(".unverified")
+          and "/etc/apt/keyrings/netbird.asc" != fetched.get("dest"),
+          f"order {fetch},{refuse_i},{install} dest={fetched.get('dest')}")
+    block = re.search(r"- name: netbird — refuse a signing key that is not the pinned one\n\s+when: (.+)", boot_text)
+    check("any file that is not exactly the pinned key is refused",
+          block is not None and "!= [netbird_apt_key_fingerprint]" in block.group(1)
+          and "rc != 0" in block.group(1), block.group(1) if block else "no refusal block")
+    # The awk that lists the primary keys: one key in, one fingerprint out; an extra
+    # primary key is a second line, which the comparison refuses.
+    listing = by_name.get("netbird — the primary keys in that file", {})
+    awk = re.search(r"awk -F: '([^']+)'", str(listing.get("ansible.builtin.shell", "")))
+    colons = ("pub:-:3072:1:AAAA:1::::::scESC:\nfpr:::::::::" + "A" * 40 + ":\nuid:-::::1::X::n:\n"
+              "sub:-:3072:1:BBBB:1::::::e:\nfpr:::::::::" + "B" * 40 + ":\n")
+    two = colons + "pub:-:255:22:CCCC:1::::::scESC:\nfpr:::::::::" + "C" * 40 + ":\n"
+    def primaries(text):
+        r = subprocess.run(["awk", "-F:", awk.group(1)], input=text, capture_output=True, text=True)
+        return r.stdout.split()
+    check("the listing prints each primary key's fingerprint and no subkey's",
+          awk is not None and primaries(colons) == ["A" * 40]
+          and primaries(two) == ["A" * 40, "C" * 40],
+          str(primaries(two)) if awk else "no awk program found")
+    check("the image build checks the same pinned fingerprint",
+          "netbird_apt_key_fingerprint" in prov
+          and "-o /etc/apt/keyrings/netbird.asc\n" not in prov, "vm-image-provision.sh")
+
+    # --- security updates
+    masked = [t.get("name") for t in tasks
+              if (t.get("ansible.builtin.systemd") or {}).get("masked") is True
+              and any("unattended" in str(x) or "apt-daily" in str(x)
+                      for x in ([t.get("loop")] + [(t.get("ansible.builtin.systemd") or {}).get("name")]))]
+    check("no task masks the background updater for good", not masked, str(masked))
+    quiet = by_name.get("base — keep the background updater quiet while this play uses apt", {})
+    check("the updater is quiet for this run only: a --runtime mask, gone at reboot",
+          "mask --runtime" in str(quiet.get("ansible.builtin.shell", "")), str(quiet))
+    back = by_name.get("base — automatic security updates are on again", {})
+    sh = str(back.get("ansible.builtin.shell", ""))
+    check("the last word on the updater is unmask and enable, on every run",
+          "unmask" in sh and "systemctl enable" in sh and back.get("tags") == ["always"]
+          and at("base — automatic security updates are on again")
+          > at("base — keep the background updater quiet while this play uses apt"), str(back))
+    conf = list(leaf_tasks((yaml.safe_load((root / "configure-octo-pod.yml").read_text()) or [{}])[0]
+                           .get("tasks")))
+    fix = next((t for t in conf if t.get("name") == "baseline — automatic security updates are on"), {})
+    check("apply repairs a pod that an earlier release left masked",
+          "systemctl unmask" in str(fix.get("ansible.builtin.shell", ""))
+          and "systemctl enable" in str(fix.get("ansible.builtin.shell", "")), str(fix))
+
+    # --- verify's zenoh client
+    ver = list(leaf_tasks((yaml.safe_load((root / "verify-octo-pod.yml").read_text()) or [{}])[0]
+                          .get("tasks")))
+    pips = [t.get("ansible.builtin.pip") for t in ver if t.get("ansible.builtin.pip")]
+    check("verify installs its zenoh client from the hashed lock, with --require-hashes",
+          len(pips) == 1 and "name" not in pips[0]
+          and str(pips[0].get("requirements", "")).endswith("verify-zenoh.txt")
+          and "--require-hashes" in str(pips[0].get("extra_args", "")), str(pips))
+    rel = (root.parent / "tools" / "build-release.sh").read_text()
+    check("the release ships that lock beside the playbook",
+          "tools/requirements/verify-zenoh.txt" in rel.split("EXTRA_FILES=(")[1].split(")")[0], "EXTRA_FILES")
 
 
 def check_image_carries_what_the_playbooks_install():
