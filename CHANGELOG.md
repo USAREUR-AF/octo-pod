@@ -6,6 +6,12 @@ Notable changes to octo-pod. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `octo-pod verify` no longer waits without limit on a pod whose pen never started. It
+  checks first that the pen is listening, fails within 30 seconds with the unit to look
+  at, and puts a time limit on each check that connects to the pen.
+
 ## [0.6.1] - 2026-11-27
 
 ### Security

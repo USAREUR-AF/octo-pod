@@ -604,6 +604,7 @@ def main():
     check_arm_release_slot()
     check_ca_roots_pin_in_playbook()
     check_image_carries_what_the_playbooks_install()
+    check_verify_never_waits_without_limit()
     check_bootstrap_downloads_are_pinned_and_updates_return()
     check_firewall(ctx)
     check_firewall_mesh_port_discovery()
@@ -2396,6 +2397,36 @@ def check_bootstrap_downloads_are_pinned_and_updates_return():
     rel = (root.parent / "tools" / "build-release.sh").read_text()
     check("the release ships that lock beside the playbook",
           "tools/requirements/verify-zenoh.txt" in rel.split("EXTRA_FILES=(")[1].split(")")[0], "EXTRA_FILES")
+
+
+def check_verify_never_waits_without_limit():
+    """verify fails within a bounded time on a pod whose pen never started.
+
+    The ACL test client and the decode check connect to the pen and wait for it without
+    limit, so verify on a pod with no pen sat with no message. A reachability check comes
+    first, and each task that opens a session has a task timeout.
+    """
+    print("\nverify — a pod whose pen never started fails in bounded time")
+    tasks = list(leaf_tasks((yaml.safe_load((HERE.parent / "verify-octo-pod.yml").read_text())
+                             or [{}])[0].get("tasks")))
+    names = [t.get("name", "") for t in tasks]
+    def at(n):
+        return names.index(n) if n in names else -1
+    listen = at("acl — the pen is listening")
+    w = (tasks[listen].get("ansible.builtin.wait_for") or {}) if listen >= 0 else {}
+    acl = at("acl — every declared peer may write ONLY its own namespace")
+    check("verify asks whether the pen is listening before it connects, with a limit",
+          0 <= listen < acl and "pen_listen_port" in str(w.get("port", ""))
+          and isinstance(w.get("timeout"), int) and 0 < w["timeout"] <= 60
+          and "octo-pen-zenoh-router" in str(w.get("msg", "")), str(w))
+    check("that check runs for the decode check too",
+          listen >= 0 and "decode" in (tasks[listen].get("tags") or []), str(tasks[listen].get("tags") if listen >= 0 else None))
+    opens = [t for t in tasks
+             if "verify-pen-acl.py" in str(t.get("ansible.builtin.command", ""))
+             or "zenoh.open" in str(t.get("ansible.builtin.shell", ""))]
+    unbounded = [t.get("name") for t in opens if not isinstance(t.get("timeout"), int)]
+    check("every task that opens a session on the pen has a task timeout",
+          len(opens) >= 2 and not unbounded, f"{len(opens)} task(s); without a timeout: {unbounded}")
 
 
 def check_image_carries_what_the_playbooks_install():
