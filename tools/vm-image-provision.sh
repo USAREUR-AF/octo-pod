@@ -101,7 +101,18 @@ install_substrate() {
 
   log "NetBird agent (the one permitted WAN path; enrolment stays per instance)"
   install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://pkgs.netbird.io/debian/public.key -o /etc/apt/keyrings/netbird.asc
+  # The key must be the one pinned in group_vars, and the only one in the file: apt trusts
+  # every key in the file that signed-by names.
+  local want_fpr got_fpr
+  want_fpr="$(sed -n 's/^netbird_apt_key_fingerprint: *"\([^"]*\)".*/\1/p' "${GROUP_VARS}")"
+  [[ -n "${want_fpr}" ]] || die "no netbird_apt_key_fingerprint in ${GROUP_VARS}"
+  curl -fsSL https://pkgs.netbird.io/debian/public.key -o /tmp/netbird.asc.unverified
+  got_fpr="$(gpg --batch --no-default-keyring --show-keys --with-colons --with-fingerprint \
+    /tmp/netbird.asc.unverified \
+    | awk -F: '$1=="pub"{p=1; next} $1=="sub"{p=0} p && $1=="fpr"{print $10; p=0}')"
+  [[ "${got_fpr}" == "${want_fpr}" ]] \
+    || die "the NetBird signing key is not the pinned one (found: ${got_fpr:-no key})"
+  install -m 0644 /tmp/netbird.asc.unverified /etc/apt/keyrings/netbird.asc
   echo "deb [signed-by=/etc/apt/keyrings/netbird.asc] https://pkgs.netbird.io/debian stable main" \
     > /etc/apt/sources.list.d/netbird.list
   apt-get update -qq
@@ -117,10 +128,14 @@ install_substrate() {
   log "cosign ${COSIGN_VERSION} (octo-pod upgrade verifies releases with it)"
   local base="https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}"
   local bin="cosign-linux-${ARCH}"
+  # Checked against the checksum pinned in group_vars, not against a checksum file fetched
+  # from the same place as the binary.
+  local want_sum
+  want_sum="$(awk -v a="${ARCH}:" '/^cosign_sha256:/{f=1; next} f && $1==a {gsub(/"/,"",$2); print $2; exit} f && /^[^ ]/{f=0}' "${GROUP_VARS}")"
+  [[ -n "${want_sum}" ]] || die "no cosign_sha256 for ${ARCH} in ${GROUP_VARS}"
   curl -fsSL "${base}/${bin}" -o "/tmp/${bin}"
-  curl -fsSL "${base}/cosign_checksums.txt" -o /tmp/cosign_checksums.txt
-  (cd /tmp && grep " ${bin}\$" cosign_checksums.txt | sha256sum -c -) \
-    || die "cosign checksum did not match its release's checksum file"
+  echo "${want_sum}  /tmp/${bin}" | sha256sum -c - >/dev/null \
+    || die "cosign did not match the checksum pinned in group_vars"
   install -m 0755 "/tmp/${bin}" /usr/local/bin/cosign
 }
 

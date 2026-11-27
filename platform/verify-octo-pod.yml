@@ -35,9 +35,29 @@
 
     # Pinned to the pen's zenoh: an unpinned install pulled 1.10.1 against a 1.9.0 router.
     # The golden image builds this venv already, so an airgapped pod needs no PyPI here.
+    #
+    # FROM THE HASHED LOCK, never by version alone. This runs pip as root on the pod; with
+    # --require-hashes a wheel that does not match the lock fails the install, so a
+    # substituted or re-uploaded package cannot run here. The lock ships with the release
+    # (tools/requirements/verify-zenoh.txt) and is the one the image build installs from.
+    - name: acl — the venv's home
+      ansible.builtin.file:
+        path: "{{ (verify_venv | default('/opt/octo-verify/venv')) | dirname }}"
+        state: directory
+        mode: "0755"
+      tags: [acl]
+
+    - name: acl — the hashed lock for the zenoh client
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../tools/requirements/verify-zenoh.txt"
+        dest: "{{ (verify_venv | default('/opt/octo-verify/venv')) | dirname }}/verify-zenoh.txt"
+        mode: "0644"
+      tags: [acl]
+
     - name: acl — throwaway zenoh client venv
       ansible.builtin.pip:
-        name: "eclipse-zenoh=={{ verify_zenoh_version }}"
+        requirements: "{{ (verify_venv | default('/opt/octo-verify/venv')) | dirname }}/verify-zenoh.txt"
+        extra_args: "--require-hashes --no-deps"
         virtualenv: "{{ verify_venv | default('/opt/octo-verify/venv') }}"
         virtualenv_command: python3 -m venv
       tags: [acl]

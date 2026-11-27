@@ -51,6 +51,18 @@ zenoh_image_upstream: "eclipse/zenoh@sha256:157965d71e0bfd0a044d76a985ff0e5c306a
 # The zenoh Python client verify-octo-pod.yml tests the pen's ACL with. Keep it at the
 # pen's version above (and the arms' crate, arms/Cargo.toml); test_templates.py checks.
 verify_zenoh_version: "1.9.0"
+
+# WHAT BOOTSTRAP DOWNLOADS, AND WHAT IT MUST MATCH. bootstrap-octo-pod.yml fetches cosign and
+# NetBird's package-signing key as root on a connected box. Each is refused unless it
+# matches the value here; tools/vm-image-provision.sh reads the same values for the image.
+# cosign: the release's own cosign_checksums.txt. To move the version, change all three.
+cosign_version: "2.4.1"
+cosign_sha256:
+  amd64: "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b"
+  arm64: "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a"
+# The one primary key in https://pkgs.netbird.io/debian/public.key (uid Wiretrustee).
+# A file that carries any other key, or an extra one, is refused.
+netbird_apt_key_fingerprint: "EFE37DF047DF7CCDF1FC54FA83F79AD029778355"   # gitleaks:allow (the fingerprint of a public key)
 audit_image_upstream: "ghcr.io/usareur-af/goat-audit-subscriber@sha256:6aacd50c4f6a8937e1750374a4e0b9a1150ddffe66a81d37fdb77c9e1ff49ae5"   # sha-b6ae695
 # TLS material is chowned to this gid so the sinks can read the pod key. Wrong value =
 # `Permission denied (os error 13)` = silent audit gap with every health signal green.

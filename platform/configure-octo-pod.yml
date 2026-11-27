@@ -35,6 +35,25 @@
       until: _pkgs is succeeded          # unattended-upgrades holds the dpkg lock on a fresh box
       tags: [baseline]
 
+    # A pod bootstrapped by 0.6.0 or earlier has the background updater masked for good,
+    # so it installs no security updates by itself. Every apply puts it back. Idempotent,
+    # and silent where the image ships none of these units.
+    - name: baseline — automatic security updates are on
+      ansible.builtin.shell: |
+        units="unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service"
+        was=$(systemctl is-enabled $units 2>/dev/null | grep -c masked || true)
+        systemctl unmask $units 2>/dev/null
+        for u in apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+          systemctl cat "$u" >/dev/null 2>&1 || continue
+          systemctl enable "$u" >/dev/null 2>&1
+          case "$u" in *.timer) systemctl start "$u" ;; esac
+        done
+        [ "$was" -gt 0 ] && echo "unmasked $was"
+        exit 0
+      register: _updates
+      changed_when: "'unmasked' in _updates.stdout"
+      tags: [baseline]
+
     # NO MIRROR DECLARED? LOOK, RATHER THAN REMEMBER. `-e image_mirror=localhost:5000`
     # applies to the bootstrap run that was given it, and bootstrap happens before the pod
     # has an identity, so there is nowhere yet to write it down. The operator is then
