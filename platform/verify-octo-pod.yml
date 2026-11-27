@@ -69,11 +69,28 @@
         mode: "0755"
       tags: [acl]
 
+    # ASK BEFORE CONNECTING. The test client below, and the decode check, wait for the pen
+    # without limit. On a pod whose pen never started, verify then sat with no message.
+    # This fails within 30 seconds and names the unit to look at.
+    - name: acl — the pen is listening
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ pen_listen_port }}"
+        timeout: 30
+        msg: >-
+          Nothing answers on 127.0.0.1:{{ pen_listen_port }}: the pen, the pod's Zenoh
+          router, is not running, so nothing else can be verified. Look at
+          `systemctl status octo-pen-zenoh-router` and
+          `journalctl -u octo-pen-zenoh-router`. A pen that never started is often an
+          image that could not be pulled.
+      tags: [acl, decode]
+
     # Non-zero exit = the ACL does not enforce the declaration. Do not soften this.
     - name: acl — every declared peer may write ONLY its own namespace
       ansible.builtin.command:
         cmd: "{{ verify_venv | default('/opt/octo-verify/venv') }}/bin/python ../verify-pen-acl.py"
         chdir: "{{ verify_venv | default('/opt/octo-verify/venv') }}"
+      timeout: 300              # a pen that stops answering mid-test must not hold verify
       register: acl_result
       changed_when: false
       tags: [acl]
@@ -264,6 +281,7 @@
           'pip install --quiet --disable-pip-version-check eclipse-zenoh==1.9.0 protobuf==7.35.1 && python /check.py'
       loop: "{{ (active_peers + active_arms) | selectattr('schema', 'defined') | list }}"
       loop_control: { label: "{{ item.id }} ({{ item.namespace }})" }
+      timeout: 600              # each item: an image pull, pip, and 30 s of listening
       register: decode_result
       changed_when: false
       tags: [decode]
