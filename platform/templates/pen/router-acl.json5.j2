@@ -3,7 +3,8 @@ SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recogni
 SPDX-License-Identifier: Apache-2.0
 -#}
 // MANAGED BY ANSIBLE — generated from pen_firstparty_namespaces, pen_firstparty_cns,
-// and the ENABLED `peers` (20-peers.yml) + `arms` (30-arms.yml). Hand edits are lost on re-run.
+// and the ENABLED `peers` (20-peers.yml) + `arms` (30-arms.yml) + `translators`
+// (50-translate.yml). Hand edits are lost on re-run.
 //
 // Peers hold their own cert; an arm's cert is held by our listener. Same ACL shape,
 // different CN (octo-peer-* vs octo-arm-*), hence the distinct rule/subject ids.
@@ -50,6 +51,23 @@ SPDX-License-Identifier: Apache-2.0
        'rule': a.id ~ '-arm-write', 'subject': 'mtls-' ~ a.id ~ '-arm',
        'desc': a.description | default('third-party arm publisher'),
        'how':  'trust tier ' ~ (a.trust_tier | default('T?')) ~ ' · certless source at ' ~ (a.transport | default('udp')) ~ '/' ~ (a.port | default('?')) }) %}
+{%- endfor %}
+{#- A TRANSLATION GATEWAY (50-translate.yml, docs/adr/0004) is a publisher with one extra
+    grant: a READ on exactly its declared source keys, on its own CN and no other. It
+    only ever puts, and it subscribes without querying, so it is granted no more. Its
+    namespace is first-party-readable like any publisher's, which is what gives it an
+    audit sink and lets bridge_allow release it. Nothing is appended when none is
+    declared. #}
+{%- for t in active_translators | default([]) %}
+{%-  set _ = publishers.append({
+       'id': t.id, 'ns': t.namespace, 'cn': t.cert_cn,
+       'rule': t.id ~ '-translate-write', 'subject': 'mtls-' ~ t.id ~ '-translate',
+       'messages': ['put'],
+       'desc': t.description | default('translation gateway'),
+       'how':  'converts ' ~ t['from'] ~ ' to ' ~ (t.to | join(', ')),
+       'reads': t.sources, 'read_interest': ['declare_subscriber'],
+       'read_deliver': ['put', 'delete'],
+       'reads_what': 'the captured keys it converts' }) %}
 {%- endfor %}
 {#- THE POD'S OWN HEALTH is a publisher like any other: one certificate, one namespace,
     one grant, generated from the same declaration machinery. It writes exactly one key
@@ -113,13 +131,13 @@ SPDX-License-Identifier: Apache-2.0
         key_exprs: ["{{ x.ns }}"] }{{ "," if (x.reads | default([])) or not loop.last or downlink }}
 {% if x.reads | default([]) %}
 
-      // {{ x.id }} also READS what was released down to it, on ITS OWN identity only.
+      // {{ x.id }} also READS {{ x.reads_what | default('what was released down to it') }}, on ITS OWN identity only.
       { id: "{{ x.id }}-read-interest",
-        messages: ["declare_subscriber","query"],
+        messages: [{% for m in x.read_interest | default(["declare_subscriber","query"]) %}"{{ m }}"{{ "," if not loop.last }}{% endfor %}],
         flows: ["ingress"], permission: "allow",
         key_exprs: [{% for k in x.reads %}"{{ k }}"{{ ", " if not loop.last }}{% endfor %}] },
       { id: "{{ x.id }}-read-deliver",
-        messages: ["put","delete","reply"],
+        messages: [{% for m in x.read_deliver | default(["put","delete","reply"]) %}"{{ m }}"{{ "," if not loop.last }}{% endfor %}],
         flows: ["egress"], permission: "allow",
         key_exprs: [{% for k in x.reads %}"{{ k }}"{{ ", " if not loop.last }}{% endfor %}] }{{ "," if not loop.last or downlink }}
 {% endif %}

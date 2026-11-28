@@ -90,7 +90,8 @@ PAYLOAD=(bin platform example README.md LICENSE NOTICE VERSION)
 EXTRA_FILES=(tools/build-airgap-bundle.sh tools/requirements/verify-zenoh.txt
              tools/install-to-pod.sh tools/mint-key.sh tools/deprovision-pod.sh docs/images.md
              CHANGELOG.md docs/deployment.md docs/operations.md docs/upgrading.md docs/faq.md
-             docs/release-status.md docs/guide-zenoh-partners.md docs/mac-airgap-images.md)
+             docs/release-status.md docs/guide-zenoh-partners.md docs/mac-airgap-images.md
+             docs/guide-translation-gateway.md)
 
 WITH_IMAGES="${WITH_IMAGES:-0}"
 DIST="$REPO/dist"

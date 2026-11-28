@@ -1,0 +1,36 @@
+octo-translate
+Copyright 2026 U.S. Federal Government (in countries where recognized)
+
+Portions of this work written by U.S. Federal government employees within the
+scope of their federal employment are not subject to copyright protection in the
+United States (17 U.S.C. 105) and are in the public domain there. In countries
+where copyright protection is available, those portions are released under the
+Apache License, Version 2.0. Merged contributions from private contributors are
+released under the same License. See INTENT.md.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product links goat-transformers (https://github.com/usareur-af/goat-transformers),
+Copyright 2025-2026 U.S. Federal Government (in countries where recognized), under the
+Apache License, Version 2.0, at the commit named in packs/MANIFEST.json.
+
+The files under packs/ are copied unmodified from goat-transformers at that commit.
+They were written from the third-party sources below. The source files are not
+included. A pack records field names, field numbers, positions, types, units and code
+values.
+
+Pack sapient; module sapient
+  SAPIENT protobuf files, BSI Flex 335 v2.0, Defence Science and Technology
+  Laboratory (Dstl). https://github.com/dstl/SAPIENT-Proto-Files
+  Crown owned Copyright 2023. Apache License, Version 2.0.
+
+Pack cot-xml; module core
+  Cursor on Target event schema, The MITRE Corporation, approved for public
+  release.
+
+Pack geojson
+  GeoJSON, IETF RFC 7946.
+
+Module track
+  Canonical Track v2 of open-billie (https://github.com/usareur-af/open-billie),
+  Apache License, Version 2.0.

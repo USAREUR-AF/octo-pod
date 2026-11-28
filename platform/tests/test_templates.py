@@ -328,7 +328,7 @@ def main():
     # the ACTIVE set only, and a reap task removes units no declaration names.
     play = (PLATFORM / "configure-octo-pod.yml").read_text()
     check("play renders sinks from the active set only",
-          "loop: \"{{ active_peers + active_arms }}\"" in play)
+          "loop: \"{{ active_peers + active_arms + active_translators }}\"" in play)
     check("play reaps sink units no declaration names",
           "reap sink units no declaration names" in play)
     for p_ in disabled:

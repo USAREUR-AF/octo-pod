@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+"""octo-pod translate: declare, list and remove translation gateways.
+
+  octo-pod translate add <id> --source <pen key> --from <format> --to <format>[,<format>]
+                              [--set <key>=<value>]... [--stale-after <seconds>]
+                              [--only-when <key>=<value>]...
+                              [--stamp-time] [--publish-key <template>]
+                              [--packs-dir <dir> --max-distribution controlled]
+  octo-pod translate list
+  octo-pod translate remove <id> [--yes]
+
+A translation gateway is not an arm (docs/adr/0004). An arm captures bytes and does not
+interpret them. A gateway reads captured samples on the pen under its own certificate,
+converts each one from the format named by --from to the formats named by --to, and
+publishes the result on raw/<id>/<format>/<source key>. The captured sample stays
+unchanged on the key the arm published it on.
+
+  --source   a pen key expression to read, for example raw/radar1/sapient/* (the frames a
+             SAPIENT arm with id radar1 and feed sapient captures). Repeat for more. It
+             must begin with a literal chunk, and may not reach ops, attest, system,
+             downlink, @ or any gateway's own namespace.
+  --from     the pack name of the source format: sapient, cot-xml, geojson.
+  --to       the pack names of the target formats, comma-separated.
+  --set      a model key the source format does not carry, for example how=m-g. It never
+             replaces a value the source message has.
+  --only-when  convert a sample only when this decoded model key has this value, and
+             skip any other, for example sapient.location_coordinate_system=1 (a
+             detection that reports latitude and longitude in degrees).
+
+Nothing is on unless a gateway is declared: a pod with no 50-translate.yml renders no
+certificate, no pen grant and no unit.
+
+A converted sample leaves the pod only when raw/<id>/** is in bridge_allow in
+10-pod.yml, as for any publisher. This command does not add it.
+
+DESIGN, as for egress: this edits the DECLARATION and nothing else, except `remove`,
+which must stop the running gateway before it forgets it. `octo-pod check` then `apply`
+render the certificate, the pen grant, the audit sink and the unit. Validation is here
+AND in the playbook AND in the binary: here it is a fast refusal before anything is
+written; there it is the gate that cannot be bypassed. Whether the formats exist in the
+pack bundle and can be converted is checked by the binary, which holds the bundle.
+"""
+from octo_pod_i18n import t as _tr, critical as _critical
+import argparse
+import datetime
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+ETC = pathlib.Path(os.environ.get("OCTO_POD_ETC", "/etc/octo-pod"))
+PEN_STATE = pathlib.Path(os.environ.get("OCTO_PEN_STATE", "/var/lib/octo-pen"))
+QUADLET_DIR = pathlib.Path(os.environ.get("OCTO_QUADLET_DIR", "/etc/containers/systemd"))
+# Each gateway's TLS lives in <TRANSLATE_ETC>/octo-translate-<id>; /etc on a pod.
+TRANSLATE_ETC = pathlib.Path(os.environ.get("OCTO_TRANSLATE_ETC", "/etc"))
+FILE = "50-translate.yml"
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+FORMAT_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+CONTEXT_KEY_RE = re.compile(r"^[a-z0-9_.]+$")
+# What the unit file can carry unquoted and unescaped: no quote, semicolon, percent or
+# newline. The playbook's validation holds the same rule.
+CONTEXT_VALUE_RE = re.compile(r"^[A-Za-z0-9 ._:+-]*$")
+ONLY_WHEN_VALUE_RE = re.compile(r"^[A-Za-z0-9._:+-]+$")
+PUBLISH_KEY_RE = re.compile(r"^\{namespace\}/[A-Za-z0-9_./{}-]+$")
+PLACEHOLDERS = ("{namespace}", "{from}", "{to}", "{source}", "{tail}")
+RESERVED_ROOTS = ("ops", "attest", "system", "downlink")
+HEADER = """# TRANSLATION GATEWAYS: captured samples, converted, under their own identity.
+#
+# A gateway is not an arm (docs/adr/0004). It reads only the `sources` below on the pen,
+# and writes only raw/<id>/**. Nothing runs unless an entry here is enabled. Converted
+# data leaves the pod only when raw/<id>/** is in bridge_allow in 10-pod.yml.
+# Written by `octo-pod translate add`; ids are unique across peers, arms, destinations
+# and gateways.
+
+translators:
+"""
+
+
+def die(msg):
+    sys.exit(_critical('error: {v0}', v0=msg))
+
+
+def pod_dir():
+    hv = ETC / "host_vars"
+    pods = [p for p in hv.iterdir() if p.is_dir()] if hv.is_dir() else []
+    if not pods:
+        die(_critical("no pod identity under {v0}; run 'octo-pod join' first", v0=hv))
+    if len(pods) > 1:
+        die(_critical('more than one pod under {v0}: {v1}', v0=hv, v1=[p.name for p in pods]))
+    return pods[0]
+
+
+def load(path):
+    try:
+        import yaml
+    except ImportError:
+        die(_critical("pyyaml missing; install python3-yaml"))
+    if not path.exists():
+        return {}
+    try:
+        return yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError as exc:
+        die(_critical('{v0} is not valid YAML, so nothing was changed. Fix it, then run this again:\n{v1}', v0=path, v1=exc))
+
+
+def declared(d, name, key):
+    return [e for e in (load(d / name).get(key) or []) if isinstance(e, dict)]
+
+
+def gateway_ids(d):
+    return [e.get("id") for e in declared(d, FILE, "translators")]
+
+
+def other_ids(d):
+    """Ids held by peers, arms and destinations: a gateway may not share one."""
+    out = []
+    for name, key in (("20-peers.yml", "peers"), ("30-arms.yml", "arms"), ("40-egress.yml", "egress")):
+        out += [e.get("id") for e in declared(d, name, key)]
+    return out
+
+
+def source_problem(source, own_id, gateways):
+    """Why a pen key expression may not be a gateway's source, or None. route.rs in the
+    gateway crate and the playbook's validation hold the same rule; the binary also
+    checks true key-expression intersection."""
+    chunks = source.split("/")
+    if not source or source != source.strip() or "" in chunks or " " in source or "," in source:
+        return f"source {source!r} is not a well-formed key expression"
+    first = chunks[0]
+    if "*" in first or "$" in first:
+        return (f"source {source!r} must begin with a literal chunk: a gateway reads declared "
+                "publishers, never the whole pen")
+    if first.startswith("@") or first in RESERVED_ROOTS:
+        return f"source {source!r} starts in a reserved namespace (ops, attest, system, downlink or @)"
+    if len(chunks) < 2:
+        return f"source {source!r} must name what to read beneath {first}/, for example {first}/<publisher>/**"
+    if first == "raw" and ("*" in chunks[1] or "$" in chunks[1]):
+        return (f"source {source!r} has a wildcard directly under raw/: it would reach a "
+                "gateway's own output. Name the publisher: raw/<arm id>/...")
+    if first == "raw" and chunks[1] in [own_id, *gateways]:
+        return (f"source {source!r} is the namespace of gateway {chunks[1]}: a gateway does "
+                "not convert converted output")
+    return None
+
+
+def template_problem(template):
+    if not PUBLISH_KEY_RE.match(template):
+        return (f"--publish-key {template!r} must begin with {{namespace}}/ and hold only "
+                "literal chunks and placeholders")
+    rest = template
+    for p in PLACEHOLDERS:
+        rest = rest.replace(p, "")
+    if "{" in rest or "}" in rest:
+        return f"--publish-key {template!r} may use only {', '.join(PLACEHOLDERS)}"
+    if "{to}" not in template:
+        return f"--publish-key {template!r} must contain {{to}}: two target formats may not share a key"
+    if "{source}" not in template and "{tail}" not in template:
+        return (f"--publish-key {template!r} must contain {{source}} or {{tail}}: a result "
+                "names the sample it came from")
+    return None
+
+
+def context_pairs(items):
+    """[(key, value)] from --set key=value, or die naming the first bad one."""
+    out = []
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        key = key.strip()
+        if not sep or not CONTEXT_KEY_RE.match(key):
+            die(_critical('--set {v0!r} must be <model key>=<value>, for example how=m-g', v0=item))
+        if not CONTEXT_VALUE_RE.match(value):
+            die(_critical('--set {v0!r}: the value may hold only letters, digits, spaces and . _ : + -', v0=item))
+        if key in [k for k, _ in out]:
+            die(_critical('--set names {v0} twice', v0=key))
+        out.append((key, value))
+    return out
+
+
+def rule_pairs(flag, items, value_re, what):
+    """[(key, value)] from a repeated --only-when, or die naming the bad one."""
+    out = []
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        key = key.strip()
+        if not sep or not CONTEXT_KEY_RE.match(key) or not value_re.match(value):
+            die(_critical('{v0} {v1!r} must be {v2}', v0=flag, v1=item, v2=what))
+        if key in [k for k, _ in out]:
+            die(_critical('{v0} names {v1} twice', v0=flag, v1=key))
+        out.append((key, value))
+    return out
+
+
+def find_block(text, ident):
+    """(start, end) of one gateway's entry, from its '- id:' line to the next."""
+    m = re.search(rf"^(\s*)- id: {re.escape(ident)}\s*$", text, re.M)
+    if not m:
+        return None
+    nxt = re.search(r"^\s*- id: ", text[m.end():], re.M)
+    end = m.end() + (nxt.start() if nxt else len(text) - m.end())
+    return m.start(), end
+
+
+def verify_yaml(path, ident, present):
+    """Re-read a file just written: an unparseable declaration fails at 3am otherwise."""
+    ids = [x.get("id") for x in (load(path).get("translators") or [])]
+    if (ident in ids) != present:
+        die(_critical('{v0} {v1} {v2} after the write; inspect it', v0=path, v1='lacks' if present else 'still holds', v2=ident))
+
+
+def cmd_add(args, d):
+    if not ID_RE.match(args.id or ""):
+        die(_critical('id {v0!r} must be lowercase alphanumeric/dashes: it becomes a CN and a unit name', v0=args.id))
+    gateways = gateway_ids(d)
+    if args.id in gateways or args.id in other_ids(d):
+        die(_critical('{v0} is already declared on this pod', v0=args.id))
+    import yaml
+    as_read = yaml.safe_load(args.id)
+    if as_read != args.id:
+        die(_critical('id {v0!r} reads as {v1!r} in YAML, not as a name: YAML takes off, yes and no for booleans, null for nothing, and 123 or 0x1f for numbers. Choose another id.', v0=args.id, v1=as_read))
+    if not args.source:
+        die(_critical("give at least one --source: the pen keys this gateway reads, e.g. "
+                      "raw/<arm id>/<feed>/*"))
+    bad = [p for p in (source_problem(s, args.id, gateways) for s in args.source) if p]
+    if bad:
+        die("refusing these sources:\n  - " + "\n  - ".join(bad))
+    if not FORMAT_RE.match(args.src_format or ""):
+        die(_critical("--from must be one pack name, for example sapient"))
+    targets = [t.strip() for t in (args.to or "").split(",") if t.strip()]
+    if not targets or any(not FORMAT_RE.match(t) for t in targets):
+        die(_critical("--to must be pack names, comma-separated, for example cot-xml,geojson"))
+    if args.src_format in targets:
+        die(_critical('--to names the source format {v0}: nothing to convert', v0=args.src_format))
+    if len(set(targets)) != len(targets):
+        die(_critical("--to names a format twice"))
+    if args.max_distribution == "controlled" and not args.packs_dir:
+        die(_critical("--max-distribution controlled needs --packs-dir: the bundle in the image "
+                      "holds public packs only, so there is nothing controlled to load"))
+    if args.packs_dir and not re.match(r"^/[A-Za-z0-9_./-]+$", args.packs_dir):
+        die(_critical("--packs-dir must be an absolute path on this pod"))
+    if args.publish_key:
+        why = template_problem(args.publish_key)
+        if why:
+            die(why)
+    if args.stale_after is not None and args.stale_after < 1:
+        die(_critical("--stale-after must be at least 1 second"))
+    context = context_pairs(args.set)
+    only_when = rule_pairs("--only-when", args.only_when, ONLY_WHEN_VALUE_RE,
+                           "<model key>=<value>, for example sapient.location_coordinate_system=1")
+
+    lines = [f"  - id: {args.id}",
+             "    kind: translate",
+             f"    description: \"{(args.description or args.src_format + ' to ' + ', '.join(targets)).replace(chr(34), '')}\"",
+             f"    cert_cn: octo-translate-{args.id}",
+             f"    namespace: \"raw/{args.id}/**\"",
+             "    enabled: true",
+             "    sources:"]
+    lines += [f"      - \"{s}\"" for s in args.source]
+    lines += [f"    from: {args.src_format}",
+              f"    to: [{', '.join(targets)}]"]
+    if context:
+        lines.append("    context:")
+        lines += [f"      {k}: \"{v}\"" for k, v in context]
+    if only_when:
+        lines.append("    only_when:")
+        lines += [f"      {k}: \"{v}\"" for k, v in only_when]
+    if args.stale_after is not None:
+        lines.append(f"    stale_after_s: {args.stale_after}")
+    if args.stamp_time:
+        lines.append("    stamp_time: true")
+    if args.publish_key:
+        lines.append(f"    publish_key: \"{args.publish_key}\"")
+    lines.append(f"    max_distribution: {args.max_distribution}")
+    if args.packs_dir:
+        lines.append(f"    packs_dir: \"{args.packs_dir}\"")
+    lines.append(f"    onboarded: \"{datetime.date.today().isoformat()}\"")
+    entry = "\n".join(lines) + "\n"
+
+    target = d / FILE
+    text = target.read_text() if target.exists() else HEADER
+    if re.search(r"^translators:\s*\[\s*\]\s*$", text, re.M):
+        text = re.sub(r"^translators:\s*\[\s*\]\s*$", "translators:", text, count=1, flags=re.M)
+    elif not re.search(r"^translators:\s*$", text, re.M):
+        die(_critical('{v0} has no `translators:` list; nothing was changed', v0=target))
+    target.write_text(text.rstrip("\n") + "\n" + entry)
+    verify_yaml(target, args.id, True)
+    print(f"declared translation gateway {args.id}: {args.src_format} -> {', '.join(targets)}")
+    print(f"  reads   {', '.join(args.source)}")
+    print(f"  writes  raw/{args.id}/<format>/<source key>")
+    print(f"  stays on this pod until raw/{args.id}/** is in bridge_allow in 10-pod.yml")
+    print("Nothing on the pod has changed yet:\n  octo-pod check\n  octo-pod apply")
+    return 0
+
+
+def cmd_list(d):
+    gateways = declared(d, FILE, "translators")
+    if not gateways:
+        print("no translation gateway is declared on this pod")
+        return 0
+    for g in gateways:
+        state = "enabled" if g.get("enabled") else "disabled"
+        to = g.get("to") or []
+        print(f"{g.get('id')}  {state}  {g.get('from')} -> {', '.join(to) if isinstance(to, list) else to}"
+              f"  reads {', '.join(g.get('sources') or [])}  writes {g.get('namespace')}")
+    return 0
+
+
+def systemctl(*argv):
+    """Run systemctl; on a box without it, say so instead of a traceback."""
+    try:
+        return subprocess.run(["systemctl", *argv], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        print(f"note: no systemctl here; skipped 'systemctl {' '.join(argv)}'")
+        return None
+
+
+def owned_paths(ident):
+    """What one gateway owns on disk. tests/test_translate.py checks that every private
+    key the playbook writes for a gateway is in here."""
+    return {
+        "key": PEN_STATE / "zenoh" / "tls" / f"{ident}-translate-key.pem",
+        "csr": PEN_STATE / "ca" / f"{ident}-translate.csr",
+        "dir": TRANSLATE_ETC / f"octo-translate-{ident}",
+        "unit": QUADLET_DIR / f"octo-translate-{ident}.container",
+    }
+
+
+def cmd_remove(args, d):
+    target = d / FILE
+    gateways = {e.get("id"): e for e in declared(d, FILE, "translators")}
+    if args.id not in gateways:
+        die(_critical('{v0} is not declared in {v1}. Known: {v2}', v0=args.id, v1=FILE, v2=', '.join(sorted(gateways)) or 'none'))
+    own = owned_paths(args.id)
+
+    # The certificate stays, as remove-arm keeps it: an audit record naming the CN must
+    # still resolve to who it was.
+    print(f"This removes translation gateway {args.id}:")
+    print(f"  stop and delete  octo-translate-{args.id}.service ({own['unit']})")
+    print(f"  delete           {own['key']}, {own['csr']}, {own['dir']}/")
+    print("  drop             its declaration")
+    print("  keep             its certificate and its audit records under /var/lib/octo-translate/")
+    if not args.yes:
+        typed = input(_critical('\nType the id to confirm ({v0}): ', v0=args.id)).strip()
+        if typed != args.id:
+            die(_critical("not confirmed; nothing changed"))
+
+    # Stop BEFORE forgetting: a unit left on disk resurrects its gateway at the next boot.
+    systemctl("stop", f"octo-translate-{args.id}.service")
+    own["unit"].unlink(missing_ok=True)
+    systemctl("daemon-reload")
+    for p in (own["key"], own["csr"]):
+        p.unlink(missing_ok=True)
+    if own["dir"].exists():
+        for f in sorted(own["dir"].rglob("*"), reverse=True):
+            f.unlink() if f.is_file() or f.is_symlink() else f.rmdir()
+        own["dir"].rmdir()
+
+    text = target.read_text()
+    span = find_block(text, args.id)
+    if span is not None:
+        start, end = span
+        text = text[:start] + text[end:]
+        if not re.search(r"^\s*- id: ", text, re.M):
+            text = re.sub(r"^translators:[ \t]*$", "translators: []", text, count=1, flags=re.M)
+        target.write_text(text.rstrip("\n") + "\n")
+    verify_yaml(target, args.id, False)
+    pod = d / "10-pod.yml"
+    if pod.exists() and f"raw/{args.id}/" in pod.read_text():
+        print(f"\n  NOTE {pod} still mentions raw/{args.id}/: check bridge_allow.")
+    print(f"\nremoved {args.id}. Next: sudo octo-pod apply, which withdraws its pen grants "
+          "and its audit sink.")
+    return 0
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.stderr.write(
+            "\nERROR: run with sudo. Declarations live in /etc/octo-pod, which is root-owned.\n"
+            f"  sudo octo-pod translate {' '.join(sys.argv[1:]) or '<verb> ...'}\n\n")
+        return 2
+    ap = argparse.ArgumentParser(prog="octo-pod translate")
+    ap.add_argument("verb", choices=["add", "list", "remove"])
+    ap.add_argument("id", nargs="?")
+    ap.add_argument("--source", action="append",
+                    help=_tr("add: a pen key expression to read, for example raw/radar1/sapient/*; "
+                             "repeat for more"))
+    ap.add_argument("--from", dest="src_format",
+                    help=_tr("add: the pack name of the source format, for example sapient"))
+    ap.add_argument("--to", help=_tr("add: the pack names of the target formats, comma-separated"))
+    ap.add_argument("--set", action="append",
+                    help=_tr("add: a model key the source does not carry, as key=value; repeat for more"))
+    ap.add_argument("--only-when", action="append",
+                    help=_tr("add: convert a sample only when this model key has this value, "
+                             "as key=value; repeat for more"))
+    ap.add_argument("--stale-after", type=int,
+                    help=_tr("add: give each result a stale time this many seconds after the "
+                             "sample was received, when the source carries none"))
+    ap.add_argument("--stamp-time", action="store_true",
+                    help=_tr("add: give each result the time the sample was received, when the "
+                             "source carries none"))
+    ap.add_argument("--publish-key",
+                    help=_tr("add: the publish key template (default {namespace}/{to}/{source})"))
+    ap.add_argument("--packs-dir",
+                    help=_tr("add: a pack bundle on this pod, with its own MANIFEST.json, to use "
+                             "instead of the one in the image"))
+    ap.add_argument("--max-distribution", choices=["public", "controlled"], default="public",
+                    help=_tr("add: the most restricted pack the engine may load (default public)"))
+    ap.add_argument("--description", default="")
+    ap.add_argument("--yes", action="store_true", help=_tr("remove: skip the typed confirmation"))
+    args = ap.parse_args()
+    d = pod_dir()
+    if args.verb == "list":
+        return cmd_list(d)
+    if not args.id:
+        die(_critical('usage: octo-pod translate {v0} <gateway-id>', v0=args.verb))
+    if args.verb == "add":
+        if not (args.source and args.src_format and args.to):
+            die(_critical("usage: octo-pod translate add <id> --source <pen key> --from <format> "
+                          "--to <format>[,<format>]"))
+        return cmd_add(args, d)
+    return cmd_remove(args, d)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

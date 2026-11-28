@@ -292,6 +292,12 @@ DONE
   peer)
     shift; run python3 "$BIN/octo-pod-peer" "$@" ;;
 
+  # Translation gateways (docs/adr/0004): declare, list and remove. Not an arm verb: a
+  # gateway captures nothing, it converts what arms captured. Same refusal discipline as
+  # egress: every error names its own fix.
+  translate)
+    shift; run python3 "$BIN/octo-pod-translate" "$@" ;;
+
   # ---- 4. take a new version of the software --------------------------------
   # Not "step 4" in the install: a pod that is never upgraded still works. It is here
   # because it is the other thing an operator does to a running pod, and because the

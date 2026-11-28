@@ -42,6 +42,7 @@ SEARCH_DIRS=(
   "{{ pen_state_dir }}/zenoh/tls"
   "{{ sub_leaf_dir }}"
   /etc/octo-egress-*/tls
+  /etc/octo-translate-*/tls
   "{{ downlink_tls_dir | default('/etc/octo-downlink/tls') }}"
   /etc/octo-arm-*/tls
   {{ arm_tls_dir }}
@@ -74,6 +75,7 @@ failures=0
 touched_router=0
 touched_arms=()
 touched_egress=()
+touched_translate=()
 touched_downlink=0
 
 # `openssl -checkend` rather than parsing dates: it answers exactly the question being
@@ -161,6 +163,7 @@ for dir in "${SEARCH_DIRS[@]}"; do
       case "$dir" in
         "{{ pen_state_dir }}/zenoh/tls") touched_router=1 ;;
         /etc/octo-egress-*/tls) touched_egress+=("$(basename "$(dirname "$dir")")") ;;
+        /etc/octo-translate-*/tls) touched_translate+=("$(basename "$(dirname "$dir")")") ;;
         "{{ downlink_tls_dir | default('/etc/octo-downlink/tls') }}") touched_downlink=1 ;;
         /etc/octo-arm-*/tls) touched_arms+=("$(basename "$(dirname "$dir")")") ;;
       esac
@@ -187,6 +190,10 @@ if [ "$renewed" -gt 0 ]; then
   for egress in "${touched_egress[@]:-}"; do
     [ -n "$egress" ] || continue
     systemctl restart "$egress.service" || failures=$((failures + 1))
+  done
+  for translate in "${touched_translate[@]:-}"; do
+    [ -n "$translate" ] || continue
+    systemctl restart "$translate.service" || failures=$((failures + 1))
   done
   if [ "$touched_downlink" = 1 ]; then
     systemctl restart octo-downlink-bridge.service || failures=$((failures + 1))

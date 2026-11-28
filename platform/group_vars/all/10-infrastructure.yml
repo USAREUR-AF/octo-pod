@@ -194,6 +194,19 @@ egress_session_schemes: [sapient]
 downlink_tls_dir: /etc/octo-downlink/tls
 egress_audit_dir: /var/lib/octo-egress
 
+# ---- translation gateway: captured samples, converted, under their own identity ----
+# OFF unless a pod declares `translators:` in 50-translate.yml (octo-pod translate add).
+# A gateway is not an arm (docs/adr/0004): it is built from gateway/translate/, reads only
+# its declared source keys on the pen, and writes only raw/<id>/**. The arms are unchanged
+# whether or not one runs.
+#
+# No image is published for it yet, so this is empty: a clone builds
+# localhost/octo-translate:dev from gateway/translate/, and a packaged pod sets this to a
+# digest-pinned reference it carries or can pull. When images.yml publishes one, the pin
+# moves beside the others as translate_image_upstream, under the same digest rule.
+translate_image: ""
+translate_audit_dir: /var/lib/octo-translate
+
 # Where an airgapped install stages carried artifacts (debs, image tars, the bridge
 # tarball). Defined here rather than only in bootstrap-octo-pod.yml because BOTH
 # playbooks name it: bootstrap unpacks from it, and configure-octo-pod.yml points a
@@ -276,6 +289,8 @@ active_peer_readers: >-
   {{ active_peers | selectattr('read_keys', 'defined') | selectattr('read_keys')
      | selectattr('release', 'defined') | selectattr('release.from_fabric', 'defined')
      | selectattr('release.from_fabric') | list }}
+# Declared translation gateways (50-translate.yml). Empty on a pod that declares none.
+active_translators: "{{ translators | default([]) | selectattr('enabled') | list }}"
 # Everything that reads through the downlink: one list, so a condition can never count
 # egress destinations and forget peer readers (or the reverse).
 downlink_users: "{{ active_egress + active_peer_readers }}"

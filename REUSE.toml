@@ -21,6 +21,9 @@ path = [
   "arms/Cargo.lock",
   "arms/about.hbs",
   "arms/sapient-receiver/NOTICE",
+  "gateway/translate/NOTICE",
+  "gateway/translate/Cargo.lock",
+  "gateway/translate/packs/MANIFEST.json",
   "arms/sapient-receiver/tests/vectors/NOTICE",
   "arms/sapient-receiver/tests/vectors/manifest.json",
   "arms/fuzz/seeds/NOTICE",
@@ -41,6 +44,20 @@ SPDX-License-Identifier = "Apache-2.0"
 path = "arms/THIRD_PARTY_LICENSES.md"
 precedence = "override"
 SPDX-FileCopyrightText = "2026 U.S. Federal Government (in countries where recognized)"
+SPDX-License-Identifier = "Apache-2.0"
+
+# The translation gateway's pinned pack bundle: model modules and packs copied unmodified
+# from https://github.com/usareur-af/goat-transformers at the commit recorded in
+# gateway/translate/packs/MANIFEST.json, which also records each file's SHA-256, so the
+# files cannot take a header. gateway/translate/NOTICE names the public documents each
+# pack was written from.
+[[annotations]]
+path = [
+  "gateway/translate/packs/model/**",
+  "gateway/translate/packs/packs/**",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2025-2026 U.S. Federal Government (in countries where recognized)"
 SPDX-License-Identifier = "Apache-2.0"
 
 # The SAPIENT protobuf definitions (BSI Flex 335 v2.0), vendored unmodified from
