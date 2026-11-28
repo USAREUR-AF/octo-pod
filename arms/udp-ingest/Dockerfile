@@ -13,7 +13,7 @@
 # embedded identity material.
 
 # upstream tag at the time this digest was pinned: latest-dev
-FROM cgr.dev/chainguard/rust@sha256:5cf99a94c5e94cb6741988f77aeb0976ad9d4eb379db80e0ee980cc95c5e5fe6 AS chef
+FROM cgr.dev/chainguard/rust@sha256:0f1f402298c87daffc740afe67cd42f87b4398fb717904e42c1273257622cf28 AS chef
 USER root
 # DEPENDENCIES COMPILE IN THEIR OWN LAYER. cargo-chef reduces the workspace to its
 # manifests and Cargo.lock (recipe.json), and `cook` compiles every dependency from that
@@ -36,7 +36,7 @@ COPY . .
 RUN cargo build --release --locked -p udp-ingest
 
 # upstream tag at the time this digest was pinned: latest
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:671a621016fb33812136dea6182b1db957996d3c8c618187aaf86abd9b14af53
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:3359c6ba6b3bcf3b1d2179849f782365564cb262789e732e2833b25b9a8c00f1
 WORKDIR /
 COPY --from=rust-builder /build/target/release/udp-ingest /usr/local/bin/udp-ingest
 COPY --from=rust-builder /build/LICENSE /build/NOTICE /build/THIRD_PARTY_LICENSES.md /usr/share/doc/octo-pod/
