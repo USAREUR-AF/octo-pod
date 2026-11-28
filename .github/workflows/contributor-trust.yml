@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# contributor-trust: a required check on every pull request to main (ADR 1221
+# in USAREUR-AF/goatcore). The check itself lives in goatcore; this repository
+# keeps only its own list of sensitive paths.
+#
+# pull_request_target runs this file as it is on main. The pull request's
+# code is never checked out, built or run: the script reads the author and
+# the changed paths from the API.
+name: contributor-trust
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write   # only to remove a stale security-reviewed label
+
+concurrency:
+  group: contributor-trust-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  contributor-trust:
+    name: contributor-trust
+    # Every event runs the whole check: a skipped run of a required check
+    # counts as passed.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Semgrep flags every checkout under pull_request_target. This one checks out
+      # the BASE branch (what is already merged), never the pull request's code.
+      - name: this repository's sensitive paths, from the base branch # nosemgrep: yaml.github-actions.security.pull-request-target-code-checkout.pull-request-target-code-checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          sparse-checkout: .github/contributor-trust
+          persist-credentials: false
+
+      - name: the check, from goatcore main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: USAREUR-AF/goatcore
+          # goatcore pinned by commit, bumped deliberately like the actions group
+          ref: 284921600e53e420be9fda36134e87a142eb2b14
+          path: .goatcore-trust
+          sparse-checkout: .github/contributor-trust
+          persist-credentials: false
+
+      - name: a new push withdraws an earlier security review
+        if: >-
+          github.event.action == 'synchronize'
+          && contains(github.event.pull_request.labels.*.name, 'security-reviewed')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/security-reviewed"
+
+      - name: decide
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          CONTRIBUTOR_ROSTER_REPO: ${{ vars.CONTRIBUTOR_ROSTER_REPO }}
+          CONTRIBUTOR_ROSTER_TOKEN: ${{ secrets.CONTRIBUTOR_ROSTER_TOKEN }}
+          SENSITIVE_PATHS: .github/contributor-trust/sensitive-paths.txt
+        run: python3 .goatcore-trust/.github/contributor-trust/check.py
