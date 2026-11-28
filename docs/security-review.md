@@ -54,8 +54,9 @@ listed here until its advisory is published.
 
 Changes made as a result of this review, all on `main`:
 
-- Every GitHub Action is pinned by commit, and workflow tokens are read-only unless a job
-  needs more.
+- GitHub Actions are pinned by commit except the SLSA generator, whose verifier requires
+  a full version tag. This is a documented compatibility exception. Workflow tokens
+  are read-only unless a job needs more.
 - Each image carries a signed build provenance attestation, and the `signed-pins` check
   refuses an image pin that this repository's image workflow did not sign on `main`.
 - Each release carries SLSA Build Level 3 provenance and a signature in the standard
