@@ -5,6 +5,17 @@ SPDX-License-Identifier: Apache-2.0
 
 # octo-pod
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/octo-pod-boundary-dark.svg">
+  <img src="docs/figures/octo-pod-boundary-light.svg" width="760" alt="One octo-pod at one site sits between sensors and receivers that cannot join the shared Zenoh fabric and the fabric itself: UDP and TCP sensors feed ingress arms, Zenoh-native publishers connect to the pen (the pod's own Zenoh router), the pod captures and audits locally, the uplink bridge carries only released keys out to the fabric, and the downlink gate brings approved keys back to egress arms that deliver to UDP or TCP receivers, clients that dial the pod, SAPIENT controllers and partners' Zenoh routers.">
+</picture>
+
+octo-pod is an edge gateway appliance. It runs on one small computer where sensors
+live, takes in their feeds, records and audits them locally, and releases only what
+you choose onto a shared Zenoh network, the **fabric**, that other sites and systems
+share. It works the other way too: it can deliver data from the fabric to a local
+receiver.
+
 <!-- badges: the public repository's live status. The documentation book leaves this block out. -->
 [![CI](https://github.com/USAREUR-AF/octo-pod/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/USAREUR-AF/octo-pod/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/USAREUR-AF/octo-pod/actions/workflows/github-code-scanning/codeql/badge.svg?branch=main)](https://github.com/USAREUR-AF/octo-pod/actions/workflows/github-code-scanning/codeql)
@@ -13,12 +24,6 @@ SPDX-License-Identifier: Apache-2.0
 [![Release](https://img.shields.io/github/v/release/USAREUR-AF/octo-pod?sort=semver)](https://github.com/USAREUR-AF/octo-pod/releases/latest)
 [![MSRV 1.89](https://img.shields.io/badge/MSRV-1.89-orange.svg)](arms/Cargo.toml)
 <!-- /badges -->
-
-octo-pod is an edge gateway appliance. It runs on one small computer where sensors
-live, takes in their feeds, records and audits them locally, and releases only what
-you choose onto a shared Zenoh network, the **fabric**, that other sites and systems
-share. It works the other way too: it can deliver data from the fabric to a local
-receiver.
 
 **Where it fits.** A sensor speaks its own wire format on its own network and has no
 place on a shared fabric; a shared fabric should not reach back into a sensor's
